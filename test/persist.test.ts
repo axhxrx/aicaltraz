@@ -223,6 +223,20 @@ describe('across restarts (in-process)', () => {
     await store.shutdown(20);
   });
 
+  test.skipIf(!posix || !Bun.which('mkfifo'))('a FIFO where the state file should be: no hang, start fresh, saves fail loudly once, presses still work', async () => {
+    const dir = tmpDir('buttpad-persist-');
+    const path = join(dir, STATE_FILE);
+    expect(Bun.spawnSync(['mkfifo', path]).success).toBe(true);
+    const { store, runs, logs } = storeAt(dir, [{ id: 'a', x: 0, y: 0, action: shell('x') }]); // would block forever on a plain read
+    expect(logs).toEqual([`state: can't use ${path} (not a regular file: it is a named pipe (FIFO)); starting fresh`]);
+    expect(store.press('p', 'a')).toMatchObject({ result: 'started', runId: 1 });
+    runs[0]!.exit({ exitCode: 0 });
+    await waitFor(() => logs.some((l) => l.startsWith(`state: cannot save ${path}`)), 2000, 'the save failure');
+    expect(store.get('p/a')?.phase).toBe('success');
+    await store.shutdown(20);
+    expect(logs.filter((l) => l.includes('cannot save')).length).toBe(1);
+  });
+
   test(`saves are throttled: routine ones at most every ${SAVE_INTERVAL_MS} ms; a run start or end soon after`, async () => {
     const dir = tmpDir('buttpad-persist-');
     const writes: number[] = [];
@@ -338,6 +352,30 @@ describe('graceful shutdown', () => {
     expect(late.states['p/long']).toMatchObject({ phase: 'ready', last: { reason: 'interrupted' } });
     c2.send({ t: 'press', id: '2', pad: 'p', button: 'long' });
     expect(await c2.next('ack')).toMatchObject({ result: 'started', runId: 2 });
+  });
+});
+
+describe('a second host on the same config', () => {
+  test("one that can't listen (port taken) says nothing about the state file and never touches the running host's actions", async () => {
+    const dir = tmpDir('buttpad-persist-');
+    writeJson(join(dir, 'buttpad.config.json'), padConfig([{ id: 'long', x: 0, y: 0, action: shell('sleep 30') }]));
+    const one = await inProcessHost(dir);
+    const { c } = await one.ws();
+    c.send({ t: 'press', id: '1', pad: 'p', button: 'long' });
+    await c.next('ack');
+    await waitFor(() => {
+      try {
+        return readState(join(dir, STATE_FILE)).live.length === 1;
+      } catch {
+        return false;
+      }
+    }, 2000, 'the run saved');
+    const logs: string[] = [];
+    await expect(startHost({ configPath: join(dir, 'buttpad.config.json'), host: '127.0.0.1', port: one.host.port, log: (m) => logs.push(m) })).rejects.toThrow();
+    expect(logs.filter((l) => l.startsWith('state:') || l.includes('interrupted'))).toEqual([]);
+    await Bun.sleep(300);
+    expect(one.host.state.get('p/long')).toMatchObject({ phase: 'running', runId: 1 });
+    expect(one.host.state.running).toBe(1);
   });
 });
 

@@ -283,7 +283,8 @@ runs):
   gets a record of it. On Windows there is no fingerprint: nothing is killed.
 - A graceful shutdown keeps the runs it stopped in the file (`stopped: "shutdown"`): the next host
   reports them the same way.
-- A missing, unreadable or unknown-version file: start fresh, with a log line; the next save replaces
+- A missing, unreadable (a FIFO or device is never opened for reading) or unknown-version file:
+  start fresh, with a log line once listening; the next save replaces
   it. A file whose writer is still running (its pid and fingerprint alive): this host neither saves
   nor touches that host's runs, and says so.
 - Not covered: a crash during a killed run's 2 s grace period (its main process had already exited)

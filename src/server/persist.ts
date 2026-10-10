@@ -13,9 +13,9 @@
  * SAVE_INTERVAL_MS, run starts/ends sooner (URGENT_SAVE_INTERVAL_MS). A missing or unreadable
  * file means starting fresh (the host says so); the next save replaces it.
  */
-import { readFileSync, statSync } from 'node:fs';
 import type { FailureReason, LastResult } from '../core/machine.ts';
 import { atomicWrite } from './config-store.ts';
+import { NotRegularFileError, readRegularFile } from './files.ts';
 
 export const STATE_FILE = 'buttpad.state.json';
 export const STATE_VERSION = 1;
@@ -122,14 +122,12 @@ const MAX_STATE_BYTES = 8 * 1024 * 1024;
 export function loadState(path: string, clean: (s: string, max: number) => string): LoadResult {
   let text: string;
   try {
-    // Never open a FIFO or device (it could block the host forever).
-    const st = statSync(path);
-    if (!st.isFile()) return { ok: false, missing: false, error: 'not a regular file' };
-    if (st.size > MAX_STATE_BYTES) return { ok: false, missing: false, error: `too big (${st.size} bytes)` };
-    text = readFileSync(path, 'utf8');
+    // Never blocks on a FIFO or device (files.ts checks before and after opening, non-blocking).
+    text = readRegularFile(path, MAX_STATE_BYTES).toString('utf8');
   } catch (e) {
+    if (e instanceof NotRegularFileError) return { ok: false, missing: false, error: `not a regular file: it is ${e.kind}` };
     const err = e as NodeJS.ErrnoException;
-    return { ok: false, missing: err.code === 'ENOENT', error: err.code ?? err.message };
+    return { ok: false, missing: err.code === 'ENOENT', error: err.code === 'EFBIG' ? 'too big' : (err.code ?? err.message) };
   }
   let raw: unknown;
   try {
@@ -182,7 +180,7 @@ export class StateFile {
     this.timer.unref?.();
   }
 
-  /** Save now, synchronously (shutdown, the process 'exit' handler). Whether it worked. */
+  /** Save now, synchronously (shutdown, the process 'exit' handler). Whether it worked; a failure (WriteError) is logged, never thrown. */
   flush(): boolean {
     clearTimeout(this.timer);
     this.timer = undefined;

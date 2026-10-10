@@ -31,6 +31,8 @@ function useDeliberate(activate: () => void, longMs = 0) {
   const [holding, setHolding] = useState(false);
   /** performance.now() of the last pointerdown: a click right after one is that pointer's, not the keyboard's. */
   const lastDown = useRef(-Infinity);
+  /** A deliberate press was released: activate on its click (or shortly after, if none comes). */
+  const pending = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const act = useRef(activate);
   act.current = activate;
   const stop = () => {
@@ -38,7 +40,12 @@ function useDeliberate(activate: () => void, longMs = 0) {
     st.current = null;
     setHolding(false);
   };
-  useEffect(() => () => clearTimeout(st.current?.timer), []);
+  useEffect(() => () => (clearTimeout(st.current?.timer), clearTimeout(pending.current)), []);
+  const fire = () => {
+    clearTimeout(pending.current);
+    pending.current = undefined;
+    act.current();
+  };
   const handlers = {
     onPointerDown(e: PointerEvent) {
       lastDown.current = performance.now();
@@ -67,12 +74,16 @@ function useDeliberate(activate: () => void, longMs = 0) {
       stop();
       if (longMs) return;
       if (s.type !== 'mouse' && e.timeStamp - s.t0 < NAV_MIN_MS) return;
-      act.current();
+      // Not right here: the click this release makes would land on whatever the activation opens
+      // (the menu's close button, under the finger).
+      clearTimeout(pending.current);
+      pending.current = setTimeout(fire, 350);
     },
     onPointerCancel: stop,
     onPointerLeave: stop,
     onClick() {
-      // Pointer presses are decided above (a touch's click can even say detail 0); this is the keyboard.
+      if (pending.current) return fire();
+      // Otherwise pointer presses were decided above (a touch's click can say detail 0 too); this is the keyboard.
       if (performance.now() - lastDown.current > 1500 && !longMs) act.current();
     },
   };

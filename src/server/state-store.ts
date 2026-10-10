@@ -160,6 +160,8 @@ export class StateStore {
   private liveEntries = new Set<LiveEntry>();
   /** Left in flight by the previous host, for recover(). */
   private toRecover: LiveEntry[] = [];
+  /** What loading the state file found, logged by recover(): once the host is listening, not before a failed start. */
+  private loadNotes: string[] = [];
   private persist: StateFile | undefined;
   private hostId: PersistedState['host'];
   private closed = false;
@@ -336,6 +338,7 @@ export class StateStore {
    * after the host knows it is the only one (it got its port).
    */
   recover() {
+    for (const m of this.loadNotes.splice(0)) this.log(m);
     const entries = this.toRecover;
     this.toRecover = [];
     for (const e of entries) {
@@ -711,7 +714,7 @@ export class StateStore {
     const r = loadState(path, clean);
     this.hostId = { pid: process.pid, fingerprint: processFingerprint(process.pid) };
     if (!r.ok) {
-      this.log(r.missing ? `state: no ${path} yet; starting fresh` : `state: can't use ${path} (${r.error}); starting fresh`);
+      this.loadNotes.push(r.missing ? `state: no ${path} yet; starting fresh` : `state: can't use ${path} (${r.error}); starting fresh`);
     } else {
       for (const [key, memo] of Object.entries(r.state.buttons)) this.memos.set(key, memo);
       // Ids continue past every run it knew, finished or not.
@@ -722,7 +725,7 @@ export class StateStore {
       const prev = r.state.host;
       // Another host that is still running wrote it (two hosts on one config): its runs are its own.
       if (prev && prev.pid !== process.pid && prev.fingerprint && processFingerprint(prev.pid) === prev.fingerprint) {
-        this.log(`state: ${path} belongs to another ButtPad host that is still running (pid ${prev.pid}); this one won't save run state or touch that host's actions`);
+        this.loadNotes.push(`state: ${path} belongs to another ButtPad host that is still running (pid ${prev.pid}); this one won't save run state or touch that host's actions`);
         return;
       }
       this.toRecover = r.state.live;
