@@ -162,6 +162,17 @@
                     "pattern": "^(\\*|[\\w-]+\\/(\\*|[\\w-]+))$"
                   }
                 },
+                "group": {
+                  "type": "string",
+                  "maxLength": 40,
+                  "pattern": "^[\\w-]+$"
+                },
+                "maxLatenessMs": {
+                  "default": 3000,
+                  "type": "integer",
+                  "minimum": 200,
+                  "maximum": 10000
+                },
                 "key": {
                   "type": "string"
                 },

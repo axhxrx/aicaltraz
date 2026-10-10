@@ -42,11 +42,26 @@ describe('schema validation', () => {
       timeoutMs: 120000,
       resultHoldMs: 2500,
       cooldownMs: 400,
+      maxLatenessMs: 3000,
       action: { type: 'shell', script: 'true' },
     });
     expect(parseConfig({ version: 1, pads: [{ id: 'p', name: 'P' }] })).toMatchObject({ ok: true, config: { pads: [{ buttons: [] }] } });
     const exec = Button.parse({ id: 'e', x: 0, y: 0, action: { type: 'exec', command: 'ls' } });
     expect(exec.action).toEqual({ type: 'exec', command: 'ls', args: [] });
+  });
+
+  test('paths are trimmed (a phone keyboard adds trailing spaces); args are not', () => {
+    const exec = Button.parse({ id: 'e', x: 0, y: 0, action: { type: 'exec', command: ' ./porch.sh ', args: [' a '], cwd: ' /srv ' } });
+    expect(exec.action).toEqual({ type: 'exec', command: './porch.sh', args: [' a '], cwd: '/srv' });
+    const sh = Button.parse({ id: 's', x: 0, y: 0, action: { type: 'shell', script: 'true', shell: 'bash ' } });
+    expect(sh.action).toEqual({ type: 'shell', script: 'true', shell: 'bash' });
+  });
+
+  test('group and maxLatenessMs', () => {
+    expect(Button.parse({ id: 'g', x: 0, y: 0, group: 'wash', action: { type: 'none' } })).toMatchObject({ group: 'wash', maxLatenessMs: 3000 });
+    expect(Button.safeParse({ id: 'g', x: 0, y: 0, group: 'a b', action: { type: 'none' } }).success).toBe(false);
+    expect(Button.safeParse({ id: 'g', x: 0, y: 0, maxLatenessMs: 100, action: { type: 'none' } }).success).toBe(false);
+    expect(Button.safeParse({ id: 'g', x: 0, y: 0, maxLatenessMs: 500, action: { type: 'none' } }).success).toBe(true);
   });
 
   test('requires version 1 and at least one pad', () => {

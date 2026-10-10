@@ -25,7 +25,10 @@ export type StateMap = Record<string, RunState>;
  */
 export type PressResult = 'started' | 'ignored' | 'cancelling' | 'queued' | 'unknown-button' | 'expired' | 'needs-confirm';
 
-/** A press whose `at` is older than this when the host handles it is dropped as `expired`. */
+/**
+ * The default for a button's `maxLatenessMs`: a press whose `at` is older than the button's
+ * maxLatenessMs when the host handles it is dropped as `expired`.
+ */
 export const PRESS_MAX_AGE_MS = 3000;
 
 export interface HostInfo {
@@ -70,6 +73,19 @@ export type ClientMsg = {
   /** The user went through the button's confirm step. Required for `confirm` buttons. */
   confirm?: boolean;
 };
+
+/**
+ * POST /api/pair (no token): trade a one-time pairing code the host printed (or showed to an admin)
+ * for a token — how a phone becomes an admin without typing a 43-character token. Codes are short-
+ * lived, single-use and attempts are rate limited.
+ */
+export interface PairRequest {
+  code: string;
+}
+export interface PairResponse {
+  token: string;
+  role: Role;
+}
 
 /** PUT /api/config (admin). */
 export interface SaveConfigBody {

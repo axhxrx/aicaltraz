@@ -15,9 +15,9 @@ const env = z.record(z.string().regex(ENV_NAME), z.string(), {
 export const ExecAction = z.strictObject({
   type: z.literal('exec'),
   /** Executable path, or a name resolved via PATH. Run directly, no shell. */
-  command: z.string().min(1),
+  command: z.string().trim().min(1),
   args: z.array(z.string()).default([]),
-  cwd: z.string().optional(),
+  cwd: z.string().trim().optional(),
   env: env.optional(),
 });
 
@@ -26,8 +26,8 @@ export const ShellAction = z.strictObject({
   /** Passed to the shell as a single command string (`sh -c` / `cmd /c`). */
   script: z.string().min(1),
   /** Shell binary. Defaults to /bin/sh (POSIX) or %ComSpec%/cmd.exe (Windows) — never $SHELL, so behavior doesn't depend on how the host was started. */
-  shell: z.string().optional(),
-  cwd: z.string().optional(),
+  shell: z.string().trim().optional(),
+  cwd: z.string().trim().optional(),
   env: env.optional(),
 });
 
@@ -69,6 +69,10 @@ export const Button = z.strictObject({
   cooldownMs: z.int().min(0).max(10_000).default(400),
   /** Running buttons this one cancels before its own action starts (itself excluded). */
   stops: z.array(z.string().regex(STOP_PATTERN, 'use pad/button, pad/* or *')).optional(),
+  /** Exclusive group (any pad): starting this button stops the running buttons of the same group. */
+  group: z.string().trim().regex(/^[\w-]+$/, 'letters, digits, _ and - only').max(40).optional(),
+  /** The host drops a press that reaches it later than this after it was made (dead Wi-Fi, a frozen host). */
+  maxLatenessMs: z.int().min(200).max(10_000).default(3000),
   /** Keyboard key (KeyboardEvent.key) that presses this button, for BLE remotes etc. */
   key: z.string().optional(),
   action: Action,
