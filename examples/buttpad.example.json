@@ -1,0 +1,367 @@
+{
+  "$schema": "../schema/buttpad.config.schema.json",
+  "version": 1,
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8787
+  },
+  "pads": [
+    {
+      "id": "lights",
+      "name": "Lights",
+      "cols": 3,
+      "rows": 3,
+      "buttons": [
+        {
+          "id": "all-on",
+          "label": "All on",
+          "color": "#ffb703",
+          "x": 0,
+          "y": 0,
+          "w": 2,
+          "holdMs": 400,
+          "key": "1",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "all",
+              "on"
+            ]
+          }
+        },
+        {
+          "id": "all-off",
+          "label": "All off",
+          "color": "#3d405b",
+          "x": 2,
+          "y": 0,
+          "key": "0",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "all",
+              "off"
+            ]
+          }
+        },
+        {
+          "id": "key-80",
+          "label": "Key 80%",
+          "color": "#f4a261",
+          "x": 0,
+          "y": 1,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "key",
+              "80"
+            ]
+          }
+        },
+        {
+          "id": "fill",
+          "label": "Fill on/off",
+          "color": "#e9c46a",
+          "x": 1,
+          "y": 1,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "fill",
+              "toggle"
+            ]
+          }
+        },
+        {
+          "id": "interview",
+          "label": "Scene: Interview",
+          "color": "#8338ec",
+          "x": 2,
+          "y": 1,
+          "h": 2,
+          "holdMs": 800,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/scene.sh",
+            "args": [
+              "interview"
+            ]
+          }
+        },
+        {
+          "id": "key-off",
+          "label": "Key off",
+          "color": "#264653",
+          "x": 0,
+          "y": 2,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "key",
+              "off"
+            ]
+          }
+        },
+        {
+          "id": "back-30",
+          "label": "Back 30%",
+          "color": "#2a9d8f",
+          "x": 1,
+          "y": 2,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/light.sh",
+            "args": [
+              "back",
+              "30"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "camera",
+      "name": "Camera",
+      "cols": 2,
+      "rows": 3,
+      "buttons": [
+        {
+          "id": "rec",
+          "label": "● REC",
+          "color": "#d62828",
+          "x": 0,
+          "y": 0,
+          "w": 2,
+          "holdMs": 600,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/camera.sh",
+            "args": [
+              "rec"
+            ]
+          }
+        },
+        {
+          "id": "snap",
+          "label": "Snapshot",
+          "color": "#457b9d",
+          "x": 0,
+          "y": 1,
+          "trigger": "tap",
+          "key": " ",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/camera.sh",
+            "args": [
+              "snap"
+            ]
+          }
+        },
+        {
+          "id": "battery",
+          "label": "Battery",
+          "color": "#2a9d8f",
+          "x": 1,
+          "y": 1,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/camera.sh",
+            "args": [
+              "battery"
+            ]
+          }
+        },
+        {
+          "id": "upload",
+          "label": "Upload clips",
+          "color": "#1d3557",
+          "x": 0,
+          "y": 2,
+          "whileRunning": "cancel",
+          "timeoutMs": 60000,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/camera.sh",
+            "args": [
+              "upload"
+            ]
+          }
+        },
+        {
+          "id": "format",
+          "label": "Format card",
+          "color": "#9d0208",
+          "x": 1,
+          "y": 2,
+          "holdMs": 1500,
+          "confirm": true,
+          "confirmWindowMs": 4000,
+          "resultHoldMs": 5000,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/camera.sh",
+            "args": [
+              "format"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "test",
+      "name": "Test",
+      "cols": 3,
+      "rows": 4,
+      "buttons": [
+        {
+          "id": "progress",
+          "label": "Progress 5 s",
+          "color": "#3a86ff",
+          "x": 0,
+          "y": 0,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/progress.sh"
+          }
+        },
+        {
+          "id": "flaky",
+          "label": "Flaky (30%)",
+          "color": "#fb8500",
+          "x": 1,
+          "y": 0,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/flaky.sh"
+          }
+        },
+        {
+          "id": "fail",
+          "label": "Always fails",
+          "color": "#6c757d",
+          "x": 2,
+          "y": 0,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/fail.sh"
+          }
+        },
+        {
+          "id": "slow",
+          "label": "Slow 20 s (press again to cancel)",
+          "color": "#5f0f40",
+          "x": 0,
+          "y": 1,
+          "whileRunning": "cancel",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/slow.sh"
+          }
+        },
+        {
+          "id": "timeout",
+          "label": "Times out after 3 s",
+          "color": "#9a031e",
+          "x": 1,
+          "y": 1,
+          "timeoutMs": 3000,
+          "action": {
+            "type": "exec",
+            "command": "./scripts/slow.sh"
+          }
+        },
+        {
+          "id": "spawn-fail",
+          "label": "Missing binary",
+          "color": "#495057",
+          "x": 2,
+          "y": 1,
+          "trigger": "tap",
+          "action": {
+            "type": "exec",
+            "command": "buttpad-no-such-tool",
+            "args": [
+              "--help"
+            ]
+          }
+        },
+        {
+          "id": "queue",
+          "label": "Queue (1.5 s each)",
+          "color": "#0081a7",
+          "x": 0,
+          "y": 2,
+          "trigger": "tap",
+          "whileRunning": "queue",
+          "action": {
+            "type": "shell",
+            "script": "sleep 1.5; echo \"@result Run #$BUTTPAD_RUN_ID done\""
+          }
+        },
+        {
+          "id": "double",
+          "label": "Double-tap me",
+          "color": "#00afb9",
+          "x": 1,
+          "y": 2,
+          "trigger": "double",
+          "action": {
+            "type": "shell",
+            "script": "echo \"Double-tapped at $(date +%H:%M:%S)\""
+          }
+        },
+        {
+          "id": "long-text",
+          "label": "Long result",
+          "color": "#7209b7",
+          "x": 2,
+          "y": 2,
+          "trigger": "tap",
+          "resultHoldMs": 6000,
+          "action": {
+            "type": "shell",
+            "script": "echo \"@result $(for i in 1 2 3 4 5 6 7 8 9 10; do printf 'Result text is capped at 200 characters (%s). ' \"$i\"; done)\""
+          }
+        },
+        {
+          "id": "clicker",
+          "label": "Clicker: PageDown",
+          "color": "#06d6a0",
+          "x": 0,
+          "y": 3,
+          "w": 2,
+          "trigger": "tap",
+          "key": "PageDown",
+          "action": {
+            "type": "shell",
+            "script": "echo \"Next slide at $(date +%H:%M:%S)\""
+          }
+        },
+        {
+          "id": "env",
+          "label": "Env vars",
+          "color": "#118ab2",
+          "x": 2,
+          "y": 3,
+          "trigger": "tap",
+          "action": {
+            "type": "shell",
+            "script": "echo \"@result $BUTTPAD_PAD/$BUTTPAD_BUTTON run #$BUTTPAD_RUN_ID: $BUTTPAD_LABEL\""
+          }
+        }
+      ]
+    }
+  ]
+}
