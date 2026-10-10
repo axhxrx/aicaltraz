@@ -50,16 +50,37 @@ previous config keeps running. The admin UI's edit mode writes the same file.
 }
 ```
 
-- `exec` runs argv directly (no shell); `shell` runs a command string via `$SHELL -c` (or `cmd /c`).
-  `cwd` defaults to the config file's directory; env gets `BUTTPAD_PAD`, `BUTTPAD_BUTTON`,
-  `BUTTPAD_RUN_ID`, `BUTTPAD_LABEL`.
-- Exit code 0 = SUCCESS. Script output protocol (stdout lines):
-  `@progress 40` (determinate fill), `@status warming up`, `@result Key light ON 80%`.
-  Without `@result`, the last stdout line is the result text (stderr's on failure).
-- Per button: `trigger` hold|tap|double, `holdMs`, `driftPx`, `whileRunning` ignore|cancel|queue,
-  `confirm`, `timeoutMs`, `resultHoldMs`, `key` (keyboard / BLE remote key), `color`, `x y w h`.
+Actions:
 
-Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:8787/api/press/lights/key`.
+- `exec` runs argv directly (no shell). `shell` runs a command string with `/bin/sh -c` (`cmd /c`
+  on Windows) — deliberately not `$SHELL`, so a button behaves the same from a terminal and from a
+  service; set `"shell": "bash"` for bash-isms. `none` runs nothing (for stop buttons, below).
+- `cwd` defaults to the config file's folder; a relative `command` resolves against `cwd`. env gets
+  `BUTTPAD_PAD`, `BUTTPAD_BUTTON`, `BUTTPAD_RUN_ID` (keeps increasing across restarts), `BUTTPAD_LABEL`.
+- Exit code 0 = SUCCESS. Script output protocol (stdout lines):
+  `@progress 40` (determinate fill), `@status warming up`, `@result Key light ON 80%`, and
+  `@state REC ●` — a device-state chip that stays on the button across runs and restarts (`@state`
+  alone clears it). Without `@result`, the last stdout line is the result text (stderr's on failure).
+- Background processes a script starts are left alone when it exits (ButtPad stops reading their
+  output); cancelling or a timeout kills the whole process group.
+
+Per button (defaults in parentheses):
+
+| Field | |
+|---|---|
+| `x y w h` | grid cell and span (`w`,`h` = 1) |
+| `label`, `color` | ≤ 200 chars; any opaque CSS color (`#2f6fde`) — avoid green/red, they read as results |
+| `trigger` | `hold` (default), `tap`, `double` |
+| `holdMs` (500), `driftPx` (60) | how long to hold; how far a finger may slide |
+| `confirm` (false), `confirmWindowMs` (3000) | needs a second, deliberate press — enforced by the host |
+| `whileRunning` | `ignore` (default), `cancel` (press again to stop; not within 700 ms of the start), `queue` (one re-run) |
+| `cooldownMs` (400) | presses right after a fire are ignored on that device (key chatter, bounces) |
+| `timeoutMs` (120000), `resultHoldMs` (2500) | run time limit; how long ✓/✗ shows (failures stay until touched) |
+| `key` | KeyboardEvent.key (BLE remotes/clickers): fires on keydown; the visible pad wins, else the unique match on any pad |
+| `stops` | `["lights/*"]`, `["camera/rec"]`, `["*"]`: running buttons to cancel before this one starts |
+
+Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:8787/api/press/lights/key`
+(add `?confirm=1` for confirm buttons; otherwise it's refused with 428).
 
 ## Security model (read this)
 
@@ -67,9 +88,23 @@ Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:
   config — i.e. run any command on the host; treat it like an SSH key). `--rotate-tokens` revokes all.
 - Browsers only ever name a pad + button; commands live in the host's config and are never sent to
   press-role devices. Press devices do see each run's one-line result text, so don't print secrets.
+- Presses carry the time they were made; the host drops any older than 3 s (a press stuck in a
+  dead Wi-Fi zone must never fire late). `confirm` is checked by the host, not just the UI — but it
+  guards against accidents, not against a press-token holder (who can always confirm).
 - Plain HTTP by default — use it on a network you trust, or `--tls-cert/--tls-key` (e.g. mkcert).
-- Limits: 64 sockets (8 reserved for admin), press rate limit, 32 concurrent runs, same-origin
-  WebSockets only.
+- Limits: 64 sockets (8 reserved for admin, 16 per address), press rate limits per device and
+  global, 32 concurrent runs, same-origin WebSockets only.
+- `buttpad.state.json` (0600, next to the config) keeps run ids, last results, `@state` chips and
+  live process groups, so after a crash the host kills orphaned actions and marks them INTERRUPTED.
+
+## In the field
+
+- Results: ✓ shows for `resultHoldMs`; ✗ (and NO RESPONSE / NOT SENT / INTERRUPTED) stays until you
+  touch it; READY buttons show how their last run went ("✓ 12 s ago").
+- Menu → device settings → **Rough mode** for gloves/vibration: one button at a time, longer
+  minimum tap, longer cooldown, more drift tolerance.
+- `?lock&pad=lights` for a mounted tablet: no tabs, menu only on long-press; if that pad is renamed
+  or deleted it says so instead of becoming another pad's remote.
 
 ## Keep-awake
 

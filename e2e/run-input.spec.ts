@@ -23,6 +23,7 @@ const CONFIG: ConfigInput = {
         { id: 'confirm', label: 'Confirm', color: '#4338ca', x: 0, y: 1, holdMs: 600, confirm: true, confirmWindowMs: 1000, resultHoldMs: 800, key: 'c', action: sh('sleep 0.2; echo confirmed') },
         { id: 'cancel', label: 'Cancel', color: '#0d9488', x: 1, y: 1, trigger: 'tap', whileRunning: 'cancel', resultHoldMs: 1500, action: sh("echo '@progress 10'; sleep 30") },
         { id: 'slow', label: 'Slow', color: '#0891b2', x: 2, y: 1, trigger: 'tap', resultHoldMs: 800, action: sh("echo '@status busy'; sleep 3") },
+        { id: 'confirm2', label: 'Confirm long', color: '#4338ca', x: 0, y: 2, holdMs: 600, confirm: true, confirmWindowMs: 4000, resultHoldMs: 800, action: sh('sleep 0.2; echo confirmed') },
       ],
     },
     {
@@ -124,6 +125,8 @@ test('pressing again while the last press is still SENDING: BUSY, no second fire
   await demo(page).run((b) => b.dropAcks(1));
   await f.tap('tap');
   await expectVisual(page, 'tap', 'sending');
+  // Past the cooldown (a quicker press is a bounce: dropped without a word), before NO RESPONSE.
+  await page.waitForTimeout(450);
   await f.tap('tap');
   await expect(btn(page, 'tap')).toHaveAttribute('data-flash', 'busy');
   await expect(btn(page, 'tap').locator('.bp-badge')).toHaveText('BUSY');
@@ -199,16 +202,17 @@ test('confirm: a second hold begun inside the window fires, even when it complet
 });
 
 test('confirm: a confirming press that is let go early gives the window back', async ({ page }) => {
-  await f.hold('confirm', 700);
-  await expectVisual(page, 'confirm', 'confirm');
+  await f.hold('confirm2', 700);
+  await expectVisual(page, 'confirm2', 'confirm');
   await page.waitForTimeout(450);
-  await f.down('confirm');
+  await f.down('confirm2');
   // It took the window over…
-  await expectVisual(page, 'confirm', 'arming');
+  await expectVisual(page, 'confirm2', 'arming');
   await page.waitForTimeout(150);
   await f.up();
-  await expectVisual(page, 'confirm', 'confirm');
-  await expect(btn(page, 'confirm')).toContainText('AGAIN TO CONFIRM');
+  // …and gives it back when let go early.
+  await expectVisual(page, 'confirm2', 'confirm');
+  await expect(btn(page, 'confirm2')).toContainText('AGAIN TO CONFIRM');
 });
 
 test('a trigger change from hold to tap mid-press does not fire again on release', async ({ page }) => {

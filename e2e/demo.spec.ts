@@ -161,6 +161,7 @@ test('a second finger on the same button does not cancel the first one', async (
 test('pressing while running (whileRunning: ignore) flashes BUSY', async ({ page }) => {
   await f.tap('slow');
   await expectVisual(page, 'slow', 'running');
+  await page.waitForTimeout(450);
   await f.tap('slow');
   await expect(btn(page, 'slow')).toHaveAttribute('data-flash', 'busy');
   await expect(btn(page, 'slow').locator('.bp-badge')).toHaveText('BUSY');
