@@ -59,7 +59,7 @@ export interface ButtonVM {
   text?: string;
   /** The countdown bar of a result; absent: it stays. */
   resultHoldMs?: number;
-  /** This device keeps it on screen until touched (a touch only clears it; a hold retries). */
+  /** This device keeps it on screen until the next run: a press is a retry; its ✕ clears it. */
   sticky?: boolean;
   confirmUntil?: number;
   confirmMs?: number;
@@ -254,11 +254,12 @@ export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus
     return out;
   }
   const running = fromHost.visual === 'running';
+  const c = l.confirm && l.confirm.until > now ? l.confirm : null;
   if (l.sending && !running) return { ...vm, visual: 'sending' };
-  if (local) return { ...vm, ...local };
+  // A press on a kept result asked for the confirm step: CONFIRM shows over it (it's back if the window runs out).
+  if (local && !c) return { ...vm, ...local };
   if (running) return { ...vm, ...fromHost, sendingOverlay: !!l.sending, other };
-  if (l.confirm && l.confirm.until > now)
-    return { ...vm, visual: 'confirm', confirmUntil: l.confirm.until, confirmMs: l.confirm.until - l.confirm.at, confirmVerb: VERB[l.confirm.via] };
+  if (c) return { ...vm, visual: 'confirm', confirmUntil: c.until, confirmMs: c.until - c.at, confirmVerb: VERB[c.via] };
   if (fromHost.visual !== 'ready') return { ...vm, ...fromHost, other };
   if (host.phase === 'ready' && host.last) vm.last = lastMark(host.last, skew, now);
   if (vm.arming) vm.visual = 'arming';

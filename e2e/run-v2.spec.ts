@@ -22,7 +22,7 @@ const CONFIG: ConfigInput = {
         { id: 'hold', label: 'Hold', x: 0, y: 0, holdMs: 400, resultHoldMs: 800, key: 'h', action: sh('sleep 0.2; echo held') },
         { id: 'tap', label: 'Tap', color: '#db2777', x: 1, y: 0, trigger: 'tap', resultHoldMs: 800, key: 't', action: sh('sleep 0.3; echo tapped') },
         { id: 'wrap', label: 'Wrap', color: '#7c3aed', x: 2, y: 0, holdMs: 300, confirm: true, confirmWindowMs: 3000, resultHoldMs: 800, key: 'w', action: sh('sleep 0.2; echo wrapped') },
-        { id: 'fail', label: 'Fail', color: '#f97316', x: 0, y: 1, trigger: 'tap', resultHoldMs: 600, action: sh("sleep 0.5; echo 'disk full' >&2; exit 2") },
+        { id: 'fail', label: 'Fail', color: '#f97316', x: 0, y: 1, trigger: 'tap', key: 'e', resultHoldMs: 600, action: sh("sleep 0.5; echo 'disk full' >&2; exit 2") },
         { id: 'failhold', label: 'Fail hold', color: '#ea580c', x: 1, y: 1, holdMs: 300, resultHoldMs: 600, action: sh("echo 'nope' >&2; exit 1") },
         { id: 'slow', label: 'Slow', color: '#0891b2', x: 2, y: 1, trigger: 'tap', whileRunning: 'cancel', action: sh("echo '@progress 2'; sleep 30") },
         { id: 'rec', label: 'REC', color: '#dc2626', x: 0, y: 2, trigger: 'tap', resultHoldMs: 800, action: sh("echo '@state REC ●'; echo recording") },
@@ -34,10 +34,12 @@ const CONFIG: ConfigInput = {
       id: 'ride',
       name: 'Ride',
       cols: 1,
-      rows: 2,
+      rows: 4,
       buttons: [
         { id: 'pull', label: 'PULL OVER', color: '#f97316', x: 0, y: 0, trigger: 'tap', key: 'p', action: sh('echo pulled') },
         { id: 'dup1', label: 'Dup one', x: 0, y: 1, trigger: 'tap', key: 'x', action: sh('echo one') },
+        { id: 'flat', label: 'Flat tyre', color: '#dc2626', x: 0, y: 2, trigger: 'tap', key: 'f', cooldownMs: 0, resultHoldMs: 600, action: sh("sleep 0.2; echo 'radio offline' >&2; exit 1") },
+        { id: 'sos', label: 'SOS', color: '#4338ca', x: 0, y: 3, trigger: 'tap', key: 's', confirm: true, confirmWindowMs: 3000, action: sh('echo sent') },
       ],
     },
     { id: 'crew', name: 'Crew', cols: 1, rows: 1, buttons: [{ id: 'dup2', label: 'Dup two', x: 0, y: 0, trigger: 'tap', key: 'x', action: sh('echo two') }] },
@@ -272,6 +274,46 @@ test('keys are global: a key of a button on another pad fires it (with a toast);
   await expect.poll(presses).toEqual(['pull', 'dup1']);
 });
 
+test('a key for a button on another pad: the toast says what it did, ▶ only when it fired; a failure kept there takes no key', async ({ page }) => {
+  await open(page);
+  const presses = await trackPresses(page);
+  const toast = page.getByTestId('run-toast');
+  await page.keyboard.press('f');
+  await expect(toast).toHaveText('▶ Flat tyre (Ride)');
+  await expect.poll(() => count(VIB.failure)).toBe(1);
+  await expect(page.getByTestId('tab-ride')).toHaveAttribute('data-mark', 'failure');
+  // Again, with its failure kept (off screen): a retry, not a key swallowed clearing what nobody sees.
+  await page.keyboard.press('f');
+  await expect.poll(presses).toEqual(['flat', 'flat']);
+  await expect(toast).toHaveText('▶ Flat tyre (Ride)');
+  await expect.poll(() => count(VIB.failure)).toBe(2);
+  // Too soon after the last press: says so, sends nothing.
+  await page.keyboard.press('p');
+  await page.keyboard.press('p');
+  await expect(toast).toHaveText('PULL OVER (Ride): too soon after the last press, ignored');
+  await page.waitForTimeout(200);
+  expect(await presses()).toEqual(['flat', 'flat', 'pull']);
+  // A confirm button: the first press asks for the confirm step; the second (a deliberate one) fires.
+  await page.keyboard.press('s');
+  await expect(toast).toHaveText('SOS (Ride): press again to confirm');
+  await page.waitForTimeout(450);
+  await page.keyboard.press('s');
+  await expect(toast).toHaveText('▶ SOS (Ride)');
+  await expect.poll(presses).toEqual(['flat', 'flat', 'pull', 'sos']);
+});
+
+test('?lock: keys press only the locked pad’s buttons; one bound on another pad does nothing', async ({ page }) => {
+  await open(page, '?demo&exact&pad=main&lock');
+  const presses = await trackPresses(page);
+  await page.keyboard.press('p');
+  await page.keyboard.press('f');
+  await page.waitForTimeout(400);
+  expect(await presses()).toEqual([]);
+  await expect(page.getByTestId('run-toast')).toHaveCount(0);
+  await page.keyboard.press('t');
+  await expect.poll(presses).toEqual(['tap']);
+});
+
 test('pad tabs and the menu button take a deliberate touch (a brush does nothing); keys work while the menu is open', async ({ page, hasTouch }) => {
   test.skip(!hasTouch, 'touch only (mouse clicks are deliberate)');
   await open(page);
@@ -364,14 +406,15 @@ test('rough mode: one button at a time, firmer taps, a longer cooldown', async (
   expect(await presses()).toEqual(['hold', 'tap']);
 });
 
-test('a graze on a tap button does not fire; a palm landing on several buttons fires none of them', async ({ page, hasTouch }) => {
+test('a graze on a tap button does not fire (a quick mouse click does); a palm landing on several buttons fires none of them', async ({ page, hasTouch }) => {
   await open(page);
   const presses = await trackPresses(page);
   await f.pressStamped('tap', 15);
   await page.waitForTimeout(300);
-  expect(await presses()).toEqual([]);
-  await expectVisual(page, 'tap', 'ready');
+  // A finger brushing past isn't a tap; a mouse click, however quick, is deliberate.
+  expect(await presses()).toEqual(hasTouch ? [] : ['tap']);
   test.skip(!hasTouch, 'the palm needs a touch screen');
+  await expectVisual(page, 'tap', 'ready');
   await f.downAll(['tap', 'fail', 'rec', 'chatter']);
   await page.waitForTimeout(120);
   for (const i of [1, 2, 3, 4]) await f.up(i);
@@ -393,7 +436,7 @@ test('a hold let go early, or a press that slid off, says SLIPPED — HOLD/TAP A
   await expect(btn(page, 'tap').locator('.bp-badge')).toContainText('TAP AGAIN');
 });
 
-test('a failure stays until touched; that touch only clears it (a tap does not fire), and a hold from it retries', async ({ page }) => {
+test('a failure stays until the next run: a press on it is a retry (a tap, a key, a hold), and its ✕ clears it without one', async ({ page, hasTouch }) => {
   await open(page);
   const presses = await trackPresses(page);
   await f.tap('fail');
@@ -402,21 +445,68 @@ test('a failure stays until touched; that touch only clears it (a tap does not f
   // Its resultHoldMs (600 ms) passes: still there.
   await page.waitForTimeout(1200);
   await expectVisual(page, 'fail', 'failure');
-  await expect(btn(page, 'fail')).toContainText('TAP TO CLEAR');
+  await expect(btn(page, 'fail')).toContainText('TAP TO RETRY');
   await expect(btn(page, 'fail')).toContainText('disk full');
+  // A tap on it runs it again; so does its key (a BLE remote).
   await f.tap('fail');
-  await expectVisual(page, 'fail', 'ready');
+  await expect.poll(presses).toEqual(['fail', 'fail']);
+  await expect.poll(() => count(VIB.failure)).toBe(2);
+  await expectVisual(page, 'fail', 'failure');
+  await page.keyboard.press('e');
+  await expect.poll(presses).toEqual(['fail', 'fail', 'fail']);
+  await expect.poll(() => count(VIB.failure)).toBe(3);
+  // Its ✕: it goes, nothing runs.
+  const x = page.getByTestId('dismiss-fail');
+  await (hasTouch ? x.tap() : x.click());
+  await expectVisual(page, 'fail', 'ready', 3000);
   await expect(page.getByTestId('last-fail')).toContainText('✗');
-  expect(await presses()).toEqual(['fail']);
-  // A hold button's failure: a hold is a retry.
+  await page.waitForTimeout(300);
+  expect(await presses()).toEqual(['fail', 'fail', 'fail']);
+  // A hold button's failure: a hold that comes to nothing leaves it; a full one retries.
   await f.hold('failhold', 450);
   await expectVisual(page, 'failhold', 'failure');
   await page.waitForTimeout(900);
-  await expectVisual(page, 'failhold', 'failure');
   await expect(btn(page, 'failhold')).toContainText('HOLD TO RETRY');
-  await f.hold('failhold', 450);
-  await expect.poll(presses).toEqual(['fail', 'failhold', 'failhold']);
+  await f.hold('failhold', 120);
+  await expect(btn(page, 'failhold')).toHaveAttribute('data-flash', 'slipped');
   await expectVisual(page, 'failhold', 'failure');
+  await f.hold('failhold', 450);
+  await expect.poll(presses).toEqual(['fail', 'fail', 'fail', 'failhold', 'failhold']);
+  await expectVisual(page, 'failhold', 'failure');
+});
+
+test('rough mode keeps palm rejection: contacts landing on three buttons at once fire none of them, a hold among them neither', async ({ page, hasTouch }) => {
+  test.skip(!hasTouch, 'needs a touch screen');
+  await page.addInitScript(() => localStorage.setItem('buttpad.settings', JSON.stringify({ rough: true })));
+  await open(page);
+  const presses = await trackPresses(page);
+  for (const ids of [
+    ['tap', 'fail', 'rec'],
+    ['hold', 'tap', 'chatter'],
+  ]) {
+    await f.downAll(ids);
+    // Past the hold's 400 ms.
+    await page.waitForTimeout(600);
+    for (const i of [1, 2, 3]) await f.up(i);
+    await page.waitForTimeout(300);
+  }
+  expect(await presses()).toEqual([]);
+});
+
+test("NO RESPONSE, then someone else's run more than 3 s after the press: theirs (marked; no buzz, not kept here)", async ({ page }) => {
+  await open(page);
+  await demo(page, (b) => b.dropAcks(1));
+  await f.tap('fail');
+  await expect(btn(page, 'fail')).toContainText('NO RESPONSE', { timeout: 4000 });
+  // The press can't run any more (the host drops one over 3 s old): a run from now on isn't it.
+  await page.waitForTimeout(1200);
+  const failures = await count(VIB.failure);
+  await demo(page, (b) => b.press('main', 'fail'));
+  await expectVisual(page, 'fail', 'running');
+  await expect(page.getByTestId('other-fail')).toBeVisible();
+  await expectVisual(page, 'fail', 'failure');
+  await expectVisual(page, 'fail', 'ready', 3000);
+  expect(await count(VIB.failure)).toBe(failures);
 });
 
 test("a press begun on READY isn't sent if someone else's run started meanwhile (it would cancel theirs): ALREADY RUNNING", async ({ page }) => {

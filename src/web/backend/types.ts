@@ -2,7 +2,7 @@
  * What the UI talks to. Two implementations: `ws` (a real host) and `demo` (in-browser simulation).
  * Everything the UI renders comes from `snapshot`; the only other inputs are the async calls.
  */
-import type { Config } from '../../core/config.ts';
+import { buttonKey, type Config } from '../../core/config.ts';
 import type { HostInfo, PressResult, Role, RunRecord, StateMap, WireConfig } from '../../core/protocol.ts';
 import type { Store } from '../lib/store.ts';
 
@@ -131,3 +131,13 @@ export const emptySnapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   lastSeen: null,
   ...over,
 });
+
+/**
+ * The states of the buttons `config` has (the same object when that's all of them). A button a
+ * config change drops (or renames) gets no last word from the host: its state goes with it.
+ */
+export function statesIn(states: StateMap, config: WireConfig): StateMap {
+  const keys = new Set(config.pads.flatMap((p) => p.buttons.map((b) => buttonKey(p.id, b.id))));
+  if (Object.keys(states).every((k) => keys.has(k))) return states;
+  return Object.fromEntries(Object.entries(states).filter(([k]) => keys.has(k)));
+}

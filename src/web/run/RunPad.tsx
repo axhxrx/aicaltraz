@@ -61,7 +61,7 @@ function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad
       onPointerDown={(e) => {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
         e.preventDefault();
-        if (!ctrl.down(src(e), e.clientX, e.clientY, eventTime(e))) return;
+        if (!ctrl.down(src(e), e.clientX, e.clientY, eventTime(e), e.pointerType)) return;
         try {
           e.currentTarget.setPointerCapture(e.pointerId);
         } catch {
@@ -72,6 +72,7 @@ function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad
       onPointerUp={(e) => ctrl.up(src(e), eventTime(e))}
       onPointerCancel={(e) => ctrl.abort(src(e))}
       onLostPointerCapture={(e) => ctrl.abort(src(e))}
+      onDismiss={() => ctrl.dismiss()}
     />
   );
 }

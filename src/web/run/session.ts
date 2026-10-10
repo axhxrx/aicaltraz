@@ -211,16 +211,18 @@ export class RunSession {
     else if (what === 'again') this.say(`${name}: press again (double press)`);
     else if (what === 'cooldown') this.say(`${name}: too soon after the last press, ignored`, 'warn');
     else if (what === 'busy') this.say(`${name}: busy, the last press is still on its way`, 'warn');
+    else if (what === 'queued') this.say(`${name}: already queued, its next run starts in a moment`, 'warn');
     else if (what === 'offline') this.say(`${name}: not sent, not connected to the host`, 'warn');
   }
 
   /**
    * Keys are global (BLE remotes pair as keyboards). A key presses the button on the pad on screen
    * that has it; else the one button on any other pad that has it (with a toast saying what it
-   * did); when several other pads have it, nothing (a toast says so). `onKey` runs when a key fires
-   * a button (the app closes its menu: keys keep working while it's open). Returns the cleanup.
+   * did); when several other pads have it, nothing (a toast says so). `lock` (a kiosk): only the
+   * pad on screen. `onKey` runs when a key fires a button (the app closes its menu: keys keep
+   * working while it's open). Returns the cleanup.
    */
-  listenKeys(onKey: () => void, enabled: () => boolean = () => true): () => void {
+  listenKeys(onKey: () => void, enabled: () => boolean = () => true, lock = false): () => void {
     const held = new Set<string>();
     const down = (e: KeyboardEvent) => {
       if (!enabled() || e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
@@ -231,6 +233,8 @@ export class RunSession {
       let pad = visible;
       let b = visible ? matchKey(visible.buttons, e.key) : undefined;
       if (!b) {
+        // Locked to its pad: another pad's buttons are out of reach, keys too.
+        if (lock) return;
         const elsewhere = cfg.pads.flatMap((p) => {
           const m = p === visible ? undefined : matchKey(p.buttons, e.key);
           return m ? [{ p, m }] : [];
@@ -249,10 +253,8 @@ export class RunSession {
       if (e.repeat || held.has(code) || !pad) return;
       held.add(code);
       onKey();
-      // Not on screen: nobody sees a result it keeps there, so the key presses it (not just clears that).
-      const offscreen = pad !== visible;
-      const what = this.controller(pad, b).key(eventTime(e), offscreen);
-      if (offscreen) this.sayKey(pad, b, what);
+      const what = this.controller(pad, b).key(eventTime(e));
+      if (pad !== visible) this.sayKey(pad, b, what);
     };
     const up = (e: KeyboardEvent) => {
       if (held.delete(e.code || e.key)) e.preventDefault();

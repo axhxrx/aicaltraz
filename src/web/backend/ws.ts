@@ -28,7 +28,7 @@ import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { emptySnapshot, MAX_CONFIG_BYTES, PressError, TOO_LARGE, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
+import { emptySnapshot, MAX_CONFIG_BYTES, PressError, statesIn, TOO_LARGE, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
 
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 5000;
@@ -363,7 +363,9 @@ export class WsBackend implements Backend {
         });
         break;
       case 'config':
-        this.patch({ config: m.config, rev: m.rev, configErrors: null });
+        // A button the config dropped (or renamed) gets no last word from the host: its state goes
+        // with it, or it would look RUNNING forever (and every save would offer to "stop" it).
+        this.snapshot.set((s) => ({ ...s, config: m.config, rev: m.rev, configErrors: null, states: statesIn(s.states, m.config) }));
         this.cache(m.config, m.rev);
         break;
       case 'ack': {

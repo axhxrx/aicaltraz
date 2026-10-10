@@ -74,10 +74,11 @@ test('determinate progress keeps a slow motion cue under the fill (2% still look
 });
 
 test('label ink by WCAG contrast; colors that can’t paint a button fall back to the default', async ({ page }) => {
-  const colors = ['#f97316', 'transparent', 'currentColor', 'var(--nope)', 'rgb(255 0 0 / 0.3)', '#2f6fde'];
+  // System colors (Canvas, ButtonFace…) follow the page's color scheme: the ink picked for them can't be trusted.
+  const colors = ['#f97316', 'transparent', 'currentColor', 'var(--nope)', 'rgb(255 0 0 / 0.3)', 'Canvas', 'ButtonFace', 'color-mix(in srgb, CanvasText 50%, red)', '#2f6fde'];
   await open(page, {
     version: 1,
-    pads: [{ id: 'p', name: 'P', cols: 3, rows: 2, buttons: colors.map((color, i) => ({ id: `c${i}`, label: `C${i}`, color, x: i % 3, y: Math.floor(i / 3), action: sh('echo') })) }],
+    pads: [{ id: 'p', name: 'P', cols: 3, rows: 3, buttons: colors.map((color, i) => ({ id: `c${i}`, label: `C${i}`, color, x: i % 3, y: Math.floor(i / 3), action: sh('echo') })) }],
   });
   const look = await page.evaluate(() =>
     [...document.querySelectorAll<HTMLElement>('.bp-btn')].map((b) => ({
@@ -88,8 +89,8 @@ test('label ink by WCAG contrast; colors that can’t paint a button fall back t
   // White on orange is 2.9:1; black is 7.2:1.
   expect(look[0]!.ink).toBe('rgb(11, 12, 14)');
   // The see-through or context-only colors are painted as the default blue, with its white ink.
-  for (const i of [1, 2, 3, 4]) expect(look[i]).toEqual(look[5]);
-  expect(look[5]).toEqual({ bg: 'rgb(47, 111, 222)', ink: 'rgb(255, 255, 255)' });
+  for (const i of [1, 2, 3, 4, 5, 6, 7]) expect(look[i]).toEqual(look[8]);
+  expect(look[8]).toEqual({ bg: 'rgb(47, 111, 222)', ink: 'rgb(255, 255, 255)' });
 });
 
 test('forced colors: buttons keep visible edges, the hold fill, the LIVE dot, and the state in words', async ({ page, hasTouch }) => {

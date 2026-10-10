@@ -11,14 +11,14 @@
  */
 import { buttonKey, findButton, parseConfig, type Button, type Config } from '../../core/config.ts';
 import { initialState, transition, type Effect, type MachineEvent, type RunState } from '../../core/machine.ts';
-import { PRESS_MAX_AGE_MS, type PressResult, type RunRecord } from '../../core/protocol.ts';
+import { PRESS_MAX_AGE_MS, type PressResult, type RunRecord, type StateMap } from '../../core/protocol.ts';
 import { wall } from '../lib/clock.ts';
 import { mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import { DEMO_CONFIG } from './demo-config.ts';
 import { simulate, type SimHandle } from './demo-script.ts';
-import { CANCEL_GRACE_MS, emptySnapshot, PressError, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
+import { CANCEL_GRACE_MS, emptySnapshot, PressError, statesIn, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
 
 /**
  * As on the host for one connection (src/server/limits.ts): presses that start or queue a run,
@@ -106,15 +106,24 @@ export class DemoBackend implements Backend {
       role: 'admin',
       config: this.config,
       rev: rev(JSON.stringify(this.config)),
-      states: Object.fromEntries(this.states),
+      states: this.shownStates(),
       latched: Object.fromEntries(this.latched),
       host: { name: 'Demo (in this browser)', version: 'demo', platform: 'browser' },
     });
   }
 
+  /**
+   * What the "host" tells devices: the states of the buttons in the config (one a config change
+   * dropped keeps its state here, for its run ids if it comes back, but devices hear no more of it).
+   */
+  private shownStates(): StateMap {
+    return statesIn(Object.fromEntries(this.states), this.config);
+  }
+
   private setState(key: string, s: RunState) {
     this.states.set(key, s);
-    if (this.online) this.snapshot.set((snap) => ({ ...snap, states: { ...snap.states, [key]: s } }));
+    const [pad, id] = key.split('/') as [string, string];
+    if (this.online && this.button(pad, id)) this.snapshot.set((snap) => ({ ...snap, states: { ...snap.states, [key]: s } }));
   }
 
   private latch(key: string, text: string) {
@@ -327,7 +336,7 @@ export class DemoBackend implements Backend {
     this.dropRemoved();
     lsSet(KEYS.demoConfig, JSON.stringify(r.config));
     const next = rev(JSON.stringify(r.config));
-    this.snapshot.set((s) => ({ ...s, config: r.config, rev: next, configErrors: null }));
+    this.snapshot.set((s) => ({ ...s, config: r.config, rev: next, configErrors: null, ...(this.online ? { states: this.shownStates() } : {}) }));
     return { ok: true, rev: next };
   }
 

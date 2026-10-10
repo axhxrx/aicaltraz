@@ -229,11 +229,95 @@ test('a hello that arrives seconds after its socket opened (a big config): the c
   expect(Math.abs(sent!.at! - sent!.sentAt)).toBeLessThan(1000);
 });
 
+/** A config whose hello, as a press device gets it (labels; no actions), is about 5 KB a pad. */
+function bigConfig(pads: number): ConfigInput {
+  return {
+    version: 1,
+    pads: Array.from({ length: pads }, (_, p) => ({
+      id: `pad${p}`,
+      name: `Pad ${p}`,
+      cols: 3,
+      rows: 4,
+      buttons: Array.from({ length: 12 }, (_, i) => ({ id: `b${i}`, label: `Pad ${p} button ${i} `.repeat(12).trim().slice(0, 200), x: i % 3, y: Math.floor(i / 3), trigger: 'tap' as const, action: sh('echo ok') })),
+    })),
+  };
+}
+
+test('a big hello over a slow link (about 40 KB at 150 kbps, 600 ms): the clock offset is still right, presses run', async ({ page, hasTouch }) => {
+  test.setTimeout(90_000);
+  const big = await startHost(bigConfig(8));
+  try {
+    const frames = await recordPressFrames(page);
+    await page.goto(`${big.url}/?pad=pad0#token=${big.pressToken}`);
+    await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 10_000 });
+    // The link turns slow, and the socket is opened again over it: its hello takes seconds now.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Network.enable');
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 600, downloadThroughput: (150 * 1024) / 8, uploadThroughput: (150 * 1024) / 8 });
+    const first = await page.evaluateHandle(() => (window.__buttpad!.backend as unknown as { ws: WebSocket | null }).ws);
+    await page.evaluate(() => (window.__buttpad!.backend as unknown as { ws: WebSocket }).ws.close());
+    await expect
+      .poll(
+        () =>
+          page.evaluate((w) => {
+            const b = window.__buttpad!.backend as unknown as { ws: WebSocket | null; snapshot: { get(): { status: string } } };
+            return b.ws !== w && b.snapshot.get().status === 'online';
+          }, first),
+        { timeout: 40_000 },
+      )
+      .toBe(true);
+    // Host and browser share a clock here: the offset learned from that hello is about 0, not its delay.
+    expect(Math.abs(await page.evaluate(() => window.__buttpad!.backend.snapshot.get().clockSkew))).toBeLessThan(1500);
+    await new Fingers(page, hasTouch).tap('b0');
+    await expectVisual(page, 'b0', 'success', 8000);
+    const sent = (await frames()).at(-1)!;
+    expect(Math.abs(sent.at! - sent.sentAt)).toBeLessThan(1500);
+  } finally {
+    await big.dispose();
+  }
+});
+
+test('a running button a config change removes leaves no state behind (no ghost RUNNING for later saves to "stop")', async ({ page, request }) => {
+  // A host of its own: this changes its config.
+  const h = await startHost({
+    version: 1,
+    pads: [
+      {
+        id: 'p',
+        name: 'P',
+        cols: 2,
+        rows: 1,
+        buttons: [
+          { id: 'slow', label: 'Slow', x: 0, y: 0, trigger: 'tap', action: sh('sleep 30') },
+          { id: 'quick', label: 'Quick', x: 1, y: 0, trigger: 'tap', action: sh('echo quick') },
+        ],
+      },
+    ],
+  });
+  try {
+    await page.goto(`${h.url}/?pad=p#token=${h.pressToken}`);
+    await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 10_000 });
+    const headers = { authorization: `Bearer ${h.adminToken}` };
+    await request.post(`${h.url}/api/press/p/slow`, { headers });
+    await expectVisual(page, 'slow', 'running');
+    const got = (await (await request.get(`${h.url}/api/config`, { headers })).json()) as { config: { pads: { buttons: { id: string }[] }[] }; rev: string };
+    const without = structuredClone(got.config);
+    without.pads[0]!.buttons = without.pads[0]!.buttons.filter((b) => b.id !== 'slow');
+    expect((await request.put(`${h.url}/api/config`, { headers, data: { config: without, baseRev: got.rev } })).ok()).toBe(true);
+    await expect(btn(page, 'slow')).toHaveCount(0);
+    // Its run is stopped meanwhile; the host says no more about a button that's gone.
+    await page.waitForTimeout(1500);
+    expect(await page.evaluate(() => window.__buttpad!.backend.snapshot.get().states['p/slow'] ?? null)).toBeNull();
+  } finally {
+    await h.dispose();
+  }
+});
+
 test('a tap made right before the page stalled says when it was made: the host drops it (too late) rather than run it 4 s late', async ({ page, hasTouch }) => {
   const frames = await recordPressFrames(page);
   await open(page);
   await expectVisual(page, 'quick', 'ready', 8000);
-  const socket = await page.evaluateHandle(() => window.__buttpad!.backend.ws);
+  const socket = await page.evaluateHandle(() => (window.__buttpad!.backend as unknown as { ws: WebSocket | null }).ws);
   // Busy from 20 ms after the touch for 4 s; the finger lifted at 80 ms (stamped events).
   await page.evaluate(() =>
     document.querySelector('[data-testid="btn-quick"]')!.addEventListener(
@@ -258,7 +342,7 @@ test('a tap made right before the page stalled says when it was made: the host d
   expect(sent!.sentAt - t0).toBeGreaterThan(3500);
   expect(host.log()).toMatch(/dropped a stale press of main\/quick/);
   // The offset was fine (the press was old already when it went out): the socket is kept.
-  expect(await page.evaluate((ws) => ws === window.__buttpad!.backend.ws, socket)).toBe(true);
+  expect(await page.evaluate((ws) => ws === (window.__buttpad!.backend as unknown as { ws: WebSocket | null }).ws, socket)).toBe(true);
 });
 
 test('a queued re-run that All off drops is no longer this device’s: a later run by someone else is marked, and its failure not kept here', async ({ page, request }) => {

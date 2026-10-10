@@ -18,6 +18,8 @@ export interface FaceProps extends Omit<HTMLAttributes<HTMLDivElement>, 'style' 
   now: number;
   class?: string;
   style?: Record<string, string>;
+  /** The ✕ on a result kept on screen (run mode): clears it without a press. */
+  onDismiss?: () => void;
 }
 
 const POP: Keyframe[] = [{ transform: 'scale(1)' }, { transform: 'scale(1.045)', offset: 0.32 }, { transform: 'scale(0.99)', offset: 0.7 }, { transform: 'scale(1)' }];
@@ -93,8 +95,11 @@ function Hints({ vm }: { vm: ButtonVM }) {
 
 const LAST_GLYPH = { ok: '✓', bad: '✗', stopped: '■', warn: '!' } as const;
 
-/** The top edge: another device's run, or how the last run ended (left); latched device state (right). */
-function TopBand({ vm }: { vm: ButtonVM }) {
+/**
+ * The top edge: another device's run, how the last run ended, or the ✕ of a result kept on screen
+ * (left); latched device state (right).
+ */
+function TopBand({ vm, onDismiss }: { vm: ButtonVM; onDismiss?: () => void }) {
   const left = vm.other ? (
     <span class="bp-mark bp-other" data-testid={`other-${vm.id}`}>
       <Devices />
@@ -108,6 +113,21 @@ function TopBand({ vm }: { vm: ButtonVM }) {
         <span class="bp-short">{vm.last.ago.replace(/ (\w) ago$/, '$1')}</span>
       </span>
     </span>
+  ) : vm.sticky && onDismiss ? (
+    <button
+      type="button"
+      class="bp-dismiss"
+      data-testid={`dismiss-${vm.id}`}
+      aria-label={`Clear this result (${vm.label || vm.id})`}
+      // Its own touch: not a press of the button under it.
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        onDismiss();
+      }}
+    >
+      ✕
+    </button>
   ) : null;
   if (!left && !vm.latched) return null;
   return (
@@ -185,7 +205,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
           <G class="bp-icon" />
           {vm.title && <Fit class="bp-headline" text={vm.title} lines={2} />}
           {vm.detail && <Sub class="bp-detail" text={vm.detail} />}
-          {vm.nextQueued ? <NextQueued /> : vm.sticky && <div class="bp-sticky">{vm.trigger === 'hold' ? 'HOLD TO RETRY' : 'TAP TO CLEAR'}</div>}
+          {vm.nextQueued ? <NextQueued /> : vm.sticky && <div class="bp-sticky">{`${verbOf(vm.trigger)} TO RETRY`}</div>}
         </>
       );
     }
@@ -259,7 +279,7 @@ const FC_WORD: Partial<Record<Visual, string>> = {
   offline: 'OFFLINE',
 };
 
-export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
+export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: FaceProps) {
   const face = useRef<HTMLDivElement>(null);
   const arm = useRef<HTMLDivElement>(null);
   const flash = useRef<HTMLDivElement>(null);
@@ -318,7 +338,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
   // Offline: the last-known state's layers stay, under the OFFLINE look.
   const u = v === 'offline' ? vm.under : v;
   const badge = vm.flash ? badgeOf(vm.flash.kind, vm) : undefined;
-  const top = !!(vm.latched || vm.last || vm.other);
+  const top = !!(vm.latched || vm.last || vm.other || (vm.sticky && onDismiss));
   return (
     <div
       class={`bp-btn${cls ? ` ${cls}` : ''}${top ? ' has-top' : ''}`}
@@ -342,7 +362,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
         <div ref={arm} class="bp-arm" />
         <div ref={flash} class="bp-flash" />
         {(v === 'confirm' || v === 'offline' || v === 'unknown' || v === 'interrupted') && <div class="bp-frame" />}
-        <TopBand vm={vm} />
+        <TopBand vm={vm} onDismiss={onDismiss} />
         <div class="bp-content">
           <Content vm={vm} now={now} />
         </div>

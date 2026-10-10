@@ -12,13 +12,21 @@ Status: working prototype. Spec: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Quick start
 
+Needs a recent [Bun](https://bun.sh) on the host (developed on 1.4; macOS, Linux x64/arm64 incl. Raspberry Pi 4/5 with a
+64-bit OS; Windows should work but is untested): `curl -fsSL https://bun.sh/install | bash`.
+
 ```sh
 bun install
 bun run example        # host with the example config: fake lights/camera scripts, 3 pads
+bun start              # your own ./buttpad.config.json (a starter one is written if missing)
+bun src/server/main.ts --help    # --config, --port, --host, --rotate-tokens, --tls-cert/--tls-key …
 ```
 
 It prints a **press URL** (and a QR code) and an **admin URL**. Open one on your phone (same
-network). The token in the URL pairs the device and is then stripped from the address bar.
+network; the host's firewall must allow the port, 8787 by default). The token in the URL pairs the
+device and is then stripped from the address bar. **The QR code pairs a press-only device**: to edit
+pads from a phone, open the admin URL on it instead (it's printed below the press URL — send it to
+yourself, it's a password).
 
 - `bun start` uses `./buttpad.config.json`, writing a harmless starter config if it's missing.
 - No host handy? Open any host's page with `?demo` — an in-browser simulation of the whole thing.
@@ -101,10 +109,42 @@ Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:
 
 - Results: ✓ shows for `resultHoldMs`; ✗ (and NO RESPONSE / NOT SENT / INTERRUPTED) stays until you
   touch it; READY buttons show how their last run went ("✓ 12 s ago").
-- Menu → device settings → **Rough mode** for gloves/vibration: one button at a time, longer
-  minimum tap, longer cooldown, more drift tolerance.
+- Menu → **Rough mode** for gloves/vibration: one button at a time, longer minimum tap, longer
+  cooldown, more drift tolerance. Recommended whenever you wear gloves.
 - `?lock&pad=lights` for a mounted tablet: no tabs, menu only on long-press; if that pad is renamed
   or deleted it says so instead of becoming another pad's remote.
+
+## Recipes
+
+- **Status check** ("is the printer done?"): print the answer as `@state` so it stays on the button,
+  e.g. `echo "@state printing 37%"`; exit 0 either way so it doesn't look like a failure.
+- **Long actions** (a garage door, a fade): print `@state` / `@status` first (`@state OPENING`),
+  then progress (`@progress 40`), then the final `@state OPEN`. If the host restarts mid-run the
+  button shows INTERRUPTED.
+- **Stop everything**: a button with `"action": {"type": "none"}`, `"stops": ["*"]`, `"confirm": true`.
+- **Bash scripts**: `"shell": "bash"` — the default is `/bin/sh`.
+
+## Running it for real
+
+A systemd unit (Linux), `/etc/systemd/system/buttpad.service`:
+
+```ini
+[Unit]
+Description=ButtPad
+After=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/buttpad
+ExecStart=/home/pi/.bun/bin/bun src/server/main.ts --config /home/pi/buttpad/buttpad.config.json --no-qr
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`sudo systemctl enable --now buttpad`; `journalctl -u buttpad` shows the pairing URLs and the run
+log. Or `bun run compile` and run the single `dist/buttpad` binary anywhere.
 
 ## Keep-awake
 

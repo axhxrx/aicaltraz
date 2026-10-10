@@ -158,8 +158,9 @@ function Connected(p: { backend: Backend; opts: AppOptions; onPair(t: string): v
   const editing = mode === 'edit' && role === 'admin';
   // A kiosk locked to a pad that's gone has no buttons, and its remote presses none elsewhere either.
   const keysOff = useRef(false);
-  // Keys work for every pad, and while the menu is open (a key that presses a button closes it).
-  useEffect(() => (editing ? undefined : session.listenKeys(() => setMenu(false), () => !keysOff.current)), [session, editing]);
+  // Keys work for every pad (a kiosk's only for its own), and while the menu is open (a key that
+  // presses a button closes it).
+  useEffect(() => (editing ? undefined : session.listenKeys(() => setMenu(false), () => !keysOff.current, opts.lock)), [session, editing]);
   // Unsaved edits kept on this device from an earlier editor (a reload, a new token…): offered back.
   const kept = useMemo(() => {
     if (role !== 'admin' || opts.lock || mode !== 'run') return null;

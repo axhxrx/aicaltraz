@@ -1,7 +1,7 @@
 /**
  * Client-side half of a button: turns pointer/key input into fires (hold/tap/double, drift,
  * confirm, cooldown) and owns the client-only states (ARMING, CONFIRM, SENDING, flashes, and the
- * results this device keeps on screen until touched). Host state stays authoritative; this only
+ * results this device keeps on screen until the next run or their ✕). Host state stays authoritative; this only
  * decorates it. Framework-free; one per button for the whole session (run/session.ts), so the
  * outcome of a press still buzzes after switching pads.
  *
@@ -65,22 +65,23 @@ export type FlashKind = 'busy' | 'cooldown' | 'later' | 'already' | 'queued' | '
 export type Via = 'key' | 'hold' | 'tap' | 'double';
 
 /**
- * What a key press did (a key for a button on another pad says it in a toast): sent; confirm (the
+ * What a press did (a key for a button on another pad says it in a toast): sent; confirm (the
  * confirm step: press again); again (the first press of a double); cooldown (too soon after the
- * last fire, ignored); busy (the last press is still on its way); offline (not connected); cleared
- * (it cleared a result kept on screen); none (a bounce, a finger on the button).
+ * last fire, ignored); busy (the last press is still on its way); queued (a queued re-run starts in
+ * a moment: nothing sent); offline (not connected); none (a bounce, a finger on the button).
  */
-export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'offline' | 'cleared' | 'none';
+export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'queued' | 'offline' | 'none';
 
 /**
  * A result this device shows on its own, on top of what the host says:
- * - failure / interrupted: one of this device's runs failed. Stays until touched.
- * - noresponse: sent, no answer (it may or may not have run). Stays until touched, or until the
- *   host's state shows what it did.
- * - notsent: it never reached the host (or arrived too late and was dropped). Stays until touched.
+ * - failure / interrupted: one of this device's runs failed.
+ * - noresponse: sent, no answer (it may or may not have run). Until the host's state shows what it did.
+ * - notsent: it never reached the host (or arrived too late and was dropped).
  * - ran: a press that got no answer did run, and finished before the link came back. Shows how it
- *   ended when the host still knows (`last`); a failure stays until touched, anything else for
+ *   ended when the host still knows (`last`); a failure is kept, anything else shows for
  *   resultHoldMs.
+ * A kept one stays until the next run on the button supersedes it, a press of it fires (a retry:
+ * an ordinary press), or its ✕ clears it (dismiss()).
  */
 export interface LocalResult {
   kind: 'failure' | 'interrupted' | 'noresponse' | 'notsent' | 'ran';
@@ -207,8 +208,6 @@ interface Gesture {
   confirmed: boolean;
   /** The confirm window this press took over, given back if the press comes to nothing. */
   window: Local['confirm'];
-  /** Began on a result this device kept on screen, and dismissed it: a tap doesn't fire; a hold that comes to nothing is quiet. */
-  dismissed: boolean;
   /** What the host showed when it began: a run someone else starts meanwhile isn't this press's to touch. */
   runId0: number;
   idle0: boolean;
@@ -389,8 +388,8 @@ export class ButtonController {
 
   /**
    * Run ids started over: the runs remembered here are gone, and their ids will name new ones. A
-   * result kept on screen stays until touched (the next run supersedes it, as usual); one that a
-   * newer run had superseded already doesn't come back.
+   * result kept on screen stays (the next run supersedes it, as usual); one that a newer run had
+   * superseded already doesn't come back.
    */
   private forget(host: RunState) {
     const { result: r, sending } = this.l;
@@ -418,7 +417,7 @@ export class ButtonController {
     if (r.until !== undefined) this.after('result', Math.max(0, r.until - wall()) + 20, () => this.l.result === r && this.patch({ result: null }));
   }
 
-  /** One of our runs ended: cue it once, and keep a failure on screen until touched. */
+  /** One of our runs ended: cue it once, and keep a failure on screen (until the next run, or ✕). */
   private settle(host: RunState) {
     const o = outcomeOf(host);
     if (!o || !this.isOwn(o.runId) || this.handled.includes(o.runId)) return;
@@ -444,8 +443,10 @@ export class ButtonController {
   /**
    * A contact went down on the button at `t` (mono()). Returns whether it is now part of a press
    * (the caller captures the pointer). A second contact on a pressed button joins that press.
+   * `kind`: the PointerEvent's pointerType. A finger needs a minimum contact time to tap (a graze
+   * isn't a tap); a mouse or pen click is deliberate however short.
    */
-  down(src: string, x: number, y: number, t = mono()): boolean {
+  down(src: string, x: number, y: number, t = mono(), kind = 'touch'): boolean {
     const ctx = this.ctx;
     if (!ctx) return false;
     const g = this.g;
@@ -470,13 +471,7 @@ export class ButtonController {
     // when the contact happened, not when a busy page got to it).
     if (c && now - Math.max(0, mono() - t) - c.at < Math.max(CONFIRM_MIN_MS, this.cooldown())) return false;
     const host = ctx.host();
-    // A result kept on screen: this touch is for it.
-    const dismissed = resultShown(this.l, host, now);
-    if (dismissed) {
-      this.clear('result');
-      this.patch({ result: null });
-      haptic('touch');
-    }
+    // (A result kept on screen: this is a press like any other, a retry. It clears it if it fires.)
     const second = b.trigger === 'double' && this.tapAt > 0 && t - this.tapAt <= DOUBLE_TAP_MS;
     this.tapAt = 0;
     this.clear('double');
@@ -496,21 +491,20 @@ export class ButtonController {
       trigger: b.trigger,
       holdMs: b.holdMs,
       driftPx: b.driftPx * (rough ? ROUGH.drift : 1),
-      tapMinMs: rough ? ROUGH.tapMinMs : TAP_MIN_MS,
+      tapMinMs: kind !== 'touch' ? 0 : rough ? ROUGH.tapMinMs : TAP_MIN_MS,
       fired: false,
       second,
       confirmed,
       window,
-      dismissed,
       runId0: host.runId,
       idle0: host.phase !== 'running',
     };
     this.g = next;
     if (b.trigger === 'hold') {
-      if (!dismissed) haptic('touch');
+      haptic('touch');
       this.patch({ input: 'arming', armAt: now - Math.max(0, mono() - t), armMs: b.holdMs });
       this.after('hold', Math.max(0, t + b.holdMs - mono()), () => this.holdDue(next, false));
-    } else if (!dismissed) this.patch({ input: 'pressed' });
+    } else this.patch({ input: 'pressed' });
     return true;
   }
 
@@ -536,7 +530,7 @@ export class ButtonController {
   /**
    * The press came to nothing. `slipped`: let go early or slid off (says SLIPPED, buzzes). `buzz`:
    * a short buzz only (a resting thumb, the system took the contact, the button moved). `quiet`:
-   * nothing (a graze, a palm, the link went, a touch that only dismissed a result).
+   * nothing (a graze, a palm, the link went).
    */
   private cancelGesture(g: Gesture, how: 'slipped' | 'buzz' | 'quiet') {
     if (this.g === g) this.g = null;
@@ -544,7 +538,6 @@ export class ButtonController {
     if (g.fired) return;
     this.patch({ input: 'idle', disarmAt: this.l.input === 'arming' ? wall() : this.l.disarmAt });
     this.restoreWindow(g.window);
-    if (g.dismissed) return;
     if (how === 'slipped') this.flash('slipped');
     if (how !== 'quiet') cue('cancel');
   }
@@ -580,8 +573,6 @@ export class ButtonController {
     if (g.fired) return;
     const held = t - g.t0;
     if (g.trigger === 'hold') return held >= g.holdMs ? this.fireGesture(g) : this.cancelGesture(g, 'slipped');
-    // A touch that dismissed a result is done.
-    if (g.dismissed) return this.cancelGesture(g, 'quiet');
     // A graze isn't a tap; a thumb resting on a tap button and lifting later isn't either.
     if (held < g.tapMinMs) return this.cancelGesture(g, 'quiet');
     if (held > TAP_MAX_MS) return this.cancelGesture(g, 'buzz');
@@ -605,11 +596,10 @@ export class ButtonController {
   /**
    * A mapped key went down at `t` (auto-repeat already filtered out). Keys don't hold: clickers
    * send keydown and keyup together, so hold and tap buttons fire right away, and a double fires
-   * on the second keydown within DOUBLE_TAP_MS. Confirm and cooldown still apply. A result kept on
-   * screen takes the key (it only clears it), unless the button is `offscreen` (on another pad):
-   * then nobody sees that result to clear, and the key press is a press. Says what it did.
+   * on the second keydown within DOUBLE_TAP_MS. Confirm and cooldown still apply, and a result
+   * kept on screen doesn't take the key (it's a retry, like a touch). Says what it did.
    */
-  key(t = mono(), offscreen = false): KeyResult {
+  key(t = mono()): KeyResult {
     const ctx = this.ctx;
     if (!ctx) return 'none';
     unlockAudio();
@@ -621,15 +611,6 @@ export class ButtonController {
     // A finger is on it already.
     if (this.g) return 'none';
     const now = wall();
-    if (resultShown(this.l, ctx.host(), now)) {
-      this.clear('result');
-      this.patch({ result: null });
-      // A result kept on screen: this key press is for it.
-      if (!offscreen) {
-        haptic('touch');
-        return 'cleared';
-      }
-    }
     const c = this.l.confirm && this.l.confirm.until > now ? this.l.confirm : null;
     // A key that bounces (or chatters) right after CONFIRM came up doesn't confirm.
     if (c && now - Math.max(0, mono() - t) - c.at < Math.max(CONFIRM_MIN_MS, this.cooldown())) return 'none';
@@ -653,6 +634,15 @@ export class ButtonController {
     cue('denied');
   }
 
+  /** The ✕ on a result kept on screen: it goes, nothing fires. */
+  dismiss(): void {
+    const ctx = this.ctx;
+    if (!ctx || !resultShown(this.l, ctx.host(), wall())) return;
+    this.clear('result');
+    this.patch({ result: null });
+    haptic('touch');
+  }
+
   // ---- firing ---------------------------------------------------------------------------------
 
   /** A press fired (made at `at`, mono()): send it, or ask for the confirm step, or say why not. */
@@ -673,6 +663,13 @@ export class ButtonController {
     }
     const button = ctx.button();
     const host = ctx.host();
+    // A result whose queued re-run starts in a moment (NEXT RUN QUEUED): the host ignores presses
+    // until then, so say so rather than send one for a "try again".
+    if ((host.phase === 'success' || host.phase === 'failure') && host.queued) {
+      this.flash('queued');
+      cue('busy');
+      return 'queued';
+    }
     // Begun on what looked READY, but someone else's run started meanwhile: this press was meant to
     // start one, not to cancel, queue behind or bump into theirs.
     if (g?.idle0 && host.phase === 'running' && host.runId > g.runId0 && !this.isOwn(host.runId)) {
@@ -839,7 +836,7 @@ export class ButtonController {
         // Someone else's run got there first; the re-run is queued already; busy with its own run;
         // not running: refused for now (rate limit, last run still dying).
         if (host?.phase === 'running') this.flash(host.runId > baseRunId && !this.isOwn(host.runId) ? 'already' : host.queued ? 'queued' : 'busy');
-        else this.flash('later');
+        else this.flash(host && host.phase !== 'ready' && host.queued ? 'queued' : 'later');
         cue('busy');
         break;
       case 'expired':

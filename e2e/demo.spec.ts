@@ -1,6 +1,6 @@
 /** Run-mode flows against the in-browser demo backend (`?demo&exact`: no random timing/failures). */
 import { expect, test, type Page } from '@playwright/test';
-import { btn, expectVisual, FLOW_CONFIG, Fingers, seedDemo } from './helpers.ts';
+import { btn, expectVisual, FLOW_CONFIG, Fingers, seedDemo, trackPresses } from './helpers.ts';
 
 let f: Fingers;
 
@@ -197,6 +197,21 @@ test('queue while running runs again: the result shows NEXT RUN QUEUED, then the
   await expectVisual(page, 'queue', 'running', 2000);
   await expectVisual(page, 'queue', 'success', 4000);
   await expect(btn(page, 'queue')).not.toContainText('NEXT RUN QUEUED');
+});
+
+test('while NEXT RUN QUEUED shows (its re-run starts in a moment), a press says ALREADY QUEUED and sends nothing', async ({ page }) => {
+  const presses = await trackPresses(page);
+  await f.tap('queue');
+  await expectVisual(page, 'queue', 'running');
+  await page.waitForTimeout(450);
+  await f.tap('queue');
+  await expect(btn(page, 'queue')).toContainText('QUEUED');
+  await expect(btn(page, 'queue')).toContainText('NEXT RUN QUEUED', { timeout: 4000 });
+  await f.tap('queue');
+  await expect(btn(page, 'queue')).toHaveAttribute('data-flash', 'queued');
+  await expect(btn(page, 'queue').locator('.bp-badge')).toContainText('ALREADY');
+  expect(await presses()).toEqual(['queue', 'queue']);
+  await expectVisual(page, 'queue', 'running', 2000);
 });
 
 test('no ack within 2 s → NO RESPONSE (amber, not the red failure)', async ({ page }) => {

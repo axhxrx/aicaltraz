@@ -14,9 +14,13 @@ let ctx: CanvasRenderingContext2D | null | undefined;
 
 /**
  * Colors that only mean something in context: `currentColor`, custom properties, `env()`… The
- * canvas would resolve them against itself (or not at all), never against the button.
+ * canvas would resolve them against itself (or not at all), never against the button. So do the
+ * system colors (`Canvas`, `ButtonFace`…, and the engines' own `-webkit-link`…): they follow the
+ * page's color scheme and forced colors, which the canvas's answer doesn't, so the ink picked for
+ * them can be unreadable.
  */
-const CONTEXTUAL = /currentcolor|var\(|env\(|attr\(|inherit|initial|unset|revert|light-dark\(/i;
+const CONTEXTUAL =
+  /currentcolor|var\(|env\(|attr\(|inherit|initial|unset|revert|light-dark\(|-(webkit|moz|internal)-|\b(accentcolor|accentcolortext|activetext|buttonborder|buttonface|buttontext|canvas|canvastext|field|fieldtext|graytext|highlight|highlighttext|linktext|mark|marktext|selecteditem|selecteditemtext|visitedtext|activeborder|activecaption|appworkspace|background|buttonhighlight|buttonshadow|captiontext|inactiveborder|inactivecaption|inactivecaptiontext|infobackground|infotext|menu|menutext|scrollbar|threeddarkshadow|threedface|threedhighlight|threedlightshadow|threedshadow|window|windowframe|windowtext)\b/i;
 
 function resolve(color: string): Resolved {
   if (cache.has(color)) return cache.get(color)!;

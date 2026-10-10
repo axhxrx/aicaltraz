@@ -95,10 +95,10 @@ function setup(buttons: ButtonIn[], states: StateMap = {}) {
   const pad = config.pads[0]!;
   const ctl: Record<string, import('../src/web/run/controller.ts').ButtonController> = {};
   for (const b of pad.buttons) ctl[b.id] = session.controller(pad, b);
-  const vm = (id: string) => {
+  const vm = (id: string, now = wall()) => {
     const b = pad.buttons.find((x) => x.id === id) as WireButton;
     const s = be.snapshot.get();
-    return viewOf(b, s.states[`p/${id}`] ?? { phase: 'ready', runId: 0 }, ctl[id]!.local.get(), s.status, 0, wall());
+    return viewOf(b, s.states[`p/${id}`] ?? { phase: 'ready', runId: 0 }, ctl[id]!.local.get(), s.status, 0, now);
   };
   return { be, session, ctl, vm, sent: () => be.got.map((g) => g.button) };
 }
@@ -342,25 +342,75 @@ describe('keys and presses', () => {
     session.dispose();
   });
 
-  test('a key for a button on another pad fires it, over a failure it keeps; on screen the key only clears that', async () => {
-    const { ctl, be, sent, session } = setup([tapButton('k', 0, { key: 'k' })], { 'p/k': ready(0) });
-    const fail = async (runId: number) => {
+  test('a press on a failure kept on screen is a retry, a key too; the kept failure stays until then, and its ✕ clears it', async () => {
+    const { ctl, be, sent, vm, session } = setup([tapButton('k', 0, { key: 'k' }), tapButton('c', 1, { key: 'c', confirm: true })], { 'p/k': ready(0), 'p/c': ready(0) });
+    const fail = (id: string, runId: number) => {
       be.got.at(-1)!.ack({ result: 'started', runId });
-      be.set('p/k', running(runId));
-      be.set('p/k', failed(runId));
-      expect(ctl.k!.local.get().result?.kind).toBe('failure');
+      be.set(`p/${id}`, running(runId));
+      be.set(`p/${id}`, failed(runId));
+      be.set(`p/${id}`, ready(runId, { runId, ok: false, reason: 'exit', endedAt: wall() }));
+      expect(vm(id).sticky).toBe(true);
     };
     ctl.k!.key(mono());
-    await fail(1);
-    const onScreen = ctl.k!.key(mono(), false);
-    expect(sent()).toEqual(['k']);
-    ctl.k!.key(mono());
-    await fail(2);
+    fail('k', 1);
+    // A key (a BLE remote): fires again.
     vib.length = 0;
-    const offScreen = ctl.k!.key(mono(), true);
-    expect(sent()).toEqual(['k', 'k', 'k']);
+    const what = ctl.k!.key(mono());
+    expect(sent()).toEqual(['k', 'k']);
+    expect(what).toBe('sent');
     expect(vib).toContain(FIRE);
-    expect([onScreen, offScreen]).toEqual(['cleared', 'sent']);
+    fail('k', 2);
+    // A tap: fires on release like any tap; until then the failure stays.
+    const t = mono();
+    ctl.k!.down('p1', 10, 10, t);
+    expect(vm('k').visual).toBe('failure');
+    ctl.k!.up('p1', t + 80);
+    expect(sent()).toEqual(['k', 'k', 'k']);
+    fail('k', 3);
+    // Its ✕: cleared, nothing sent.
+    ctl.k!.dismiss();
+    expect(vm('k').visual).toBe('ready');
+    expect(sent()).toEqual(['k', 'k', 'k']);
+    // A confirm button: the retry asks for the confirm step over the kept failure, which is back when the window runs out.
+    ctl.c!.key(mono());
+    expect(vm('c').visual).toBe('confirm');
+    await sleep(450);
+    ctl.c!.key(mono());
+    fail('c', 1);
+    expect(ctl.c!.key(mono())).toBe('confirm');
+    expect(vm('c').visual).toBe('confirm');
+    expect(vm('c', wall() + 3100).visual).toBe('failure');
+    session.dispose();
+  });
+
+  test('a mouse or pen click fires a tap button however short; a finger needs 40 ms (shorter is a graze)', () => {
+    const { ctl, sent, session } = setup([tapButton('a', 0), tapButton('b', 1), tapButton('c', 2)]);
+    // (Contacts 100 ms apart: three within 60 ms would be a palm.)
+    const t = mono() - 500;
+    ctl.a!.down('p1', 10, 10, t, 'touch');
+    ctl.a!.up('p1', t + 15);
+    ctl.b!.down('p2', 110, 10, t + 100, 'mouse');
+    ctl.b!.up('p2', t + 108);
+    ctl.c!.down('p3', 210, 10, t + 200, 'pen');
+    ctl.c!.up('p3', t + 212);
+    expect(sent()).toEqual(['b', 'c']);
+    session.dispose();
+  });
+
+  test("in a queued re-run's gap (its result says NEXT RUN QUEUED), a press says ALREADY QUEUED and sends nothing", () => {
+    const gap = succeeded(4, { queued: true });
+    const { ctl, sent, vm, session } = setup([tapButton('q', 0, { whileRunning: 'queue' }), tapButton('c', 1, { whileRunning: 'queue', confirm: true })], { 'p/q': gap, 'p/c': gap });
+    const what = ctl.q!.key(mono());
+    expect(sent()).toEqual([]);
+    expect(vm('q').flash?.kind).toBe('queued');
+    // Not a confirm step either: nothing can start yet.
+    const t = mono();
+    ctl.c!.down('p1', 110, 10, t);
+    ctl.c!.up('p1', t + 80);
+    expect(vm('c').visual).not.toBe('confirm');
+    expect(vm('c').flash?.kind).toBe('queued');
+    expect(sent()).toEqual([]);
+    expect(what).toBe('queued');
     session.dispose();
   });
 
@@ -413,6 +463,21 @@ describe('the demo backend, like the host', () => {
     expect(d.snapshot.get().latched['p/rec']).toBeUndefined();
     expect((await d.saveConfig(Config.parse(CFG), d.snapshot.get().rev!)).ok).toBe(true);
     expect(d.snapshot.get().latched['p/rec']).toBeUndefined();
+    d.dispose();
+  });
+
+  test('a button removed while it runs leaves no state behind on devices (no ghost RUNNING), not even once its run ends', async () => {
+    const d = demo();
+    expect(await d.press('p', 'q')).toBe('started');
+    expect(d.snapshot.get().states['p/q']?.phase).toBe('running');
+    const without: ConfigInput = { ...CFG, pads: [{ ...CFG.pads[0]!, buttons: [CFG.pads[0]!.buttons![0]!] }] };
+    expect((await d.saveConfig(Config.parse(without), d.snapshot.get().rev!)).ok).toBe(true);
+    expect(d.snapshot.get().states['p/q']).toBeUndefined();
+    await sleep(800);
+    expect(d.snapshot.get().states['p/q']).toBeUndefined();
+    // Back again: its state (and run ids) carry on.
+    expect((await d.saveConfig(Config.parse(CFG), d.snapshot.get().rev!)).ok).toBe(true);
+    expect(d.snapshot.get().states['p/q']).toMatchObject({ runId: 1 });
     d.dispose();
   });
 
