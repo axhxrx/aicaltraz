@@ -205,7 +205,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
           <G class="bp-icon" />
           {vm.title && <Fit class="bp-headline" text={vm.title} lines={2} />}
           {vm.detail && <Sub class="bp-detail" text={vm.detail} />}
-          {vm.nextQueued ? <NextQueued /> : vm.sticky && <div class="bp-sticky">{`${verbOf(vm.trigger)} TO RETRY`}</div>}
+          {vm.nextQueued ? <NextQueued /> : vm.sticky && <div class="bp-sticky">{`${vm.trigger === 'double' ? '2× TAP' : verbOf(vm.trigger)} TO RETRY`}</div>}
         </>
       );
     }

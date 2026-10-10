@@ -145,6 +145,24 @@ test('lost ack: the press ran, the link died before the ack; after reconnecting 
   expect(runs()).toBe(before + 1);
 });
 
+test("a press lost in a dead link: NO RESPONSE, then, reconnected and past the time the host could still run it, DIDN'T RUN (and it never runs)", async ({ page, hasTouch }) => {
+  proxy = await startProxy(host.port);
+  await open(page, proxy);
+  await expectVisual(page, 'tap', 'ready', 8000);
+  const before = runs();
+  // Wi-Fi gone: the link stays open and nothing moves (the host's `expired`, if the press ever got
+  // there, would go to that dead socket). New connections get through.
+  proxy.freezeAll();
+  await new Fingers(page, hasTouch).tap('tap');
+  await expect(btn(page, 'tap')).toContainText('NO RESPONSE', { timeout: 4000 });
+  await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 10_000 });
+  await expect(btn(page, 'tap')).toContainText("DIDN'T RUN", { timeout: 8000 });
+  await expect(btn(page, 'tap')).toHaveAttribute('data-sticky', '');
+  proxy.killFrozen();
+  await page.waitForTimeout(500);
+  expect(runs()).toBe(before);
+});
+
 test('a host that drops every socket right after hello is retried with a growing backoff, not hammered', async ({ page }) => {
   proxy = await startProxy(host.port);
   await open(page, proxy);

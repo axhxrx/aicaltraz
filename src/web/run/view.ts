@@ -199,6 +199,8 @@ function localView(r: LocalResult, skew: number): Part {
       return { visual: 'unknown', title: 'NO RESPONSE', detail: 'The host didn’t answer in 2 s', code: 'NO RESPONSE', endedAt: r.at, sticky: true };
     case 'notsent':
       return { visual: 'failure', title: 'NOT SENT', detail: r.text, code: 'NOT SENT', endedAt: r.at, sticky: true };
+    case 'didntrun':
+      return { visual: 'failure', title: "DIDN'T RUN", detail: 'It didn’t reach the host in time', code: "DIDN'T RUN", endedAt: r.at, sticky: true };
     case 'ran': {
       const hold = (r.until ?? r.at) - r.at;
       if (r.last?.ok) return { visual: 'success', text: r.last.text, endedAt: r.at, resultHoldMs: hold };

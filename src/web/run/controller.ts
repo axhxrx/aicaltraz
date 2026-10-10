@@ -40,6 +40,11 @@ const KEY_DOUBLE_MIN_MS = 60;
  * a press that old).
  */
 const OUTCOME_WINDOW_MS = 30_000;
+/**
+ * NO RESPONSE: the host drops a press older than PRESS_MAX_AGE_MS. This long past that (the error
+ * of the clock offset's estimate), a fresh hello that shows no run of it means it never ran.
+ */
+const LOST_MARGIN_MS = 1000;
 const FLASH_MS = 1200;
 const SHORT_FLASH_MS = 700;
 /** After a 'started' ack, wait this long at most for the host's state broadcast. */
@@ -77,6 +82,8 @@ export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'qu
  * - failure / interrupted: one of this device's runs failed.
  * - noresponse: sent, no answer (it may or may not have run). Until the host's state shows what it did.
  * - notsent: it never reached the host (or arrived too late and was dropped).
+ * - didntrun: NO RESPONSE, settled: reconnected since, past the time the host could still run it,
+ *   and no run of it there. It never will.
  * - ran: a press that got no answer did run, and finished before the link came back. Shows how it
  *   ended when the host still knows (`last`); a failure is kept, anything else shows for
  *   resultHoldMs.
@@ -84,7 +91,7 @@ export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'qu
  * an ordinary press), or its ✕ clears it (dismiss()).
  */
 export interface LocalResult {
-  kind: 'failure' | 'interrupted' | 'noresponse' | 'notsent' | 'ran';
+  kind: 'failure' | 'interrupted' | 'noresponse' | 'notsent' | 'didntrun' | 'ran';
   /** The run it is about: the failed run; for noresponse/notsent, the run the host showed when the press went out. */
   runId: number;
   /** wall() it appeared. */
@@ -150,6 +157,8 @@ interface Sent {
   skew: number;
   /** Pressed on a running queue button: what it starts is the re-run after that run. */
   queue: boolean;
+  /** It would start (or queue) a run: not a cancel, nor a press the host ignores while it runs. */
+  starts: boolean;
 }
 
 /** NO RESPONSE: if the host turns out to have run the press, show that (onHost). */
@@ -158,6 +167,8 @@ interface Outcome extends Sent {
   until: number;
   /** queue: the run it would wait for ended (or is being cancelled) with a re-run still coming. */
   requeued: boolean;
+  /** A fresh hello came since (the host's state as it is now, not as a dead link left it). */
+  fresh: boolean;
 }
 
 const idle = (): Local => ({
@@ -296,9 +307,11 @@ export class ButtonController {
     return this.g !== null;
   }
 
-  /** Link dropped: a gesture in progress can't be sent, so let go of it (fill drains). */
+  /** Link dropped: a gesture in progress can't be sent, so let go of it (fill drains). Back: a fresh hello. */
   onLink(online: boolean): void {
     if (!online && this.g) this.cancelGesture(this.g, 'quiet');
+    if (this.outcome) this.outcome.fresh = online;
+    if (online) this.checkLost();
   }
 
   /** The button moved, changed size or went away under a finger (config change), or left the screen: let go. */
@@ -339,6 +352,23 @@ export class ButtonController {
     const r = this.l.result;
     if (r && host.runId > r.runId && (r.kind !== 'noresponse' || !this.outcome)) this.patch({ result: null });
     this.settle(host);
+    this.checkLost();
+  }
+
+  /**
+   * NO RESPONSE, and the press can't run any more (the host drops one older than PRESS_MAX_AGE_MS):
+   * reconnected since, with no run of it on the host, it never ran, and never will: DIDN'T RUN.
+   * (Its late `expired` answer, if any, went to the socket that died.) A newer run is resolve()'s
+   * business; a re-run that may be its doing is still coming; a cancel isn't a run.
+   */
+  private checkLost() {
+    const o = this.outcome;
+    const ctx = this.ctx;
+    if (!o || !ctx || !o.fresh || !o.starts || !ctx.online() || wall() < o.made + PRESS_MAX_AGE_MS + LOST_MARGIN_MS) return;
+    const host = ctx.host();
+    if (host.runId !== o.baseRunId || (o.queue && host.phase !== 'ready' && host.queued)) return;
+    this.outcome = null;
+    if (this.l.result?.kind === 'noresponse') this.setResult({ kind: 'didntrun', runId: o.baseRunId, at: wall() });
   }
 
   /**
@@ -712,6 +742,7 @@ export class ButtonController {
       made: wall() - Math.max(0, mono() - at),
       skew: ctx.skew(),
       queue: host.phase === 'running' && ctx.button().whileRunning === 'queue',
+      starts: host.phase !== 'running' || ctx.button().whileRunning === 'queue',
     };
     this.outcome = null;
     this.lateSeq = 0;
@@ -761,7 +792,9 @@ export class ButtonController {
     this.sendSeq++;
     this.patch({ sending: null });
     this.setResult({ kind: 'noresponse', runId: press.baseRunId, at: now });
-    this.outcome = { ...press, until: now + OUTCOME_WINDOW_MS, requeued: false };
+    this.outcome = { ...press, until: now + OUTCOME_WINDOW_MS, requeued: false, fresh: false };
+    // From when the host can no longer run it, a fresh hello settles it (checkLost).
+    this.after('lost', Math.max(0, press.made + PRESS_MAX_AGE_MS + LOST_MARGIN_MS - now) + 20, () => this.checkLost());
     // Not the failure buzz: we don't know that it failed.
     cue('unknown');
     this.ctx?.kick();

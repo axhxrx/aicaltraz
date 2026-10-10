@@ -83,7 +83,7 @@ Per button (defaults in parentheses):
 | `confirm` (false), `confirmWindowMs` (3000) | needs a second, deliberate press — enforced by the host |
 | `whileRunning` | `ignore` (default), `cancel` (press again to stop; not within 700 ms of the start), `queue` (one re-run) |
 | `cooldownMs` (400) | presses right after a fire are ignored on that device (key chatter, bounces) |
-| `timeoutMs` (120000), `resultHoldMs` (2500) | run time limit; how long ✓/✗ shows (failures stay until touched) |
+| `timeoutMs` (120000), `resultHoldMs` (2500) | run time limit; how long ✓ shows (failures stay until the next run or ✕) |
 | `key` | KeyboardEvent.key (BLE remotes/clickers): fires on keydown; the visible pad wins, else the unique match on any pad |
 | `stops` | `["lights/*"]`, `["camera/rec"]`, `["*"]`: running buttons to cancel before this one starts |
 
@@ -107,8 +107,9 @@ Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:
 
 ## In the field
 
-- Results: ✓ shows for `resultHoldMs`; ✗ (and NO RESPONSE / NOT SENT / INTERRUPTED) stays until you
-  touch it; READY buttons show how their last run went ("✓ 12 s ago").
+- Results: ✓ shows for `resultHoldMs`; ✗ (and NO RESPONSE / DIDN'T RUN / INTERRUPTED) stays until
+  the next run — pressing it again retries, its small ✕ clears it without firing. READY buttons show
+  how their last run went ("✓ 12 s ago").
 - Menu → **Rough mode** for gloves/vibration: one button at a time, longer minimum tap, longer
   cooldown, more drift tolerance. Recommended whenever you wear gloves.
 - `?lock&pad=lights` for a mounted tablet: no tabs, menu only on long-press; if that pad is renamed

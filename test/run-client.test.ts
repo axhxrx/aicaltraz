@@ -240,6 +240,37 @@ describe('NO RESPONSE', () => {
     session.dispose();
   });
 
+  test("reconnected, and past the time the host could still run it, with no run of it there: DIDN'T RUN (it never will)", async () => {
+    // Made 3.5 s ago (a page that stalled): the host could still run it for another half second.
+    const s = setup([tapButton('g', 0)], { 'p/g': ready(0) });
+    s.ctl.g!.key(mono() - 3500);
+    s.be.got[0]!.fail(new PressError(true, 'the link to the host dropped before it answered'));
+    await sleep(0);
+    expect(s.ctl.g!.local.get().result?.kind).toBe('noresponse');
+    s.be.hello({ 'p/g': ready(0) });
+    expect(s.ctl.g!.local.get().result?.kind).toBe('noresponse');
+    await sleep(800);
+    expect(s.ctl.g!.local.get().result?.kind).toBe('didntrun');
+    expect(s.vm('g')).toMatchObject({ visual: 'failure', title: "DIDN'T RUN", sticky: true });
+    s.session.dispose();
+  });
+
+  test('without a fresh hello (the link never dropped), or with a run of it on the host, NO RESPONSE is not settled that way', async () => {
+    const s = setup([tapButton('g', 0), tapButton('h', 1)], { 'p/g': ready(0), 'p/h': ready(0) });
+    s.ctl.g!.key(mono() - 3500);
+    s.be.got[0]!.fail(new PressError(true, 'no answer'));
+    s.ctl.h!.key(mono() - 3500);
+    s.be.got[1]!.fail(new PressError(true, 'no answer'));
+    await sleep(800);
+    expect(s.ctl.g!.local.get().result?.kind).toBe('noresponse');
+    // Reconnected: h's press did run (the hello shows it running).
+    s.be.hello({ 'p/g': ready(0), 'p/h': running(1, { startedAt: wall() - 3400 }) });
+    expect(s.ctl.g!.local.get().result?.kind).toBe('didntrun');
+    expect(s.ctl.h!.local.get().result).toBeNull();
+    expect(s.vm('h').visual).toBe('running');
+    s.session.dispose();
+  });
+
   test('on a running queue button, the re-run that follows is what the press did, unless the run ended without one', async () => {
     let s = await unanswered('g', { whileRunning: 'queue' }, { 'p/g': running(5) });
     s.be.set('p/g', running(5, { queued: true }));

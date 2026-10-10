@@ -200,18 +200,32 @@ test('queue while running runs again: the result shows NEXT RUN QUEUED, then the
 });
 
 test('while NEXT RUN QUEUED shows (its re-run starts in a moment), a press says ALREADY QUEUED and sends nothing', async ({ page }) => {
-  const presses = await trackPresses(page);
-  await f.tap('queue');
+  // Another device runs it and queues a re-run (straight to the backend: nothing of this device's).
+  const other = () => page.evaluate(() => window.__buttpad!.backend.press('main', 'queue'));
+  await other();
   await expectVisual(page, 'queue', 'running');
-  await page.waitForTimeout(450);
-  await f.tap('queue');
+  await other();
   await expect(btn(page, 'queue')).toContainText('QUEUED');
-  await expect(btn(page, 'queue')).toContainText('NEXT RUN QUEUED', { timeout: 4000 });
-  await f.tap('queue');
+  const presses = await trackPresses(page);
+  // This device presses (its key) the moment NEXT RUN QUEUED shows: the 800 ms gap is too short to aim at from here.
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        const el = document.querySelector('[data-testid="btn-queue"]')!;
+        const go = () => {
+          if (!el.textContent?.includes('NEXT RUN QUEUED')) return false;
+          for (const type of ['keydown', 'keyup']) window.dispatchEvent(new KeyboardEvent(type, { key: 'q', code: 'KeyQ' }));
+          return true;
+        };
+        if (go()) return resolve();
+        const mo = new MutationObserver(() => go() && (mo.disconnect(), resolve()));
+        mo.observe(el, { subtree: true, childList: true, characterData: true });
+      }),
+  );
   await expect(btn(page, 'queue')).toHaveAttribute('data-flash', 'queued');
   await expect(btn(page, 'queue').locator('.bp-badge')).toContainText('ALREADY');
-  expect(await presses()).toEqual(['queue', 'queue']);
   await expectVisual(page, 'queue', 'running', 2000);
+  expect(await presses()).toEqual([]);
 });
 
 test('no ack within 2 s → NO RESPONSE (amber, not the red failure)', async ({ page }) => {

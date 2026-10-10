@@ -255,7 +255,7 @@ export const FLOW_CONFIG: ConfigInput = {
         { id: 'slow', label: 'Slow', color: '#0891b2', x: 1, y: 1, trigger: 'tap', resultHoldMs: 800, action: { type: 'shell', script: "echo '@status busy'; sleep 2.5; echo 'slow done'" } },
         { id: 'fail', label: 'Fail', color: '#f97316', x: 2, y: 1, trigger: 'tap', resultHoldMs: 1500, action: { type: 'shell', script: "echo 'disk full' >&2; exit 2" } },
         { id: 'cancel', label: 'Cancel me', color: '#0d9488', x: 0, y: 2, trigger: 'tap', whileRunning: 'cancel', resultHoldMs: 1500, action: { type: 'shell', script: "echo '@progress 10'; sleep 1; echo '@progress 50'; sleep 5; echo 'never'" } },
-        { id: 'queue', label: 'Queue', color: '#2563eb', x: 1, y: 2, trigger: 'tap', whileRunning: 'queue', resultHoldMs: 800, action: { type: 'shell', script: "sleep 0.8; echo 'queued run'" } },
+        { id: 'queue', label: 'Queue', color: '#2563eb', x: 1, y: 2, trigger: 'tap', key: 'q', whileRunning: 'queue', resultHoldMs: 800, action: { type: 'shell', script: "sleep 0.8; echo 'queued run'" } },
         { id: 'hold2', label: 'Hold two', color: '#ea580c', x: 2, y: 2, holdMs: 400, resultHoldMs: 1200, action: { type: 'shell', script: "sleep 0.6; echo 'second ok'" } },
       ],
     },
