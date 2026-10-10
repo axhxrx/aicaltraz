@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { accessSync, chmodSync, constants, existsSync, lstatSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { Button, Config, findButton, parseConfig, type ConfigInput } from '../src/core/config.ts';
@@ -250,11 +250,26 @@ describe('ConfigStore', () => {
     const link = join(dir, 'link.json');
     symlinkSync(real, link);
     const { store } = ConfigStore.open(link);
-    expect(store.path).toBe(real);
+    expect(store.path).toBe(link);
+    expect(store.dir).toBe(dir);
     expect(store.save(padConfig([btn('z', 0, 0)]), store.rev).ok).toBe(true);
     expect(lstatSync(link).isSymbolicLink()).toBe(true);
     expect(JSON.parse(readFileSync(link, 'utf8')).pads[0].buttons[0].id).toBe('z');
     expect(statSync(real).mode & 0o777).toBe(0o640);
+  });
+
+  test('a new config file is 0600 (it holds commands and env); a rewrite keeps the mode exactly, whatever the umask', () => {
+    const path = join(tmpDir(), 'new', 'c.json');
+    const { store } = ConfigStore.open(path, starterConfigText);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    chmodSync(path, 0o644);
+    const umask = process.umask(0o077);
+    try {
+      expect(store.save(valid, store.rev).ok).toBe(true);
+    } finally {
+      process.umask(umask);
+    }
+    expect(statSync(path).mode & 0o777).toBe(0o644);
   });
 
   test('save picks up an unseen hand edit first (→ 409), so it is never silently overwritten', () => {
@@ -325,6 +340,38 @@ describe('ConfigStore', () => {
       await Bun.sleep(300);
       expect(revs.length).toBe(3);
       expect(new Set(revs).size).toBe(3);
+    } finally {
+      store.close();
+    }
+  });
+
+  test('watch: a symlinked config reloads on edits of its target, and after `sed -i` replaced the link with a file', async () => {
+    const dir = tmpDir();
+    const realDir = join(dir, 'dotfiles');
+    mkdirSync(realDir);
+    const real = join(realDir, 'buttpad.json');
+    writeJson(real, padConfig([btn('one', 0, 0)]));
+    const link = join(dir, 'buttpad.config.json');
+    symlinkSync(real, link);
+    const { store } = ConfigStore.open(link);
+    const id = () => store.config.pads[0]!.buttons[0]!.id;
+    expect(store.path).toBe(link);
+    expect(store.dir).toBe(realDir); // relative action paths still resolve next to the real file
+    store.watch(50);
+    try {
+      writeJson(real, padConfig([btn('two', 0, 0)]));
+      await waitFor(() => id() === 'two', 3000, 'edit of the target');
+      // sed -i: a temp file next to the link, renamed over it.
+      writeJson(join(dir, 'sedAbc123'), padConfig([btn('three', 0, 0)]));
+      renameSync(join(dir, 'sedAbc123'), link);
+      expect(lstatSync(link).isSymbolicLink()).toBe(false);
+      await waitFor(() => id() === 'three', 3000, 'link replaced by a file');
+      // Now the file at the configured path is the config: saves go there, its edits are seen.
+      expect(store.save(padConfig([btn('four', 0, 0)]), store.rev).ok).toBe(true);
+      expect(JSON.parse(readFileSync(link, 'utf8')).pads[0].buttons[0].id).toBe('four');
+      expect(JSON.parse(readFileSync(real, 'utf8')).pads[0].buttons[0].id).toBe('two');
+      writeJson(link, padConfig([btn('five', 0, 0)]));
+      await waitFor(() => id() === 'five', 3000, 'edit of the new file');
     } finally {
       store.close();
     }

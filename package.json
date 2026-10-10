@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --hot src/server/main.ts --config buttpad.config.json",
+    "dev": "bun --hot src/server/main.ts --config buttpad.config.json --dev",
     "start": "bun src/server/main.ts --config buttpad.config.json",
     "example": "bun src/server/main.ts --config examples/buttpad.example.json",
     "test": "bun test",

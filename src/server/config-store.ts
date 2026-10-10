@@ -6,6 +6,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   closeSync,
   existsSync,
+  fchmodSync,
   fsyncSync,
   mkdirSync,
   openSync,
@@ -21,6 +22,8 @@ import {
 import { basename, dirname, join, resolve } from 'node:path';
 import { Button, parseConfig, type Action, type Config } from '../core/config.ts';
 import type { Role, WireConfig } from '../core/protocol.ts';
+
+const isWindows = process.platform === 'win32';
 
 /** sha256 (hex, first 16 chars) of the file's bytes. */
 export const revOf = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex').slice(0, 16);
@@ -80,9 +83,12 @@ export function readConfigFile(path: string): ReadResult {
   return r.ok ? { ok: true, config: r.config, rev } : { ok: false, rev, errors: r.errors };
 }
 
-/** Write via a temp file in the same directory + rename, keeping the existing file's mode. */
+/**
+ * Write via a temp file in the same directory + rename. Keeps the existing file's mode; a new file gets
+ * 0600, since a config holds commands and their env.
+ */
 export function atomicWrite(path: string, text: string) {
-  let mode = 0o644;
+  let mode = 0o600;
   try {
     mode = statSync(path).mode & 0o777;
   } catch {}
@@ -90,6 +96,7 @@ export function atomicWrite(path: string, text: string) {
   try {
     const fd = openSync(tmp, 'wx', mode);
     try {
+      if (!isWindows) fchmodSync(fd, mode); // exactly that mode, whatever the umask
       writeSync(fd, text);
       fsyncSync(fd);
     } finally {
@@ -99,6 +106,15 @@ export function atomicWrite(path: string, text: string) {
   } catch (e) {
     rmSync(tmp, { force: true });
     throw e;
+  }
+}
+
+/** Where a write to `path` goes: a symlink's target, so the link stays a link. */
+function writeTarget(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
   }
 }
 
@@ -121,28 +137,32 @@ export interface ConfigListener {
 }
 
 export class ConfigStore {
-  readonly dir: string;
   /** Errors of the file on disk while it is broken (the last good config keeps running). */
   fileErrors: string[] | null = null;
   private brokenRev: string | undefined;
   private listeners = new Set<ConfigListener>();
-  private watcher: FSWatcher | undefined;
+  private watching = false;
+  private watchers = new Map<string, FSWatcher>();
+  /** File names the watchers react to. */
+  private watchNames = new Set<string>();
+  private debounceMs = 200;
   private timer: ReturnType<typeof setTimeout> | undefined;
 
   private constructor(
+    /** The configured path, absolute. It may be a symlink: it's read and watched as such, saves replace its target. */
     readonly path: string,
+    /** Directory of the file the path resolved to at startup; actions' relative paths resolve against it. */
+    readonly dir: string,
     public config: Config,
     public rev: string,
-  ) {
-    this.dir = dirname(path);
-  }
+  ) {}
 
   /**
    * Load `path`; if it doesn't exist and `starter` is given, write `starter(absPath)` there first.
    * Throws ConfigLoadError when the file is invalid.
    */
   static open(path: string, starter?: (absPath: string) => string): { store: ConfigStore; created: boolean } {
-    let abs = resolve(path);
+    const abs = resolve(path);
     let created = false;
     if (!existsSync(abs)) {
       if (!starter) throw new ConfigLoadError(abs, [`(file): not found`]);
@@ -150,11 +170,9 @@ export class ConfigStore {
       atomicWrite(abs, starter(abs));
       created = true;
     }
-    // Follow symlinks so saves replace the target, not the link.
-    abs = realpathSync(abs);
     const r = readConfigFile(abs);
     if (!r.ok) throw new ConfigLoadError(abs, r.errors);
-    return { store: new ConfigStore(abs, r.config, r.rev), created };
+    return { store: new ConfigStore(abs, dirname(writeTarget(abs)), r.config, r.rev), created };
   }
 
   subscribe(l: ConfigListener): () => void {
@@ -198,7 +216,7 @@ export class ConfigStore {
     }
     const text = serializeConfig(config);
     const rev = revOf(text);
-    atomicWrite(this.path, text);
+    atomicWrite(writeTarget(this.path), text);
     if (rev !== this.rev || this.fileErrors !== null) this.activate(config, rev);
     return { ok: true, rev };
   }
@@ -222,21 +240,51 @@ export class ConfigStore {
       }
   }
 
-  /** Watch the directory (survives atomic renames by editors and by us), debounced. */
+  /**
+   * Watch for hand edits, debounced. Watches directories, which survives atomic renames by editors
+   * and by us: the configured path's (even a symlink replaced by a file, as `sed -i` does) and, while
+   * it's a symlink, its target's (edits of the target itself).
+   */
   watch(debounceMs = 200) {
-    if (this.watcher) return;
-    const name = basename(this.path);
-    this.watcher = watch(this.dir, { persistent: false }, (_event, file) => {
-      if (file != null && String(file) !== name) return;
-      clearTimeout(this.timer);
-      this.timer = setTimeout(() => this.sync(), debounceMs);
-    });
-    this.watcher.on('error', () => {});
+    if (this.watching) return;
+    this.watching = true;
+    this.debounceMs = debounceMs;
+    this.rewatch();
+  }
+
+  private rewatch() {
+    if (!this.watching) return;
+    const files = [this.path, writeTarget(this.path)];
+    const dirs = new Set(files.map((f) => dirname(f)));
+    this.watchNames = new Set(files.map((f) => basename(f)));
+    for (const [dir, w] of this.watchers)
+      if (!dirs.has(dir)) {
+        w.close();
+        this.watchers.delete(dir);
+      }
+    for (const dir of dirs) {
+      if (this.watchers.has(dir)) continue;
+      try {
+        const w = watch(dir, { persistent: false }, (_event, file) => {
+          if (file != null && !this.watchNames.has(String(file))) return;
+          clearTimeout(this.timer);
+          this.timer = setTimeout(() => {
+            this.sync();
+            this.rewatch(); // the link may point elsewhere now, or be a plain file
+          }, this.debounceMs);
+        });
+        w.on('error', () => {});
+        this.watchers.set(dir, w);
+      } catch (e) {
+        console.error(`buttpad: cannot watch ${dir} for config edits:`, (e as Error).message);
+      }
+    }
   }
 
   close() {
     clearTimeout(this.timer);
-    this.watcher?.close();
-    this.watcher = undefined;
+    this.watching = false;
+    for (const w of this.watchers.values()) w.close();
+    this.watchers.clear();
   }
 }

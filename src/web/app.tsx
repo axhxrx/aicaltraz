@@ -85,23 +85,27 @@ function Connected(p: { backend: Backend; opts: AppOptions; onPair(t: string): v
     setPadId(id);
     lsSet(KEYS.pad, id);
   };
+  // Admin only: a press-role client never renders edit mode, whatever `mode` says.
+  const editing = mode === 'edit' && role === 'admin';
+  const exitEdit = (id?: string) => {
+    if (id && config.pads.some((x) => x.id === id)) choose(id);
+    setMode('run');
+  };
   return (
     <div class="app" data-mode={mode} data-lock={opts.lock ? '' : undefined}>
-      <TopBar
-        pads={config.pads}
-        padId={pad.id}
-        showTabs={config.pads.length > 1 && !opts.lock}
-        status={status}
-        demo={backend.kind === 'demo'}
-        onPad={choose}
-        onMenu={() => setMenu(true)}
-      />
-      {mode === 'edit' && role === 'admin' ? (
-        <EditMode backend={backend} padId={pad.id} onExit={() => setMode('run')} />
-      ) : (
-        <RunPad backend={backend} pad={pad} keys={!menu} />
+      {!editing && (
+        <TopBar
+          pads={config.pads}
+          padId={pad.id}
+          showTabs={config.pads.length > 1 && !opts.lock}
+          status={status}
+          demo={backend.kind === 'demo'}
+          onPad={choose}
+          onMenu={() => setMenu(true)}
+        />
       )}
-      {configErrors && role === 'admin' && (
+      {editing ? <EditMode backend={backend} padId={pad.id} onExit={exitEdit} /> : <RunPad backend={backend} pad={pad} keys={!menu} />}
+      {configErrors && role === 'admin' && !editing && (
         <div class="bp-banner" role="alert" data-testid="config-errors">
           <b>Config file has errors</b> — still running the previous config. {configErrors[0]}
           {configErrors.length > 1 ? ` (+${configErrors.length - 1} more)` : ''}

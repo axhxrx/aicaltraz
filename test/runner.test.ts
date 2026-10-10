@@ -139,7 +139,8 @@ describe('exec vs shell', () => {
 
 describe('output protocol', () => {
   test('@progress/@status become updates; @result wins', async () => {
-    const o = await run(sh('echo "@status starting"; echo "@progress 10"; sleep 0.2; echo "@progress 60"; echo "@status nearly"; echo plain line; echo "@result all good"; echo after'));
+    // Lines that should coalesce into one update are written at once: separate writes may be read apart.
+    const o = await run(sh("printf '@status starting\\n@progress 10\\n'; sleep 0.2; printf '@progress 60\\n@status nearly\\nplain line\\n@result all good\\nafter\\n'"));
     expect(o.exitCode).toBe(0);
     expect(o.text).toBe('all good');
     expect(o.updates[0]).toEqual({ status: 'starting', progress: 10 });
@@ -180,6 +181,12 @@ describe('output protocol', () => {
     expect((await run(sh("printf 'no newline'"))).text).toBe('no newline');
   });
 
+  test('a last line without newline counts even while a background process holds the pipe open', async () => {
+    const o = await run(sh("sleep 2 & printf '@result photo 0042 saved'"));
+    o.handle.forceKill();
+    expect(o).toMatchObject({ exitCode: 0, text: 'photo 0042 saved' });
+  });
+
   test('protocol lines are UTF-8, split across chunks', async () => {
     const o = await run(sh("printf '@result Gr\\303'; sleep 0.1; printf '\\274\\303\\237e\\n'"));
     expect(o.text).toBe('Grüße');
@@ -190,6 +197,51 @@ describe('output protocol', () => {
     expect(o.updates.length).toBeLessThan(50);
     expect(o.updates.at(-1)).toEqual({ progress: 100 });
   });
+
+  test('throttling and durations use a monotonic clock: a wall-clock step back changes nothing', async () => {
+    const realNow = Date.now;
+    const updates: number[] = [];
+    const t0 = performance.now();
+    const h = startRun(
+      { action: sh('i=1; while [ $i -le 12 ]; do echo "@progress $((i * 8))"; sleep 0.1; i=$((i + 1)); done'), baseDir: base, timeoutMs: 10_000 },
+      { onUpdate: () => updates.push(performance.now() - t0) },
+    );
+    await waitFor(() => updates.length >= 2, 3000, 'first updates');
+    const stepAt = performance.now() - t0;
+    Date.now = () => realNow() - 30_000; // NTP steps the clock back mid-run
+    let o;
+    try {
+      o = await h.done;
+    } finally {
+      Date.now = realNow;
+    }
+    // Without a monotonic clock: none until the final flush.
+    expect(updates.filter((t) => t > stepAt).length).toBeGreaterThan(3);
+    expect(o.durationMs).toBeGreaterThan(0);
+    expect(o.durationMs).toBeLessThan(performance.now() - t0 + 1);
+  });
+});
+
+describe('a firehose of output', () => {
+  for (const script of ['yes', 'yes >&2'])
+    test(`(${script}) does not starve the event loop, and its timeout fires on time`, async () => {
+      let last = performance.now();
+      let maxLag = 0;
+      const timer = setInterval(() => {
+        const now = performance.now();
+        maxLag = Math.max(maxLag, now - last - 20);
+        last = now;
+      }, 20);
+      try {
+        const o = await run(sh(script), { timeoutMs: 800 });
+        expect(o.reason).toBe('timeout');
+        // Without yielding to the event loop: lags of seconds, and the timeout fires seconds late.
+        expect(o.durationMs).toBeLessThan(800 + 700);
+        expect(maxLag).toBeLessThan(500);
+      } finally {
+        clearInterval(timer);
+      }
+    });
 });
 
 describe('tails', () => {
@@ -232,9 +284,51 @@ describe('timeout, kill and process groups', () => {
     const o = await run(sh(`sh -c 'trap "" TERM; echo "@status stubborn $$"; exec sleep 30 >/dev/null 2>&1' & sleep 30`), { timeoutMs: 300, killGraceMs: 1500 });
     expect(o.reason).toBe('timeout');
     const stubborn = Number(/stubborn (\d+)/.exec(o.stdout)![1]);
-    if (Date.now() - t0 < 1500) expect(isAlive(stubborn)).toBe(true); // SIGTERM alone didn't do it
+    if (Date.now() - t0 < 1400) {
+      expect(isAlive(stubborn)).toBe(true); // SIGTERM alone didn't do it
+      expect(o.handle.dying()).toBe(true);
+    }
     await waitFor(() => !isAlive(stubborn), 3000, 'stubborn grandchild to be SIGKILLed');
     expect(Date.now() - t0).toBeGreaterThanOrEqual(1500);
+    expect(o.handle.dying()).toBe(false);
+  });
+
+  test('once a killed group is seen gone, it is never signalled again (its pid may be recycled)', async () => {
+    const h = startRun({ action: sh('sleep 30'), baseDir: base, timeoutMs: 10_000, killGraceMs: 5000 });
+    expect(h.dying()).toBe(false);
+    expect(h.kill()).toBe(true);
+    expect(h.dying()).toBe(true);
+    await h.done;
+    await waitFor(() => !h.dying(), 1000, 'the empty group to be noticed'); // long before the 5 s grace
+    const realKill = process.kill;
+    const calls: unknown[] = [];
+    process.kill = ((...args: Parameters<typeof process.kill>) => (calls.push(args), realKill(...args))) as typeof process.kill;
+    try {
+      expect(h.alive()).toBe(false);
+      expect(h.kill()).toBe(false);
+      h.forceKill();
+    } finally {
+      process.kill = realKill;
+    }
+    expect(calls).toEqual([]);
+  });
+
+  test('a killed group counts as gone once only zombies are left (some inits are slow to reap orphans)', async () => {
+    const h = startRun({ action: sh('sleep 30 & echo "@status child $!"; wait'), baseDir: base, timeoutMs: 10_000, killGraceMs: 5000 });
+    await waitFor(() => /child \d+/.test(h.stdout()), 2000, 'child pid');
+    expect(h.kill()).toBe(true);
+    await h.done;
+    await waitFor(() => !h.dying(), 500, 'the group to count as gone');
+    expect(h.alive()).toBe(false);
+  });
+
+  test.skipIf(!Bun.which('setsid'))('kill() reports whether there was anything left to signal', async () => {
+    // The shell exits at once; the setsid'd sleep (another process group) keeps stdout open meanwhile.
+    const h = startRun({ action: sh('setsid sleep 1 & echo "@result photo taken"'), baseDir: base, timeoutMs: 5000 });
+    await waitFor(() => !h.alive(), 2000, 'the shell to exit');
+    expect(h.kill()).toBe(false);
+    expect(h.dying()).toBe(false);
+    expect(await h.done).toMatchObject({ exitCode: 0, signal: null, text: 'photo taken' });
   });
 
   test('huge timeouts mean "practically never", not "immediately" (timer overflow)', async () => {
@@ -251,8 +345,8 @@ describe('timeout, kill and process groups', () => {
     await waitFor(() => /child \d+/.test(h.stdout()), 2000, 'child pid');
     const child = Number(/child (\d+)/.exec(h.stdout())![1]);
     expect(h.alive()).toBe(true);
-    h.kill();
-    h.kill(); // idempotent
+    expect(h.kill()).toBe(true);
+    expect(h.kill()).toBe(true); // idempotent: already on its way down
     const o = await h.done;
     expect(o).toMatchObject({ exitCode: null, signal: 'SIGTERM', reason: undefined });
     await waitFor(() => !isAlive(child) && !isAlive(h.pid!), 1000, 'tree to die');
@@ -290,11 +384,19 @@ describe('spawn errors', () => {
   test('missing path, non-executable file, bad interpreter, missing shell, missing cwd', async () => {
     expect((await run(exec('./nope.sh'))).text).toBe(`not found: ${join(base, 'nope.sh')}`);
     writeFileSync(join(base, 'plain.txt'), 'echo hi\n');
-    expect((await run(exec('./plain.txt'))).text).toStartWith(`permission denied: ${join(base, 'plain.txt')}`);
+    expect((await run(exec('./plain.txt'))).text).toBe(`permission denied (chmod +x?): ${join(base, 'plain.txt')}`);
     writeExecutable(join(base, 'badshebang.sh'), '#!/no/such/interpreter\necho hi\n');
-    expect((await run(exec('./badshebang.sh'))).text).toContain('interpreter not found');
+    expect((await run(exec('./badshebang.sh'))).text).toBe(`interpreter not found (check the #! line): ${join(base, 'badshebang.sh')}`);
     expect((await run(sh('true', { shell: '/no/such/shell' }))).text).toBe('shell not found: /no/such/shell');
     expect(await run(sh('true', { cwd: 'missing-dir' }))).toMatchObject({ reason: 'spawn', text: `cwd not found: ${join(base, 'missing-dir')}` });
+  });
+
+  test('a script without #!, a directory', async () => {
+    writeExecutable(join(base, 'noshebang.sh'), 'echo hi\n');
+    expect(await run(exec('./noshebang.sh'))).toMatchObject({ reason: 'spawn', text: `not executable as a program (missing #! line?): ${join(base, 'noshebang.sh')}` });
+    mkdirSync(join(base, 'adir'), { recursive: true });
+    expect((await run(exec('./adir'))).text).toBe(`is a directory: ${join(base, 'adir')}`);
+    expect((await run(sh('true', { shell: base }))).text).toBe(`is a directory: ${base}`);
   });
 });
 

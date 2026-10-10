@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import type { ConfigInput } from '../src/core/config.ts';
 import type { RunRecord } from '../src/core/protocol.ts';
 import { revOf } from '../src/server/config-store.ts';
-import { startHost, type Host } from '../src/server/host.ts';
+import { MAX_CLIENTS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
+import { CANCEL_GRACE_MS } from '../src/server/state-store.ts';
 import { cleanupTmp, eventually, isAlive, readJson, TestClient, tmpDir, waitFor, writeExecutable, writeJson } from './helpers.ts';
 
 const baseConfig = (): ConfigInput => ({
@@ -44,12 +45,12 @@ afterEach(async () => {
   cleanupTmp();
 });
 
-async function setup(cfg: ConfigInput = baseConfig()): Promise<Ctx> {
+async function setup(cfg: ConfigInput = baseConfig(), opts: Partial<HostOptions> = {}): Promise<Ctx> {
   const dir = tmpDir('buttpad-host-');
   writeExecutable(join(dir, 'scripts', 'quick.sh'), '#!/bin/sh\necho "@status working"\nsleep 0.1\necho "@result quick done"\n');
   const configPath = join(dir, 'buttpad.config.json');
   writeJson(configPath, cfg);
-  const host = await startHost({ configPath, host: '127.0.0.1', port: 0, log: () => {}, debounceMs: 50 });
+  const host = await startHost({ configPath, host: '127.0.0.1', port: 0, log: () => {}, debounceMs: 50, ...opts });
   hosts.push(host);
   const base = `http://127.0.0.1:${host.port}`;
   return {
@@ -74,12 +75,15 @@ async function setup(cfg: ConfigInput = baseConfig()): Promise<Ctx> {
 }
 
 /** Sends a real WebSocket upgrade request and returns the response status line. */
-function rawUpgrade(port: number, path: string): Promise<string> {
+function rawUpgrade(port: number, path: string, headers: Record<string, string> = {}): Promise<string> {
+  const extra = Object.entries(headers)
+    .map(([k, v]) => `${k}: ${v}\r\n`)
+    .join('');
   return new Promise((resolve, reject) => {
     const s = connect(port, '127.0.0.1', () =>
       s.write(
         `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
-          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n',
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n${extra}\r\n`,
       ),
     );
     let buf = '';
@@ -95,11 +99,11 @@ function rawUpgrade(port: number, path: string): Promise<string> {
 }
 
 describe('auth', () => {
-  test('health needs no token', async () => {
+  test('health needs no token, and tells nothing about the machine', async () => {
     const { api } = await setup();
     const r = await api('/api/health', { token: null });
     expect(r.status).toBe(200);
-    expect(await r.json()).toMatchObject({ ok: true, protocol: 1, version: expect.any(String), name: expect.any(String) });
+    expect(await r.json()).toEqual({ ok: true, protocol: 1, version: expect.any(String) });
   });
 
   test('401 for missing, malformed or wrong tokens on every protected route', async () => {
@@ -132,6 +136,33 @@ describe('auth', () => {
     // A valid token without an upgrade is not a WebSocket.
     const plain = await fetch(`http://127.0.0.1:${host.port}/ws?token=${press}`);
     expect(plain.status).toBe(426);
+  });
+
+  test('WebSocket upgrades from a page of another origin are refused with 403', async () => {
+    const { host, press } = await setup();
+    const path = `/ws?token=${press}`;
+    expect(await rawUpgrade(host.port, path, { Origin: `http://127.0.0.1:${host.port}` })).toStartWith('HTTP/1.1 101');
+    expect(await rawUpgrade(host.port, path, { Origin: 'http://evil.example' })).toStartWith('HTTP/1.1 403');
+    expect(await rawUpgrade(host.port, path, { Origin: `http://127.0.0.1:${host.port + 1}` })).toStartWith('HTTP/1.1 403');
+    expect(await rawUpgrade(host.port, path, { Origin: 'null' })).toStartWith('HTTP/1.1 403');
+    expect(await rawUpgrade(host.port, '/ws?token=wrong', { Origin: 'http://evil.example' })).toStartWith('HTTP/1.1 403');
+  });
+
+  test(`at most ${MAX_CLIENTS} WebSocket connections; more are refused with 503`, async () => {
+    const { host, ws, press, admin } = await setup();
+    const open = await Promise.all(Array.from({ length: MAX_CLIENTS }, (_, i) => ws(i % 2 ? press : admin)));
+    expect(await rawUpgrade(host.port, `/ws?token=${admin}`)).toStartWith('HTTP/1.1 503');
+    await expect(TestClient.connect(`ws://127.0.0.1:${host.port}/ws?token=${press}`)).rejects.toThrow();
+    open[0]!.close();
+    await eventually(async () => (await rawUpgrade(host.port, `/ws?token=${press}`)).startsWith('HTTP/1.1 101'), 3000, 'a free slot');
+  });
+
+  test('Bun dev mode (HMR socket, source maps) is off unless asked for', async () => {
+    const { host } = await setup();
+    expect(await rawUpgrade(host.port, '/_bun/hmr')).toStartWith('HTTP/1.1 404');
+    // The same request reaches the HMR socket in dev mode, so the check above means something.
+    const dev = await setup(baseConfig(), { development: true });
+    expect(await rawUpgrade(dev.host.port, '/_bun/hmr')).toStartWith('HTTP/1.1 101');
   });
 
   test('press role: redacted config, 403 on admin routes; admin: full config', async () => {
@@ -191,15 +222,18 @@ describe('WebSocket', () => {
     expect(a.msgs.some((m) => m.t === 'ack')).toBe(false);
   });
 
-  test('cancel from a second client', async () => {
+  test('cancel from a second client (after the double-press grace)', async () => {
     const { ws, press } = await setup();
     const p1 = await ws(press);
     const p2 = await ws(press);
     p1.send({ t: 'press', id: '1', pad: 'main', button: 'long' });
     await p1.next('ack');
+    p2.send({ t: 'press', id: 'early', pad: 'main', button: 'long' });
+    expect(await p2.next('ack')).toMatchObject({ id: 'early', result: 'ignored' });
     await p2.next('state', (m) => m.key === 'main/long' && m.state.phase === 'running' && !!m.state.status);
+    await Bun.sleep(CANCEL_GRACE_MS);
     p2.send({ t: 'press', id: '2', pad: 'main', button: 'long' });
-    expect(await p2.next('ack')).toMatchObject({ id: '2', result: 'cancelling' });
+    expect(await p2.next('ack', (m) => m.id === '2')).toMatchObject({ id: '2', result: 'cancelling' });
     const failed = await p1.next('state', (m) => m.key === 'main/long' && m.state.phase === 'failure');
     expect(failed.state).toMatchObject({ reason: 'cancelled', runId: 1 });
   });
@@ -280,6 +314,9 @@ describe('HTTP press and state', () => {
     expect(src).toBeDefined();
     const js = await fetch(new URL(src!, base));
     expect(js.status).toBe(200);
+    // Production bundle: no source maps (they carry absolute paths, i.e. the OS user name).
+    expect(await js.text()).not.toContain('sourceMappingURL');
+    expect((await fetch(new URL(`${src}.map`, base))).status).toBe(404);
   });
 
   test('JSON bodies are capped at 1 MB', async () => {
@@ -427,7 +464,7 @@ describe('config over HTTP and hand edits', () => {
     config.pads[0].buttons[1].action = { type: 'shell', script: 'echo replaced' };
     config.pads[0].buttons[1].label = 'Renamed';
     expect((await api('/api/config', { method: 'PUT', token: admin, body: { config, baseRev: rev } })).status).toBe(200);
-    await Bun.sleep(200);
+    await Bun.sleep(CANCEL_GRACE_MS);
     expect(host.state.get('main/long')).toMatchObject({ phase: 'running', runId: 1 });
     // Cancel it (whileRunning: cancel still applies) and check the next run uses the new action.
     await api('/api/press/main/long', { method: 'POST' });

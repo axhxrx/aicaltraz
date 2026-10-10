@@ -37,7 +37,7 @@ docs/          this spec, QA reports
 
 ```
 bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
-                       [--rotate-tokens] [--no-qr] [--ready-json]
+                       [--rotate-tokens] [--no-qr] [--ready-json] [--dev]
                        [--tls-cert PATH --tls-key PATH]
 ```
 
@@ -50,7 +50,13 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
   for the first LAN IP (unless `--no-qr`). Warn that it's plain HTTP.
 - `--ready-json`: additionally print exactly one line to stdout once listening, for harnesses:
   `{"event":"ready","port":N,"pressToken":"…","adminToken":"…","configPath":"…"}`
-- SIGINT/SIGTERM: kill all running actions (process groups), then exit.
+- `--dev`: Bun dev mode, for working on the web app (`bun run dev` passes it): an unauthenticated
+  HMR socket at `/_bun/hmr` and source maps that carry absolute paths (the OS user name). Off by
+  default; never on a network you don't trust.
+- SIGINT/SIGTERM/SIGHUP: kill all running actions (process groups), including killed ones still in
+  their SIGKILL grace period, then exit. SIGHUP inherited as ignored (`nohup`) stays ignored; that is
+  detected on Linux (`/proc/self/status`), elsewhere SIGHUP always shuts down.
+- A log reader that goes away (EPIPE on stdout/stderr) doesn't take the host down.
 
 ### Auth
 
@@ -59,9 +65,12 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 - HTTP: `Authorization: Bearer <token>`. WebSocket: `/ws?token=<token>` (browsers can't set
   WS headers). Constant-time compare. Role = whichever token matched. Anything else → 401
   (WS: reject the upgrade with 401).
+- A WS upgrade whose `Origin` host differs from its `Host` header → 403 (cross-site WebSocket
+  hijacking). No `Origin` (curl, scripts) is fine.
 - The browser **never sends commands**: a press names `pad`+`button`; the host looks up the action.
 - Press role never receives `action` fields (see `WireConfig`). Only admin can PUT config or read
-  run logs.
+  run logs. But every client sees each run's result text (≤200 chars, see Runner): a script must not
+  print a secret as its last line.
 - The admin token is a remote-shell credential. Treat it as such in docs and UI.
 
 ### HTTP API
@@ -69,7 +78,7 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 | Method | Path | Role | Notes |
 |---|---|---|---|
 | GET | `/` | none | the web app (Bun HTML import of `src/web/index.html`) |
-| GET | `/api/health` | none | `{ok:true, name, version, protocol}` |
+| GET | `/api/health` | none | `{ok:true, version, protocol}`; no host name (anyone can ask, even a DNS-rebinding page; `hello` has it) |
 | GET | `/api/config` | any | `{config: WireConfig, rev}` (redacted for press) |
 | PUT | `/api/config` | admin | body `{config, baseRev}` → 200 `{rev}`; 400 `{errors:string[]}`; 409 `{rev}` if `baseRev` ≠ current |
 | GET | `/api/state` | any | `{states: StateMap, serverNow}` |
@@ -87,6 +96,7 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
   to all (each redacted for its role).
 - `press` → host replies `ack` to that client with the `PressResult`, then state broadcasts follow.
 - Malformed message → `error`, keep the socket.
+- At most 64 connections (all roles together); beyond that the upgrade is refused with 503.
 
 ### Config store
 
@@ -95,7 +105,11 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
   send `configError` to admins.
 - `rev` = sha256 (hex, first 16 chars) of the file's bytes.
 - UI saves: validate with `parseConfig`, write atomically (temp file + rename), compact output
-  (omit button fields equal to their schema defaults; 2-space JSON).
+  (omit button fields equal to their schema defaults; 2-space JSON). A new file is created 0600 (it
+  holds commands and their env); a rewrite keeps the file's mode.
+- A symlinked config is read and watched through its path: saves replace the link's current
+  target; edits of the target and replacing the link itself (`sed -i`) are both picked up. Relative
+  paths (actions, secrets) resolve against the directory of the file it pointed to at startup.
 - Removing a button that is running kills its action. Changing a running button's action does not
   affect the current run.
 
@@ -106,18 +120,35 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 - `cwd` defaults to the config file's directory; relative `cwd` resolves against it too.
 - env = host env + action `env` + `BUTTPAD_PAD`, `BUTTPAD_BUTTON`, `BUTTPAD_RUN_ID`, `BUTTPAD_LABEL`.
 - stdin ignored. Spawn detached (POSIX: own process group) so kill hits the whole tree:
-  SIGTERM to `-pid`, then SIGKILL after 2 s. Windows: `taskkill /T /F /PID`.
+  SIGTERM to `-pid`, then SIGKILL after 2 s. Windows: `taskkill /T /F /PID`. A killed run is
+  *dying* until its group is seen empty (on Linux, zombies awaiting their reaper don't count) or got
+  the SIGKILL. A group seen empty is never signalled again: its id may be recycled.
 - **Output protocol** (stdout, line-based, UTF-8):
   - `@progress N` (0–100) → `progress`; `@status text` → `status`; `@result text` → result text.
   - Without `@result`, result text = last non-empty, non-`@` stdout line; on failure with no
     stdout, last non-empty stderr line; spawn error → the error message. Truncate to 200 chars.
-- Timeout (`timeoutMs`) → kill → failure reason `timeout`. Spawn failure (ENOENT etc.) → `spawn`.
+  - A last line without a newline counts, even while a background process holds the pipe open.
+  - Output is read in turns with everything else: a flood (`yes`) can't stall timers or other presses.
+- Timeout (`timeoutMs`) → kill → failure reason `timeout`. Spawn failure → `spawn`, with text like
+  `command not found: X`, `permission denied (chmod +x?): P`, `is a directory: P`,
+  `not executable as a program (missing #! line?): P`, `interpreter not found (check the #! line): P`.
+- Durations and throttles use a monotonic clock; only `startedAt`/`endedAt` are wall-clock (epoch ms).
 - Keep only tails in memory: 16 KB per stream per run; last 20 runs per button.
 
 ### State store
 
 Holds `RunState` per button, runs `transition()` from `machine.ts`, performs the effects (start →
 runner, kill → runner, scheduleReset → timer that feeds back `reset`), broadcasts every change.
+
+A press gets `ignored` instead of its usual result when:
+
+- (`whileRunning: cancel`) it comes within 700 ms of the run's start: a double press must not
+  start and cancel at once. Also when the cancel no longer reaches a process (the action already
+  exited, its output is still draining): the run ends as what it was. A cancel drops a queued re-run.
+- it would start a run while an earlier run of that button is still alive or dying (e.g. the button
+  was removed and re-added meanwhile): never two instances of one button.
+- the limits over all buttons are hit: presses that start or queue a run draw from a token bucket
+  (bursts of 20, then 10/s), and at most 32 runs at a time. Logged once per streak of refusals.
 
 ## Client
 

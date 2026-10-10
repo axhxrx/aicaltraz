@@ -16,6 +16,8 @@ import { StateStore } from './state-store.ts';
 
 export const VERSION: string = pkg.version;
 const MAX_BODY = 1024 * 1024;
+/** WebSocket connections, all roles together; more are refused with 503. */
+export const MAX_CLIENTS = 64;
 
 export interface HostOptions {
   configPath: string;
@@ -31,6 +33,7 @@ export interface HostOptions {
   log?: (msg: string) => void;
   /** File-watch debounce. */
   debounceMs?: number;
+  /** Bun dev mode (HMR socket, source maps with absolute paths): local development only. Default false. */
   development?: boolean;
 }
 
@@ -76,6 +79,20 @@ async function readJson(req: Request): Promise<{ ok: true; value: unknown } | { 
   }
 }
 
+/**
+ * A page from another origin must not open a socket (cross-site WebSocket hijacking). Browsers always
+ * send Origin on WebSocket upgrades; other clients (curl, scripts) send none and are allowed.
+ */
+export function sameOrigin(req: Request): boolean {
+  const origin = req.headers.get('origin');
+  if (origin === null) return true;
+  try {
+    return new URL(origin).host === (req.headers.get('host') ?? '').toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /** Validates a client frame; returns an error message for anything malformed. */
 export function parseClientMsg(raw: string | Buffer): ClientMsg | string {
   if (typeof raw !== 'string') return 'expected a JSON text frame';
@@ -117,6 +134,7 @@ export async function startHost(opts: HostOptions): Promise<Host> {
 
   const state = new StateStore(config.config, {
     baseDir: config.dir,
+    log,
     onState: broadcastState,
     onRunStart: (key, runId) => log(`▶ ${key} #${runId}`),
     onRunEnd: (key, rec, o) => {
@@ -151,11 +169,11 @@ export async function startHost(opts: HostOptions): Promise<Host> {
       return handler(req, role);
     };
 
-  const development = opts.development ?? process.env.NODE_ENV !== 'production';
+  let refusingClients = false;
   const server = Bun.serve({
     hostname: opts.host ?? config.config.server.host,
     port: opts.port ?? config.config.server.port,
-    development,
+    development: opts.development ?? false,
     // Bun turns SO_REUSEPORT on when `development: false`; a second host on the same port must fail instead.
     reusePort: false,
     maxRequestBodySize: MAX_BODY,
@@ -163,12 +181,21 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     routes: {
       '/': webApp,
       '/ws': (req, srv) => {
+        if (!sameOrigin(req)) return json({ error: 'cross-origin WebSocket refused' }, 403);
         const role = auth(new URL(req.url).searchParams.get('token'));
         if (!role) return unauthorized();
+        if (clients.size >= MAX_CLIENTS) {
+          if (!refusingClients) log(`refusing WebSocket connections: ${clients.size} open (max ${MAX_CLIENTS})`);
+          refusingClients = true;
+          return json({ error: `too many connections (max ${MAX_CLIENTS})` }, 503);
+        }
+        refusingClients = false;
+        // open() runs inside upgrade(), so `clients` is up to date for the next request.
         if (srv.upgrade(req, { data: { role } })) return;
         return json({ error: 'expected a WebSocket upgrade' }, 426);
       },
-      '/api/health': { GET: () => json({ ok: true, name: info.name, version: VERSION, protocol: PROTOCOL_VERSION }) },
+      // No hostname here: anyone (even a DNS-rebinding page) can call this. `hello` carries it.
+      '/api/health': { GET: () => json({ ok: true, version: VERSION, protocol: PROTOCOL_VERSION }) },
       '/api/config': {
         GET: withRole('any', (_req, role) => json({ config: config.wire(role), rev: config.rev })),
         PUT: withRole('admin', async (req) => {

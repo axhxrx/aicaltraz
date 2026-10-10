@@ -584,6 +584,10 @@
     width: auto;
     min-width: 0;
   }
+  /* Label alone: it may shrink, so a label sized for two lines wraps instead of overflowing. */
+  .bp-btn:is([data-visual='ready'], [data-visual='arming'], [data-visual='sending']) .bp-content > .bp-label {
+    flex: 0 1 auto;
+  }
   .bp-dots {
     display: none;
   }

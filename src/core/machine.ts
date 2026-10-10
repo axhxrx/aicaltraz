@@ -61,8 +61,10 @@ export function transition(s: RunState, e: MachineEvent, o: MachineOpts): [RunSt
         return [{ phase: 'running', runId, startedAt: e.now }, [{ type: 'start', runId }]];
       }
       if (o.whileRunning === 'cancel') {
-        if (s.cancelling) return [s, []];
-        return [{ ...s, cancelling: true }, [{ type: 'kill', runId: s.runId }]];
+        // A cancel also drops a queued re-run (queued is possible after a config change from 'queue').
+        const { queued: _queued, ...rest } = s;
+        if (s.cancelling) return [s.queued ? rest : s, []];
+        return [{ ...rest, cancelling: true }, [{ type: 'kill', runId: s.runId }]];
       }
       if (o.whileRunning === 'queue') return [{ ...s, queued: true }, []];
       return [s, []];

@@ -2,9 +2,9 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { Config, type ConfigInput } from '../src/core/config.ts';
 import type { RunState } from '../src/core/machine.ts';
-import type { RunHandle, RunHooks, RunOutcome, RunSpec } from '../src/server/runner.ts';
-import { HISTORY_SIZE, StateStore } from '../src/server/state-store.ts';
-import { cleanupTmp, padConfig, tmpDir, waitFor, writeExecutable } from './helpers.ts';
+import { startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec } from '../src/server/runner.ts';
+import { CANCEL_GRACE_MS, HISTORY_SIZE, START_LIMITS, StateStore, type StateStoreOptions } from '../src/server/state-store.ts';
+import { cleanupTmp, isAlive, padConfig, tmpDir, waitFor, writeExecutable } from './helpers.ts';
 
 afterAll(cleanupTmp);
 
@@ -13,6 +13,10 @@ class FakeRun implements RunHandle {
   kills = 0;
   forceKills = 0;
   finished = false;
+  /** What kill() reports: whether there was anything left to signal. */
+  killable = true;
+  /** Killed, and its process group outlives the exit (grandchildren in their SIGKILL grace period). */
+  lingering = false;
   readonly done: Promise<RunOutcome>;
   private resolve!: (o: RunOutcome) => void;
 
@@ -24,12 +28,17 @@ class FakeRun implements RunHandle {
   }
   kill() {
     this.kills++;
+    return this.killable;
   }
   forceKill() {
     this.forceKills++;
+    this.lingering = false;
   }
   alive() {
-    return !this.finished;
+    return !this.finished || this.lingering;
+  }
+  dying() {
+    return this.lingering;
   }
   stdout() {
     return 'live stdout';
@@ -48,12 +57,17 @@ class FakeRun implements RunHandle {
   }
 }
 
-function setup(buttons: NonNullable<ConfigInput['pads'][number]['buttons']>) {
+type Buttons = NonNullable<ConfigInput['pads'][number]['buttons']>;
+
+/** Fake runs and clocks. No cancel grace and practically no rate limits unless `opts` asks for them. */
+function setup(buttons: Buttons, opts: Partial<StateStoreOptions> = {}, pad: Partial<ConfigInput['pads'][number]> = {}) {
   const runs: FakeRun[] = [];
   const events: string[] = [];
   const states: [string, RunState][] = [];
+  const logs: string[] = [];
   let clock = 1000;
-  const store = new StateStore(Config.parse(padConfig(buttons)), {
+  let mono = 0;
+  const store = new StateStore(Config.parse(padConfig(buttons, pad)), {
     baseDir: '/cfg',
     spawn: (spec, hooks) => {
       const r = new FakeRun(spec, hooks);
@@ -64,10 +78,16 @@ function setup(buttons: NonNullable<ConfigInput['pads'][number]['buttons']>) {
       states.push([key, s]);
       events.push(`state:${s.phase}`);
     },
+    log: (m) => logs.push(m),
     now: () => (clock += 10),
+    clock: () => mono,
+    cancelGraceMs: 0,
+    limits: { burst: 1e9, perSec: 0, maxRunning: 1e9 },
+    ...opts,
   });
   const press = (button: string) => store.press('p', button, (r) => events.push(`ack:${r}`)).result;
-  return { store, runs, events, states, press, last: () => states.at(-1)?.[1] };
+  const advance = (ms: number) => (mono += ms);
+  return { store, runs, events, states, logs, press, advance, last: () => states.at(-1)?.[1] };
 }
 
 const shell = (script: string) => ({ type: 'shell' as const, script });
@@ -243,7 +263,7 @@ describe('StateStore', () => {
     ]);
     press('a');
     press('b');
-    runs[0]!.kill = () => runs[0]!.exit({ exitCode: null }); // a polite one
+    runs[0]!.kill = () => (runs[0]!.exit({ exitCode: null }), true); // a polite one
     const t0 = Date.now();
     await store.shutdown(150);
     expect(Date.now() - t0).toBeGreaterThanOrEqual(140);
@@ -252,6 +272,115 @@ describe('StateStore', () => {
     expect(runs[0]!.forceKills).toBe(0);
     expect(press('a')).toBe('ignored');
     expect(runs.length).toBe(2);
+  });
+
+  test(`a cancel press within ${CANCEL_GRACE_MS} ms of the start is a double press: ignored`, () => {
+    const { runs, press, advance, last } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'cancel', action: shell('x') }], { cancelGraceMs: undefined });
+    expect(press('a')).toBe('started');
+    advance(CANCEL_GRACE_MS - 1);
+    expect(press('a')).toBe('ignored');
+    expect(runs[0]!.kills).toBe(0);
+    expect(last()).not.toHaveProperty('cancelling');
+    advance(1);
+    expect(press('a')).toBe('cancelling');
+    expect(runs[0]!.kills).toBe(1);
+  });
+
+  test('a cancel that no longer reaches the process (it exited, output still draining) is ignored; the run ends as what it was', () => {
+    const { store, runs, press, last, events } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'cancel', action: shell('x') }]);
+    press('a');
+    runs[0]!.killable = false;
+    expect(press('a')).toBe('ignored');
+    expect(last()).toMatchObject({ phase: 'running' });
+    expect(last()).not.toHaveProperty('cancelling');
+    runs[0]!.exit({ exitCode: 0, text: 'photo taken' });
+    expect(last()).toMatchObject({ phase: 'success', text: 'photo taken' });
+    expect(store.runs()[0]).toMatchObject({ reason: 'exit', exitCode: 0 });
+    expect(events.filter((e) => e.startsWith('ack'))).toEqual(['ack:started', 'ack:ignored']);
+  });
+
+  test('cancelling also drops a queued re-run (whileRunning switched from queue to cancel)', () => {
+    const { store, runs, press, last } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'queue', action: shell('x') }]);
+    press('a');
+    expect(press('a')).toBe('queued');
+    store.setConfig(Config.parse(padConfig([{ id: 'a', x: 0, y: 0, whileRunning: 'cancel', action: shell('x') }])));
+    expect(press('a')).toBe('cancelling');
+    expect(last()).not.toHaveProperty('queued');
+    runs[0]!.exit({ exitCode: null, signal: 'SIGTERM' });
+    expect(runs.length).toBe(1);
+    expect(last()).toMatchObject({ phase: 'failure', reason: 'cancelled' });
+  });
+
+  test('a removed and re-added button never runs twice at once: presses are ignored until the old run is gone', () => {
+    const { store, runs, press } = setup([{ id: 'a', x: 0, y: 0, action: shell('x') }]);
+    press('a');
+    store.setConfig(Config.parse(padConfig([])));
+    expect(runs[0]!.kills).toBe(1);
+    store.setConfig(Config.parse(padConfig([{ id: 'a', x: 0, y: 0, action: shell('x') }])));
+    expect(press('a')).toBe('ignored'); // the old action is still running
+    runs[0]!.lingering = true;
+    runs[0]!.exit({ exitCode: null, signal: 'SIGTERM' });
+    expect(press('a')).toBe('ignored'); // its process group is still dying
+    runs[0]!.lingering = false;
+    expect(press('a')).toBe('started');
+    expect(runs.filter((r) => r.alive()).length).toBe(1);
+    expect(store.runs({ button: 'a' }).map((r) => [r.runId, r.reason])).toEqual([[2, undefined], [1, 'cancelled']]);
+  });
+
+  test("a killed run's lingering process group blocks a re-run and is SIGKILLed by shutdown and forceKillAll", async () => {
+    const { store, runs, press, last } = setup([
+      { id: 'a', x: 0, y: 0, whileRunning: 'cancel', resultHoldMs: 0, action: shell('x') },
+      { id: 'b', x: 1, y: 0, whileRunning: 'cancel', resultHoldMs: 0, action: shell('x') },
+    ]);
+    for (const b of ['a', 'b']) {
+      press(b);
+      expect(press(b)).toBe('cancelling');
+    }
+    for (const r of runs) {
+      r.lingering = true; // the shell died of the SIGTERM, a grandchild ignores it
+      r.exit({ exitCode: null, signal: 'SIGTERM' });
+    }
+    expect(last()).toMatchObject({ phase: 'failure', reason: 'cancelled' });
+    await waitFor(() => store.get('p/a')?.phase === 'ready', 1000, 'reset');
+    expect(press('a')).toBe('ignored');
+    expect(store.running).toBe(0);
+    store.forceKillAll(); // the process 'exit' handler
+    expect(runs[0]!.forceKills).toBe(1);
+    runs[1]!.forceKills = 0;
+    runs[1]!.lingering = true;
+    await store.shutdown(50);
+    expect(runs[1]!.forceKills).toBe(1);
+    expect(runs.length).toBe(2);
+  });
+
+  test(`rate limit: ${START_LIMITS.burst} starts at once, then ${START_LIMITS.perSec}/s; refusals are "ignored" and logged once per streak`, () => {
+    const { runs, press, advance, logs } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'queue', action: shell('x') }], { limits: undefined });
+    for (let i = 0; i < START_LIMITS.burst; i++) {
+      expect(press('a')).toBe('started');
+      runs.at(-1)!.exit();
+    }
+    expect(press('a')).toBe('ignored');
+    expect(press('a')).toBe('ignored');
+    expect(logs).toEqual([`ignoring presses: presses are coming in too fast (max ${START_LIMITS.burst} at once, then ${START_LIMITS.perSec}/s)`]);
+    advance(1000 / START_LIMITS.perSec);
+    expect(press('a')).toBe('started');
+    expect(press('a')).toBe('ignored'); // queueing a re-run takes a token too
+    expect(runs.length).toBe(START_LIMITS.burst + 1);
+    expect(logs.length).toBe(2);
+    advance(1000 / START_LIMITS.perSec);
+    expect(press('a')).toBe('queued');
+  });
+
+  test(`at most ${START_LIMITS.maxRunning} runs at once over all buttons`, () => {
+    const n = START_LIMITS.maxRunning + 1;
+    const buttons = Array.from({ length: n }, (_, i) => ({ id: `b${i}`, x: i % 12, y: Math.floor(i / 12), action: shell('x') }));
+    const { runs, press, logs } = setup(buttons, { limits: { burst: 1e9, perSec: 0, maxRunning: START_LIMITS.maxRunning } }, { cols: 12, rows: 12 });
+    for (let i = 0; i < n - 1; i++) expect(press(`b${i}`)).toBe('started');
+    expect(press(`b${n - 1}`)).toBe('ignored');
+    expect(logs).toEqual([`ignoring presses: ${START_LIMITS.maxRunning} actions are running (max ${START_LIMITS.maxRunning})`]);
+    runs[0]!.exit();
+    expect(press(`b${n - 1}`)).toBe('started');
+    expect(runs.length).toBe(n);
   });
 });
 
@@ -268,4 +397,43 @@ test('with the real runner: env, cwd and result text end to end', async () => {
   expect(states.at(-1)).toMatchObject({ phase: 'success', text: `Hello from ${dir.split('/').at(-1)}`, exitCode: 0 });
   expect(store.runs()[0]!.stdout).toContain('@status working');
   await store.shutdown();
+});
+
+describe('with the real runner', () => {
+  const sh = (script: string) => ({ type: 'shell' as const, shell: '/bin/sh', script });
+
+  test('shutdown SIGKILLs what a cancelled run left behind in its grace period', async () => {
+    // The shell dies of the SIGTERM; the grandchild ignores it and would get its SIGKILL only after 2 s.
+    const script = `sh -c 'trap "" TERM; echo "@status child $$"; exec sleep 30 >/dev/null 2>&1' & wait`;
+    const store = new StateStore(Config.parse(padConfig([{ id: 'b', x: 0, y: 0, whileRunning: 'cancel', action: sh(script) }])), { baseDir: tmpDir(), cancelGraceMs: 0 });
+    store.press('p', 'b');
+    const status = await waitFor(() => {
+      const s = store.get('p/b');
+      return s?.phase === 'running' && s.status;
+    }, 3000, 'child pid');
+    const child = Number(/child (\d+)/.exec(status)![1]);
+    expect(store.press('p', 'b').result).toBe('cancelling');
+    await waitFor(() => store.get('p/b')?.phase === 'failure', 3000, 'cancelled');
+    expect(isAlive(child)).toBe(true);
+    expect(store.press('p', 'b').result).toBe('ignored'); // never two instances at once
+    const t0 = performance.now();
+    await store.shutdown(200);
+    await waitFor(() => !isAlive(child), 1000, 'grandchild to be SIGKILLed');
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+
+  test.skipIf(!Bun.which('setsid'))('a cancel press after the action exited 0 (a helper still holds its stdout) is ignored; the run succeeds', async () => {
+    const handles: RunHandle[] = [];
+    const store = new StateStore(
+      Config.parse(padConfig([{ id: 'cam', x: 0, y: 0, whileRunning: 'cancel', action: sh('setsid sleep 1 & echo "@result photo taken"; exit 0') }])),
+      { baseDir: tmpDir(), cancelGraceMs: 0, spawn: (spec, hooks) => (handles[handles.length] = startRun(spec, hooks)) },
+    );
+    store.press('p', 'cam');
+    await waitFor(() => handles[0] && !handles[0].alive(), 3000, 'the shell to exit');
+    expect(store.get('p/cam')?.phase).toBe('running'); // the runner waits a moment for the pipes to drain
+    expect(store.press('p', 'cam').result).toBe('ignored');
+    await waitFor(() => store.get('p/cam')?.phase !== 'running', 3000, 'the run to end');
+    expect(store.get('p/cam')).toMatchObject({ phase: 'success', exitCode: 0, text: 'photo taken' });
+    await store.shutdown(100);
+  });
 });

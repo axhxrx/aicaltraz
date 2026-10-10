@@ -1,5 +1,6 @@
 /** Command line: flags, startup banner with pairing URLs + QR, --ready-json, graceful shutdown. */
-import { networkInterfaces } from 'node:os';
+import { readFileSync } from 'node:fs';
+import { constants, networkInterfaces } from 'node:os';
 import { parseArgs } from 'node:util';
 import QRCode from 'qrcode';
 import { ConfigLoadError } from './config-store.ts';
@@ -17,6 +18,8 @@ export const USAGE = `Usage: buttpad [options]
   --ready-json      once listening, print one JSON line to stdout (other output goes to stderr)
   --tls-cert PATH   serve HTTPS with this PEM certificate…
   --tls-key PATH    …and this PEM private key
+  --dev             Bun dev mode for working on the web app (HMR, source maps);
+                    never on a network you don't trust
   -h, --help        show this help
   -v, --version     print the version
 `;
@@ -32,6 +35,7 @@ export interface CliOptions {
   qr: boolean;
   readyJson: boolean;
   tls?: { cert: string; key: string };
+  dev: boolean;
   help: boolean;
   version: boolean;
 }
@@ -53,6 +57,7 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
         'ready-json': { type: 'boolean' },
         'tls-cert': { type: 'string' },
         'tls-key': { type: 'string' },
+        dev: { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -78,6 +83,7 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
     qr: !values['no-qr'],
     readyJson: !!values['ready-json'],
     tls: cert && key ? { cert, key } : undefined,
+    dev: !!values.dev,
     help: !!values.help,
     version: !!values.version,
   };
@@ -124,7 +130,25 @@ async function printBanner(host: Host, out: (s: string) => void, qr: boolean) {
   } else out('');
 }
 
-const g = globalThis as { __buttpadHost?: Host; __buttpadSignals?: boolean };
+const g = globalThis as { __buttpadHost?: Host; __buttpadSignals?: boolean; __buttpadPipes?: boolean };
+
+/**
+ * Whether signal number `signo` is ignored by this process, per the SigIgn mask of /proc/self/status
+ * (Linux). Before any handler is installed that's the disposition inherited from the parent, e.g.
+ * SIGHUP under `nohup`. undefined where it can't be told.
+ */
+export function signalIgnored(signo: number, status?: string): boolean | undefined {
+  if (status === undefined) {
+    if (process.platform !== 'linux') return undefined;
+    try {
+      status = readFileSync('/proc/self/status', 'utf8');
+    } catch {
+      return undefined;
+    }
+  }
+  const mask = /^SigIgn:\s*([0-9a-f]+)\s*$/im.exec(status)?.[1];
+  return mask === undefined ? undefined : ((BigInt(`0x${mask}`) >> BigInt(signo - 1)) & 1n) === 1n;
+}
 
 function installSignalHandlers(log: (m: string) => void) {
   if (g.__buttpadSignals) return;
@@ -141,9 +165,23 @@ function installSignalHandlers(log: (m: string) => void) {
     log(`${sig}: shutting down${n ? `, stopping ${n} running action${n === 1 ? '' : 's'}` : ''}`);
     void host.stop().finally(() => process.exit(0));
   };
-  for (const sig of ['SIGINT', 'SIGTERM', ...(process.platform === 'win32' ? [] : ['SIGHUP'])] as NodeJS.Signals[]) process.on(sig, onSignal);
+  const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+  // Hang-up ends the host, unless it was started to survive one (nohup: SIGHUP inherited as ignored).
+  // Where that can't be told (macOS), the handler is installed regardless.
+  if (process.platform !== 'win32' && signalIgnored(constants.signals.SIGHUP) !== true) signals.push('SIGHUP');
+  for (const sig of signals) process.on(sig, onSignal);
   // Last resort for unexpected exits: don't leave action process groups behind.
   process.on('exit', () => g.__buttpadHost?.state.forceKillAll());
+}
+
+/** A log reader that went away (`buttpad | tee log` and tee died) must not take the host down. */
+function tolerateBrokenPipes() {
+  if (g.__buttpadPipes) return;
+  g.__buttpadPipes = true;
+  for (const s of [process.stdout, process.stderr])
+    s.on('error', (e: NodeJS.ErrnoException) => {
+      if (e.code !== 'EPIPE') throw e;
+    });
 }
 
 const clock = () => new Date().toTimeString().slice(0, 8);
@@ -160,6 +198,7 @@ export async function main(argv: string[]): Promise<void> {
   if (o.help) return void process.stdout.write(USAGE);
   if (o.version) return void process.stdout.write(`buttpad ${VERSION}\n`);
 
+  tolerateBrokenPipes();
   // With --ready-json, stdout carries only the ready line.
   const stream = o.readyJson ? process.stderr : process.stdout;
   const out = (s: string) => void stream.write(s + '\n');
@@ -171,7 +210,16 @@ export async function main(argv: string[]): Promise<void> {
 
   let host: Host;
   try {
-    host = await startHost({ configPath: o.config, secretsPath: o.secrets, host: o.host, port: o.port, rotateTokens: o.rotateTokens, tls: o.tls, log });
+    host = await startHost({
+      configPath: o.config,
+      secretsPath: o.secrets,
+      host: o.host,
+      port: o.port,
+      rotateTokens: o.rotateTokens,
+      tls: o.tls,
+      development: o.dev,
+      log,
+    });
   } catch (e) {
     const err = e as NodeJS.ErrnoException;
     if (e instanceof ConfigLoadError) process.stderr.write(`buttpad: invalid config ${e.path}:\n  ${e.errors.join('\n  ')}\n`);

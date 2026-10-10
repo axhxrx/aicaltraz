@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import { constants } from 'node:os';
 import { join, resolve } from 'node:path';
-import { pairingHosts, pairingUrl, parseCli, UsageError } from '../src/server/cli.ts';
-import { cleanupTmp, eventually, isAlive, readJson, tmpDir, writeJson } from './helpers.ts';
+import type { ConfigInput } from '../src/core/config.ts';
+import { pairingHosts, pairingUrl, parseCli, signalIgnored, UsageError } from '../src/server/cli.ts';
+import { CANCEL_GRACE_MS } from '../src/server/state-store.ts';
+import { cleanupTmp, eventually, isAlive, readJson, TestClient, tmpDir, writeJson } from './helpers.ts';
 
 const MAIN = resolve(import.meta.dir, '..', 'src', 'server', 'main.ts');
 
@@ -17,6 +21,7 @@ describe('parseCli', () => {
       qr: true,
       readyJson: false,
       tls: undefined,
+      dev: false,
       help: false,
       version: false,
     });
@@ -25,8 +30,8 @@ describe('parseCli', () => {
   });
 
   test('all flags', () => {
-    const o = parseCli(['--config', 'c.json', '--secrets', 's.json', '--host', '127.0.0.1', '--port', '0', '--rotate-tokens', '--no-qr', '--ready-json', '--tls-cert', 'c.pem', '--tls-key', 'k.pem'], {});
-    expect(o).toMatchObject({ config: 'c.json', secrets: 's.json', host: '127.0.0.1', port: 0, rotateTokens: true, qr: false, readyJson: true, tls: { cert: 'c.pem', key: 'k.pem' } });
+    const o = parseCli(['--config', 'c.json', '--secrets', 's.json', '--host', '127.0.0.1', '--port', '0', '--rotate-tokens', '--no-qr', '--ready-json', '--tls-cert', 'c.pem', '--tls-key', 'k.pem', '--dev'], {});
+    expect(o).toMatchObject({ config: 'c.json', secrets: 's.json', host: '127.0.0.1', port: 0, rotateTokens: true, qr: false, readyJson: true, tls: { cert: 'c.pem', key: 'k.pem' }, dev: true });
     expect(parseCli(['--port=18001'], {}).port).toBe(18001);
     expect(parseCli(['-h'], {}).help).toBe(true);
   });
@@ -35,6 +40,15 @@ describe('parseCli', () => {
     for (const argv of [['--port', 'abc'], ['--port', '70000'], ['--port', '-1'], ['--tls-cert', 'c.pem'], ['--bogus'], ['extra'], ['--host', '']])
       expect(() => parseCli(argv, {})).toThrow(UsageError);
   });
+});
+
+test('signalIgnored reads the SigIgn mask of /proc/self/status', () => {
+  const status = (mask: string) => `Name:\tbun\nSigBlk:\t0000000000000000\nSigIgn:\t${mask}\nSigCgt:\t00000001200004f8\n`;
+  expect(signalIgnored(1, status('0000000001001001'))).toBe(true); // SIGHUP under nohup
+  expect(signalIgnored(1, status('0000000001001000'))).toBe(false);
+  expect(signalIgnored(13, status('0000000000001000'))).toBe(true); // SIGPIPE
+  expect(signalIgnored(1, 'Name:\tbun\n')).toBeUndefined();
+  if (process.platform === 'linux') expect(typeof signalIgnored(1)).toBe('boolean');
 });
 
 describe('pairing URLs', () => {
@@ -75,8 +89,9 @@ afterEach(async () => {
   cleanupTmp();
 });
 
-function spawnCli(args: string[], env: Record<string, string> = {}): Proc {
-  const proc = Bun.spawn([process.execPath, MAIN, ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'production', ...env } });
+/** `wrap`: argv prefix to start the host through (it must exec it). */
+function spawnCli(args: string[], env: Record<string, string> = {}, wrap: string[] = []): Proc {
+  const proc = Bun.spawn([...wrap, process.execPath, MAIN, ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'production', ...env } });
   let out = '';
   let err = '';
   const pump = async (s: ReadableStream<Uint8Array>, add: (t: string) => void) => {
@@ -98,8 +113,8 @@ interface Ready {
   configPath: string;
 }
 
-async function startReady(args: string[], env?: Record<string, string>): Promise<{ p: Proc; ready: Ready }> {
-  const p = spawnCli([...args, '--port', '0', '--ready-json', '--no-qr'], env);
+async function startReady(args: string[], env?: Record<string, string>, wrap?: string[]): Promise<{ p: Proc; ready: Ready }> {
+  const p = spawnCli([...args, '--port', '0', '--ready-json', '--no-qr'], env, wrap);
   const line = await eventually(async () => {
     if (p.proc.exitCode !== null) throw new Error(`host exited ${p.proc.exitCode}: ${p.stderr()}`);
     return p.stdout().includes('\n') && p.stdout().split('\n')[0];
@@ -121,6 +136,7 @@ describe('CLI (spawned)', () => {
     expect(ready.pressToken).not.toBe(ready.adminToken);
 
     expect(existsSync(configPath)).toBe(true);
+    expect(statSync(configPath).mode & 0o777).toBe(0o600); // it holds commands and their env
     const secretsPath = join(dir, 'new', 'buttpad.secrets.json');
     expect(readJson<Record<string, string>>(secretsPath)).toEqual({ pressToken: ready.pressToken, adminToken: ready.adminToken });
     expect(statSync(secretsPath).mode & 0o777).toBe(0o600);
@@ -161,8 +177,10 @@ describe('CLI (spawned)', () => {
     expect(old.status).toBe(401);
   }, 30_000);
 
-  for (const sig of ['SIGTERM', 'SIGINT'] as const)
-    test(`${sig} kills running actions' process groups, then exits 0`, async () => {
+  // A test run that itself ignores SIGHUP (nohup) passes that on to the host, which then rightly keeps running.
+  const hupIgnored = signalIgnored(constants.signals.SIGHUP) === true;
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const)
+    test.skipIf(sig === 'SIGHUP' && hupIgnored)(`${sig} kills running actions' process groups, then exits 0`, async () => {
       const dir = tmpDir();
       const config = join(dir, 'buttpad.config.json');
       writeJson(config, {
@@ -185,6 +203,130 @@ describe('CLI (spawned)', () => {
       expect(Date.now() - t0).toBeLessThan(4000);
       await eventually(async () => !isAlive(child), 2000, 'action to be gone');
       expect(p.stderr()).toContain(`${sig}: shutting down, stopping 1 running action`);
+    }, 20_000);
+
+  test.skipIf(process.platform !== 'linux')('SIGHUP is left alone when the host was started to survive it (nohup)', async () => {
+    const dir = tmpDir();
+    // What nohup does: the host inherits SIGHUP as ignored.
+    const { p, ready } = await startReady(['--config', join(dir, 'c.json')], {}, ['/bin/sh', '-c', 'trap "" HUP; exec "$@"', 'sh']);
+    p.proc.kill('SIGHUP');
+    await Bun.sleep(500);
+    expect(p.proc.exitCode).toBeNull();
+    expect((await fetch(`http://127.0.0.1:${ready.port}/api/health`)).status).toBe(200);
+    expect(p.stderr()).not.toContain('SIGHUP');
+    p.proc.kill('SIGTERM');
+    expect(await p.proc.exited).toBe(0);
+  }, 20_000);
+
+  test('shutdown during a kill grace period still SIGKILLs a grandchild that ignores SIGTERM', async () => {
+    const dir = tmpDir();
+    const config = join(dir, 'buttpad.config.json');
+    const script = `sh -c 'trap "" TERM; echo "@status child $$"; exec sleep 60 >/dev/null 2>&1' & wait`;
+    writeJson(config, { version: 1, pads: [{ id: 'p', name: 'P', buttons: [{ id: 'b', x: 0, y: 0, whileRunning: 'cancel', action: { type: 'shell', shell: '/bin/sh', script } }] }] });
+    const { p, ready } = await startReady(['--config', config]);
+    const base = `http://127.0.0.1:${ready.port}`;
+    const auth = { authorization: `Bearer ${ready.pressToken}` };
+    const press = async () => ((await (await fetch(`${base}/api/press/p/b`, { method: 'POST', headers: auth })).json()) as { result: string }).result;
+    const state = async () => ((await (await fetch(`${base}/api/state`, { headers: auth })).json()) as { states: Record<string, { phase: string; status?: string }> }).states['p/b']!;
+    expect(await press()).toBe('started');
+    const status = await eventually(async () => (await state()).status, 5000, 'child pid');
+    const child = Number(/child (\d+)/.exec(status)![1]);
+    try {
+      await Bun.sleep(CANCEL_GRACE_MS);
+      expect(await press()).toBe('cancelling');
+      // The shell died of the SIGTERM; the grandchild lives on until its SIGKILL is due (2 s later).
+      await eventually(async () => (await state()).phase === 'failure', 5000, 'cancelled');
+      expect(isAlive(child)).toBe(true);
+      const t0 = Date.now();
+      p.proc.kill('SIGINT');
+      expect(await p.proc.exited).toBe(0);
+      expect(Date.now() - t0).toBeLessThan(4000);
+      await eventually(async () => !isAlive(child), 1000, 'the grandchild to be gone');
+    } finally {
+      if (isAlive(child)) process.kill(child, 'SIGKILL');
+    }
+  }, 20_000);
+
+  test('a button flooding its output does not hold up presses of other buttons; its timeout fires on time', async () => {
+    const dir = tmpDir();
+    const config = join(dir, 'buttpad.config.json');
+    writeJson(config, {
+      version: 1,
+      pads: [
+        {
+          id: 'p',
+          name: 'P',
+          buttons: [
+            { id: 'flood', x: 0, y: 0, timeoutMs: 1500, action: { type: 'shell', shell: '/bin/sh', script: 'yes' } },
+            { id: 'light', x: 1, y: 0, resultHoldMs: 0, action: { type: 'shell', shell: '/bin/sh', script: 'true' } },
+          ],
+        },
+      ],
+    } satisfies ConfigInput);
+    const { ready } = await startReady(['--config', config]);
+    const base = `http://127.0.0.1:${ready.port}`;
+    const auth = { authorization: `Bearer ${ready.pressToken}` };
+    const ws = await TestClient.connect(`ws://127.0.0.1:${ready.port}/ws?token=${ready.pressToken}`);
+    try {
+      ws.send({ t: 'press', id: 'f', pad: 'p', button: 'flood' });
+      expect((await ws.next('ack', (m) => m.id === 'f')).result).toBe('started');
+      await Bun.sleep(200);
+      const lags: number[] = [];
+      for (let i = 0; i < 5; i++) {
+        let t = performance.now();
+        ws.send({ t: 'press', id: `l${i}`, pad: 'p', button: 'light' });
+        await ws.next('ack', (m) => m.id === `l${i}`, 10_000);
+        lags.push(performance.now() - t);
+        t = performance.now();
+        await fetch(`${base}/api/state`, { headers: auth });
+        lags.push(performance.now() - t);
+        await Bun.sleep(100);
+      }
+      // Without yielding to the event loop, the first of these took >10 s.
+      lags.sort((a, b) => a - b);
+      expect(lags[lags.length >> 1]!).toBeLessThan(100);
+      expect(lags.at(-1)!).toBeLessThan(1000);
+      const end = await ws.next('state', (m) => m.key === 'p/flood' && m.state.phase === 'failure', 10_000);
+      if (end.state.phase !== 'failure') throw new Error('unreachable');
+      expect(end.state.reason).toBe('timeout');
+      expect(end.state.endedAt - end.state.startedAt).toBeLessThan(1500 + 1000);
+    } finally {
+      ws.close();
+    }
+  }, 20_000);
+
+  for (const mode of ['--ready-json', 'plain'] as const)
+    test(`a log reader that goes away does not take the host down (${mode === 'plain' ? 'log on stdout' : 'log on stderr'})`, async () => {
+      const dir = tmpDir();
+      const config = join(dir, 'buttpad.config.json');
+      writeJson(config, { version: 1, pads: [{ id: 'p', name: 'P', buttons: [{ id: 'b', x: 0, y: 0, action: { type: 'shell', shell: '/bin/sh', script: 'echo hi' } }] }] });
+      const args = [MAIN, '--config', config, '--host', '127.0.0.1', '--port', '0', '--no-qr', ...(mode === 'plain' ? [] : [mode])];
+      const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NODE_ENV: 'production' } });
+      const exited = new Promise<number | null>((r) => child.on('exit', (code) => r(code)));
+      let out = '';
+      child.stdout.on('data', (d) => (out += d));
+      child.stderr.on('data', () => {});
+      try {
+        const port = await eventually(async () => {
+          if (child.exitCode !== null) throw new Error(`host exited ${child.exitCode}`);
+          return mode === 'plain' ? Number(/Listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(out)?.[1]) : out.includes('\n') && (JSON.parse(out.split('\n')[0]!) as Ready).port;
+        }, 15_000, 'host to listen');
+        const { pressToken } = readJson<{ pressToken: string }>(join(dir, 'buttpad.secrets.json'));
+        // e.g. `buttpad | tee log`, and tee dies
+        (mode === 'plain' ? child.stdout : child.stderr).destroy();
+        await Bun.sleep(100);
+        for (let i = 0; i < 3; i++) {
+          // Each press logs a line or two.
+          await fetch(`http://127.0.0.1:${port}/api/press/p/b`, { method: 'POST', headers: { authorization: `Bearer ${pressToken}` } });
+          await Bun.sleep(100);
+        }
+        expect(await Promise.race([exited, Bun.sleep(500).then(() => 'still running')])).toBe('still running');
+        expect((await fetch(`http://127.0.0.1:${port}/api/health`)).status).toBe(200);
+        child.kill('SIGTERM');
+        expect(await exited).toBe(0);
+      } finally {
+        child.kill('SIGKILL');
+      }
     }, 20_000);
 
   test.skipIf(!Bun.which('openssl'))('--tls-cert/--tls-key serve HTTPS', async () => {

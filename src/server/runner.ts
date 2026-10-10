@@ -7,7 +7,7 @@
  *   @status text  status line shown while running
  *   @result text  result text shown after the run
  */
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve, win32 } from 'node:path';
 import type { Action } from '../core/config.ts';
@@ -15,6 +15,8 @@ import type { Action } from '../core/config.ts';
 export const TAIL_BYTES = 16 * 1024;
 export const RESULT_MAX = 200;
 export const KILL_GRACE_MS = 2000;
+/** While a killed run's process group lingers, how often to check whether it's gone. */
+const KILL_POLL_MS = 50;
 /** After the main process exits, how long to wait for its output pipes to drain. */
 const DRAIN_MS = 250;
 /** Min interval between progress/status updates (they become WebSocket broadcasts). */
@@ -24,6 +26,7 @@ const MAX_LINE = 16 * 1024;
 export const MAX_DELAY_MS = 2 ** 31 - 1;
 
 const isWindows = process.platform === 'win32';
+const isLinux = process.platform === 'linux';
 
 export interface RunSpec {
   action: Action;
@@ -61,12 +64,17 @@ export interface RunHooks {
 export interface RunHandle {
   readonly pid: number | undefined;
   readonly done: Promise<RunOutcome>;
-  /** SIGTERM the process group; SIGKILL whatever is left after the grace period. Windows: taskkill /T /F. */
-  kill(): void;
+  /**
+   * SIGTERM the process group; SIGKILL whatever is left after the grace period. Windows: taskkill /T /F.
+   * Returns whether a signal was delivered (false: nothing left to kill, e.g. it already exited).
+   */
+  kill(): boolean;
   /** SIGKILL the process group now. */
   forceKill(): void;
-  /** Whether anything in the run's process group is still alive. */
+  /** Whether anything in the run's process group is still alive (on Linux, zombies don't count). */
   alive(): boolean;
+  /** Killed, and the process group was neither seen empty nor SIGKILLed yet (the grace period is running). */
+  dying(): boolean;
   stdout(): string;
   stderr(): string;
 }
@@ -210,17 +218,25 @@ export function shellArgv(
 
 class SpawnError extends Error {}
 
+const isDir = (p: string) => {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
 function describeSpawnError(e: unknown, action: Action, cmd0: string): string {
   if (e instanceof SpawnError) return e.message;
-  const code = (e as NodeJS.ErrnoException)?.code;
-  if (action.type === 'shell') {
-    if (code === 'ENOENT') return `shell not found: ${cmd0}`;
-    if (code === 'EACCES') return `permission denied: ${cmd0}`;
-  } else {
-    if (code === 'ENOENT' && !hasSep(action.command)) return `command not found: ${action.command}`;
-    if (code === 'ENOENT') return existsSync(cmd0) ? `cannot execute ${cmd0}: interpreter not found (check its #! line)` : `not found: ${cmd0}`;
-    if (code === 'EACCES') return `permission denied: ${cmd0} (is it executable? chmod +x)`;
+  const code = errCode(e);
+  if (code === 'ENOENT') {
+    if (!hasSep(cmd0)) return `${action.type === 'shell' ? 'shell' : 'command'} not found: ${cmd0}`;
+    if (existsSync(cmd0)) return `interpreter not found (check the #! line): ${cmd0}`;
+    return action.type === 'shell' ? `shell not found: ${cmd0}` : `not found: ${cmd0}`;
   }
+  if ((code === 'EACCES' || code === 'ENOEXEC' || code === 'EISDIR') && isDir(cmd0)) return `is a directory: ${cmd0}`;
+  if (code === 'EACCES') return `permission denied (chmod +x?): ${cmd0}`;
+  if (code === 'ENOEXEC') return `not executable as a program (missing #! line?): ${cmd0}`;
   return `spawn failed: ${(e as Error)?.message ?? String(e)}`;
 }
 
@@ -240,8 +256,32 @@ type Child = ReturnType<typeof spawnChild>;
 
 const errCode = (e: unknown) => (e as NodeJS.ErrnoException)?.code;
 
+/** Linux: whether process group `pgid` has a member that isn't a zombie, from /proc. */
+function hasLiveMember(pgid: number): boolean {
+  let pids: string[];
+  try {
+    pids = readdirSync('/proc');
+  } catch {
+    return true;
+  }
+  for (const pid of pids) {
+    const c = pid.charCodeAt(0);
+    if (c < 48 || c > 57) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, 'latin1');
+    } catch {
+      continue;
+    }
+    // "pid (comm) state ppid pgrp …"; comm may contain anything, so split after its last ')'.
+    const [state, , pgrp] = stat.slice(stat.lastIndexOf(')') + 2).split(' ', 3);
+    if (Number(pgrp) === pgid && state !== 'Z' && state !== 'X') return true;
+  }
+  return false;
+}
+
 export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
-  const t0 = Date.now();
+  const t0 = performance.now();
   const grace = spec.killGraceMs ?? KILL_GRACE_MS;
   const outTail = new Tail();
   const errTail = new Tail();
@@ -254,14 +294,15 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
 
   // Coalesced progress/status updates.
   let pending: RunUpdate | undefined;
-  let lastUpdate = 0;
+  let lastUpdate = -Infinity;
   let updateTimer: ReturnType<typeof setTimeout> | undefined;
   const flushUpdate = () => {
+    clearTimeout(updateTimer);
     updateTimer = undefined;
     if (!pending || finished) return;
     const u = pending;
     pending = undefined;
-    lastUpdate = Date.now();
+    lastUpdate = performance.now();
     try {
       hooks.onUpdate?.(u);
     } catch (e) {
@@ -270,7 +311,7 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
   };
   const scheduleUpdate = () => {
     if (!pending || updateTimer) return;
-    const wait = UPDATE_INTERVAL_MS - (Date.now() - lastUpdate);
+    const wait = UPDATE_INTERVAL_MS - (performance.now() - lastUpdate);
     if (wait <= 0) flushUpdate();
     else updateTimer = setTimeout(flushUpdate, wait);
   };
@@ -297,11 +338,7 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
   let spawnError: string | undefined;
   try {
     const cwd = resolveCwd(spec.baseDir, action.cwd);
-    let isDir = false;
-    try {
-      isDir = statSync(cwd).isDirectory();
-    } catch {}
-    if (!isDir) throw new SpawnError(`cwd not found: ${cwd}`);
+    if (!isDir(cwd)) throw new SpawnError(`cwd not found: ${cwd}`);
     const env = { ...process.env, ...action.env, ...spec.env };
     let argv: string[];
     let verbatim = false;
@@ -325,53 +362,86 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
         const { value, done } = await reader.read();
         if (done) break;
         tail.push(value);
-        lines.push(value);
-        if (!finished) scheduleUpdate();
+        if (!finished) {
+          lines.push(value);
+          scheduleUpdate();
+        }
+        // Reads of a pipe that always has data resolve without ever returning to the event loop: a
+        // firehose (`yes`) would starve timers (timeouts!) and sockets. Give the event loop a turn.
+        await new Promise((r) => setImmediate(r));
       }
-    } catch {
-    } finally {
-      lines.end();
-    }
+    } catch {}
   };
 
+  /** The group was seen empty (or all zombies) after the leader exited: its id may be recycled, never signal it again. */
+  let gone = false;
   let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
   const taskkill = (pid: number) => {
     try {
       Bun.spawn(['taskkill', '/T', '/F', '/PID', String(pid)], { stdout: 'ignore', stderr: 'ignore', windowsHide: true });
     } catch {}
   };
-  const signalGroup = (sig: 'SIGTERM' | 'SIGKILL') => {
-    if (!child) return;
+  /** Returns whether the signal was delivered. */
+  const signalGroup = (sig: 'SIGTERM' | 'SIGKILL'): boolean => {
+    if (!child || gone) return false;
     if (isWindows) {
-      if (!exited) taskkill(child.pid);
-      return;
+      if (exited) return false;
+      taskkill(child.pid);
+      return true;
     }
     try {
       process.kill(-child.pid, sig);
+      return true;
     } catch (e) {
-      if (errCode(e) !== 'ESRCH' && !exited) {
-        try {
-          child.kill(sig);
-        } catch {}
+      if (exited) {
+        if (errCode(e) === 'ESRCH') gone = true;
+        return false;
+      }
+      // The leader lives but its group can't be signalled (it left the group, or EPERM): signal it alone.
+      try {
+        child.kill(sig);
+        return true;
+      } catch {
+        return false;
       }
     }
   };
   const alive = () => {
-    if (!child) return false;
+    if (!child || gone) return false;
     if (isWindows) return !exited;
     try {
       process.kill(-child.pid, 0);
-      return true;
     } catch (e) {
-      return errCode(e) === 'EPERM';
+      if (errCode(e) === 'EPERM') return true;
+      if (exited) gone = true;
+      return !exited;
     }
+    // Members that died stay zombies until their new parent reaps them (some inits take a second or
+    // more, a PID-1 host never does), and kill() counts zombies. Only zombies left = gone for good.
+    if (exited && isLinux && !hasLiveMember(child.pid)) gone = true;
+    return !gone;
   };
-  const kill = () => {
-    if (!child || killTimer || (exited && !alive())) return;
-    signalGroup('SIGTERM');
-    if (isWindows) return;
-    killTimer = setTimeout(() => signalGroup('SIGKILL'), grace);
+  const stopKillTimers = () => {
+    clearTimeout(killTimer);
+    clearInterval(pollTimer);
+    killTimer = pollTimer = undefined;
+  };
+  const kill = (): boolean => {
+    if (killTimer) return true; // already on its way down
+    if ((exited && !alive()) || !signalGroup('SIGTERM')) return false;
+    if (isWindows) return true; // taskkill /F is final
+    killTimer = setTimeout(() => {
+      stopKillTimers();
+      if (alive()) signalGroup('SIGKILL');
+    }, grace);
+    // Stop tracking as soon as the group is empty, so the delayed SIGKILL can't hit a recycled pid.
+    pollTimer = setInterval(() => {
+      if (!alive()) stopKillTimers();
+    }, KILL_POLL_MS);
     killTimer.unref?.();
+    pollTimer.unref?.();
+    return true;
   };
 
   const timeout = child
@@ -384,8 +454,10 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
   const done = new Promise<RunOutcome>((resolveDone) => {
     const finish = (exitCode: number | null, signal: string | null) => {
       clearTimeout(timeout);
+      // A last line without a newline; a background process may still hold the pipes open.
+      outLines.end();
+      errLines.end();
       flushUpdate();
-      clearTimeout(updateTimer);
       finished = true;
       const reason = spawnError ? 'spawn' : timedOut ? 'timeout' : undefined;
       const failed = reason !== undefined || exitCode !== 0;
@@ -396,7 +468,7 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
         text: spawnError ? clip(spawnError) : pickResultText({ result, lastOut, lastErr, failed }),
         stdout: outTail.text(),
         stderr: errTail.text(),
-        durationMs: Date.now() - t0,
+        durationMs: Math.round(performance.now() - t0),
       };
       try {
         hooks.onExit?.(outcome);
@@ -424,8 +496,12 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
     pid: child?.pid,
     done,
     kill,
-    forceKill: () => signalGroup('SIGKILL'),
+    forceKill: () => {
+      stopKillTimers();
+      signalGroup('SIGKILL');
+    },
     alive,
+    dying: () => killTimer !== undefined,
     stdout: () => outTail.text(),
     stderr: () => errTail.text(),
   };

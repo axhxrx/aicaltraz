@@ -47,6 +47,15 @@ describe('press', () => {
     expect(effects).toEqual([]);
   });
 
+  test('running + press (cancel) also drops a queued re-run (queued after a config change from queue)', () => {
+    const [next, effects] = transition({ ...busy, queued: true }, { type: 'press', now: 5000 }, opts('cancel'));
+    expect(next).toEqual({ ...busy, cancelling: true });
+    expect(effects).toEqual([{ type: 'kill', runId: 3 }]);
+    const [again, effects2] = transition({ ...cancelling, queued: true }, { type: 'press', now: 6000 }, opts('cancel'));
+    expect(again).toEqual(cancelling);
+    expect(effects2).toEqual([]);
+  });
+
   test('running + press (queue) marks queued without effects, idempotently', () => {
     const [next, effects] = transition(running, { type: 'press', now: 5000 }, opts('queue'));
     expect(next).toEqual({ ...running, queued: true });
@@ -127,7 +136,7 @@ describe('exit', () => {
     expect(effects).toEqual([{ type: 'start', runId: 4 }]);
   });
 
-  test('queued wins over cancelling (both can only coexist after a config change)', () => {
+  test('queued wins over cancelling (a queue press after a cancel, across a config change)', () => {
     const [next, effects] = transition({ ...running, queued: true, cancelling: true }, exit(), opts('cancel'));
     expect(next).toMatchObject({ phase: 'running', runId: 4 });
     expect(effects).toEqual([{ type: 'start', runId: 4 }]);

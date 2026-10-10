@@ -49,7 +49,7 @@ test('press role has no Edit entry; admin does', async ({ page }) => {
   await page.getByTestId('menu-btn').click();
   await expect(page.getByTestId('menu-edit')).toBeVisible();
   await page.getByTestId('menu-edit').click();
-  await expect(page.getByTestId('edit-stub')).toBeVisible();
+  await expect(page.getByTestId('edit-mode')).toBeVisible();
 });
 
 test('hold to fire runs the script: status, then success with its output', async ({ page, hasTouch }) => {
