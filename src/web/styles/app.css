@@ -39,6 +39,15 @@
     --bar-h: 38px;
   }
 }
+/* Narrow phones: the green dot alone says LIVE; words appear when something is wrong. */
+@media (max-width: 420px) {
+  .bp-conn[data-status='online'] span {
+    display: none;
+  }
+  .bp-tab {
+    padding: 0 11px;
+  }
+}
 
 *,
 *::before,

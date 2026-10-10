@@ -44,6 +44,7 @@ function RunButton({ backend, padId, button, registry }: { backend: Backend; pad
   ctrl.setCtx({ button, host, online: link === 'online', press: () => backend.press(padId, button.id), kick: () => backend.kick() });
   const local = useStore(ctrl.local);
   useEffect(() => ctrl.onHost(host), [host]);
+  useEffect(() => ctrl.onLink(link === 'online'), [link]);
   useEffect(() => {
     registry.set(button.id, ctrl);
     return () => registry.get(button.id) === ctrl && registry.delete(button.id);
@@ -83,7 +84,8 @@ export function matchKey(buttons: WireButton[], key: string): WireButton | undef
   );
 }
 
-const typing = (t: EventTarget | null) => t instanceof Element && !!t.closest('input, textarea, select, [contenteditable]');
+const typing = (t: EventTarget | null) =>
+  t instanceof Element && !!t.closest('input:not([type=checkbox]):not([type=radio]), textarea, select, [contenteditable]');
 
 /** BLE remotes/clickers pair as keyboards: keydown starts the press, keyup releases. */
 function useKeys(pad: WirePad, registry: Registry, enabled: boolean) {

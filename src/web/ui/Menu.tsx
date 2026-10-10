@@ -4,7 +4,7 @@ import { useEffect } from 'preact/hooks';
 import type { Backend } from '../backend/types.ts';
 import { DemoBackend } from '../backend/demo.ts';
 import { fullscreenSupported, isFullscreen, toggleFullscreen } from '../lib/env.ts';
-import { hapticsSupported } from '../lib/feedback.ts';
+import { haptic, hapticsSupported, sound, unlockAudio } from '../lib/feedback.ts';
 import { awake } from '../lib/keepawake.ts';
 import { setSetting, settings } from '../lib/settings.ts';
 import { useStore } from '../lib/store.ts';
@@ -75,10 +75,25 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
           <Toggle label="Keep screen awake" on={s.keepAwake} onChange={(v) => setSetting('keepAwake', v)} testid="toggle-awake" />
         </Row>
         <Row icon={<Speaker />} title="Sounds" note="Beeps on fire, success and failure">
-          <Toggle label="Sounds" on={s.sound} onChange={(v) => setSetting('sound', v)} testid="toggle-sound" />
+          <Toggle
+            label="Sounds"
+            on={s.sound}
+            onChange={(v) => {
+              setSetting('sound', v);
+              // This click is a user gesture: unlock audio now and let them hear it.
+              if (v) (unlockAudio(), setTimeout(() => sound('success'), 60));
+            }}
+            testid="toggle-sound"
+          />
         </Row>
         <Row icon={<Vibrate />} title="Haptics" note={hapticsSupported ? 'Vibrate on fire, success and failure' : 'Not supported by this browser'}>
-          <Toggle label="Haptics" on={s.haptics && hapticsSupported} disabled={!hapticsSupported} onChange={(v) => setSetting('haptics', v)} testid="toggle-haptics" />
+          <Toggle
+            label="Haptics"
+            on={s.haptics && hapticsSupported}
+            disabled={!hapticsSupported}
+            onChange={(v) => (setSetting('haptics', v), v && haptic('fire'))}
+            testid="toggle-haptics"
+          />
         </Row>
 
         {snap.role === 'admin' && !p.lock && <Row icon={<Pencil />} title="Edit pads" note="Add, move and configure buttons" onClick={p.onEdit} testid="menu-edit" />}

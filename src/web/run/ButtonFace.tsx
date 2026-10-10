@@ -20,6 +20,9 @@ export interface FaceProps extends Omit<HTMLAttributes<HTMLDivElement>, 'style' 
 
 const POP: Keyframe[] = [{ transform: 'scale(1)' }, { transform: 'scale(1.045)', offset: 0.32 }, { transform: 'scale(0.99)', offset: 0.7 }, { transform: 'scale(1)' }];
 const SHAKE: Keyframe[] = [0, -4, 4, -3, 3, -1.5, 0].map((x) => ({ transform: `translateX(${x}%)` }));
+const calm = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-motion: reduce)') : null;
+/** Pop/shake are decoration; the fill, flash and colors carry the meaning, so they stay. */
+const move = (el: HTMLElement | null, k: Keyframe[], o: KeyframeAnimationOptions) => !calm?.matches && el?.animate(k, o);
 
 /** Multi-line text sized to its box (see lib/fit.ts); `weight` must match the CSS. */
 function Fit({ text, class: cls, weight = 900, lines }: { text: string; class: string; weight?: number; lines?: number }) {
@@ -178,7 +181,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
   // Fired: pop + flash, and the full fill fades away.
   useLayoutEffect(() => {
     if (!vm.firedAt || Date.now() - vm.firedAt > 400) return;
-    face.current?.animate(POP, { duration: 320, easing: 'cubic-bezier(.2,.8,.3,1)' });
+    move(face.current, POP, { duration: 320, easing: 'cubic-bezier(.2,.8,.3,1)' });
     flash.current?.animate([{ opacity: 0.65 }, { opacity: 0 }], { duration: 420, easing: 'ease-out' });
     const el = arm.current;
     if (el && armAnim.current) {
@@ -189,7 +192,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
 
   // BUSY / pressed while offline: shake.
   useLayoutEffect(() => {
-    if (vm.flash && (vm.flash.kind === 'busy' || vm.flash.kind === 'denied')) face.current?.animate(SHAKE, { duration: 420, easing: 'ease-out' });
+    if (vm.flash && (vm.flash.kind === 'busy' || vm.flash.kind === 'denied')) move(face.current, SHAKE, { duration: 420, easing: 'ease-out' });
   }, [vm.flash?.at]);
 
   // Countdown bars: start where the host (or the confirm window) says they started.
@@ -221,7 +224,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
         <div ref={arm} class="bp-arm" />
         <div ref={flash} class="bp-flash" />
         {(v === 'confirm' || v === 'offline') && <div class="bp-frame" />}
-        <div class="bp-content" aria-live="polite">
+        <div class="bp-content">
           <Content vm={vm} now={now} />
         </div>
         {vm.doubleWait && (

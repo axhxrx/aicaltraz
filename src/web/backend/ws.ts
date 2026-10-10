@@ -11,6 +11,13 @@ const BACKOFF_MAX = 5000;
 const HELLO_TIMEOUT = 5000;
 /** Coming back from the background after this long → reconnect for a fresh hello. */
 const STALE_AFTER_HIDDEN = 5000;
+/** A deliberate reconnect (kick) that is back within this long doesn't flash OFFLINE. */
+const QUIET_RECONNECT = 1500;
+/** Presses made during a quiet reconnect wait this long for the new socket, then fail. */
+const DEFER_PRESS = 1800;
+/** While visible and online, check the host still answers (Wi-Fi can die without a TCP close). */
+const LIVENESS_EVERY = 15_000;
+const LIVENESS_TIMEOUT = 4000;
 
 interface Pending {
   resolve: (r: PressResult) => void;
@@ -34,6 +41,9 @@ export class WsBackend implements Backend {
   private disposed = false;
   private hiddenAt = 0;
   private lastKick = 0;
+  private quietUntil = 0;
+  private deferred: (() => void)[] = [];
+  private livenessTimer: ReturnType<typeof setInterval> | undefined;
   private readonly offs: (() => void)[] = [];
 
   constructor(
@@ -54,7 +64,22 @@ export class WsBackend implements Backend {
     document.addEventListener('visibilitychange', vis);
     this.offs.push(() => document.removeEventListener('visibilitychange', vis));
     on('online', () => this.connectNow());
+    this.livenessTimer = setInterval(() => void this.checkLiveness(), LIVENESS_EVERY);
     this.connect();
+  }
+
+  private async checkLiveness() {
+    if (document.visibilityState !== 'visible' || !this.isOpen()) return;
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), LIVENESS_TIMEOUT);
+    try {
+      const r = await fetch(`${this.origin}/api/health`, { cache: 'no-store', signal: ac.signal });
+      if (!r.ok) throw new Error(String(r.status));
+    } catch {
+      if (this.isOpen()) this.ws?.close();
+    } finally {
+      clearTimeout(t);
+    }
   }
 
   private patch(p: Partial<Snapshot>) {
@@ -68,6 +93,8 @@ export class WsBackend implements Backend {
   private connect() {
     if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
     clearTimeout(this.retryTimer);
+    // Never two sockets: one already on its way (or up) wins.
+    if (this.ws && this.ws.readyState <= WebSocket.OPEN) return;
     const proto = this.origin.startsWith('https:') ? 'wss:' : 'ws:';
     const url = `${proto}//${this.origin.replace(/^https?:\/\//, '')}/ws?token=${encodeURIComponent(this.token)}`;
     let ws: WebSocket;
@@ -91,6 +118,7 @@ export class WsBackend implements Backend {
         clearTimeout(this.helloTimer);
       }
       this.onMessage(msg);
+      if (msg.t === 'hello') for (const send of this.deferred.splice(0)) send();
     };
     ws.onclose = () => {
       clearTimeout(this.helloTimer);
@@ -116,8 +144,13 @@ export class WsBackend implements Backend {
     const delay = wasGreeted ? 0 : Math.round(base * (0.8 + Math.random() * 0.4));
     this.failures++;
     const s = this.snapshot.get();
-    // A first failure while still "connecting" means the host is unreachable: say so.
-    this.patch({ status: s.status === 'connecting' && wasGreeted === false && this.failures < 2 ? 'connecting' : 'offline', retryAt: Date.now() + delay });
+    if (s.status === 'online' && Date.now() < this.quietUntil) {
+      // Deliberate reconnect: stay "online" unless the new socket fails to greet in time.
+      setTimeout(() => !this.isOpen() && this.snapshot.get().status === 'online' && this.patch({ status: 'offline' }), this.quietUntil - Date.now());
+    } else {
+      // Grace for the very first attempt; after that, say it: offline.
+      this.patch({ status: s.status === 'connecting' && this.failures < 2 ? 'connecting' : 'offline', retryAt: Date.now() + delay });
+    }
     this.retryTimer = setTimeout(() => this.connect(), delay);
   }
 
@@ -178,26 +211,37 @@ export class WsBackend implements Backend {
   }
 
   press(pad: string, button: string): Promise<PressResult> {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN || this.snapshot.get().status !== 'online') return Promise.reject(new Error('offline'));
+    if (this.snapshot.get().status !== 'online') return Promise.reject(new Error('offline'));
     const id = `${Date.now().toString(36)}${(++this.seq).toString(36)}`;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      try {
-        ws.send(JSON.stringify({ t: 'press', id, pad, button }));
-      } catch (e) {
-        this.pending.delete(id);
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
+      const send = () => {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return reject(new Error('offline'));
+        this.pending.set(id, { resolve, reject });
+        try {
+          ws.send(JSON.stringify({ t: 'press', id, pad, button }));
+        } catch (e) {
+          this.pending.delete(id);
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      };
+      if (this.isOpen()) return send();
+      // Mid quiet reconnect: send on the next hello, unless that takes too long.
+      this.deferred.push(send);
+      setTimeout(() => {
+        const i = this.deferred.indexOf(send);
+        if (i >= 0) (this.deferred.splice(i, 1), reject(new Error('offline')));
+      }, DEFER_PRESS);
     });
   }
 
   kick(): void {
     if (Date.now() - this.lastKick < 2000) return;
     this.lastKick = Date.now();
+    this.quietUntil = Date.now() + QUIET_RECONNECT;
     this.failures = 0;
     if (this.ws) this.ws.close();
-    else this.connect();
+    else this.connectNow();
   }
 
   private async http(method: string, path: string, body?: unknown): Promise<Response> {
@@ -233,6 +277,7 @@ export class WsBackend implements Backend {
     this.disposed = true;
     clearTimeout(this.retryTimer);
     clearTimeout(this.helloTimer);
+    clearInterval(this.livenessTimer);
     for (const off of this.offs) off();
     this.ws?.close();
     this.ws = null;

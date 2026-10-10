@@ -80,6 +80,11 @@ export class ButtonController {
     this.timers.delete(name);
   }
 
+  /** Link dropped: a gesture in progress can't be sent, so let go of it (fill drains). */
+  onLink(online: boolean): void {
+    if (!online && this.active) this.abort(this.active.src);
+  }
+
   /** Host state changed: settle SENDING, and give feedback when our run finishes. */
   onHost(host: RunState): void {
     const s = this.l.sending;

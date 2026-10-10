@@ -41,19 +41,25 @@ export function App({ opts }: { opts: AppOptions }) {
     const onHash = () => {
       takeHashToken();
       const t = loadToken();
-      if (!opts.demo && t && t !== token) (setToken(t), setGen((g) => g + 1));
+      if (opts.demo || !t || t === token) return;
+      lsSet(KEYS.configCache, null);
+      setToken(t);
+      setGen((g) => g + 1);
     };
     addEventListener('hashchange', onHash);
     return () => removeEventListener('hashchange', onHash);
   }, [token]);
 
   if (opts.gallery) return <Gallery />;
+  // The cached layout belongs to the old pairing (it may be another host).
   const pair = (t: string) => {
+    if (t !== token) lsSet(KEYS.configCache, null);
     saveToken(t);
     setToken(t);
     setGen((g) => g + 1);
   };
   const forget = () => {
+    lsSet(KEYS.configCache, null);
     saveToken(null);
     setToken(null);
   };

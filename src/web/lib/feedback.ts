@@ -32,7 +32,12 @@ function iosTick(count: number) {
     iosSwitch.append(input);
     document.body.append(iosSwitch);
   }
-  for (let i = 0; i < count; i++) setTimeout(() => iosSwitch?.click(), i * 90);
+  const tick = () => {
+    iosSwitch?.click();
+    // Clicking the label focuses the input; give focus back so key presses (BLE remotes) still land.
+    if (document.activeElement instanceof HTMLInputElement && iosSwitch?.contains(document.activeElement)) document.activeElement.blur();
+  };
+  for (let i = 0; i < count; i++) setTimeout(tick, i * 90);
 }
 
 export function haptic(cue: Cue): void {
