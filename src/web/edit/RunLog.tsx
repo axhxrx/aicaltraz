@@ -180,7 +180,7 @@ export function RunLog(p: { backend: Backend; padId: string; buttonId: string; o
           Couldn't load runs: {err}
         </div>
       )}
-      {p.onHost && runs && runs.length === 0 && <div class="ed-runs-empty">No runs yet. Press the button (or Run now) and its output shows up here.</div>}
+      {p.onHost && runs && runs.length === 0 && <div class="ed-runs-empty">No runs yet. Press the button (or {saved ? 'Run now' : 'Save & run'}) and its output shows up here.</div>}
       {p.onHost && runs && runs.length > 0 && (
         <ol class="ed-run-list">
           {runs.map((r) => (
