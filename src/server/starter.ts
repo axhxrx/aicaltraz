@@ -1,4 +1,8 @@
-/** The config written when the config file doesn't exist yet: harmless buttons that work anywhere. */
+/**
+ * The config written when the config file doesn't exist yet: harmless buttons that work anywhere,
+ * showing tap and hold, progress, a failure, cancelling, and a stop button (`stops`, action `none`).
+ * No READY color near the SUCCESS green or FAILURE red.
+ */
 import { existsSync } from 'node:fs';
 import { dirname, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,9 +11,12 @@ import { serializeConfig } from './config-store.ts';
 
 type ButtonInput = NonNullable<ConfigInput['pads'][number]['buttons']>[number];
 
+/** Runs nothing itself: cancels whatever else is running (Count to 5, say). */
+const STOP_ALL: ButtonInput = { id: 'stop', label: 'Stop all', color: '#212529', x: 1, y: 2, trigger: 'tap', stops: ['*'], action: { type: 'none' } };
+
 function posixButtons(configPath: string): ButtonInput[] {
   return [
-    { id: 'hello', label: 'Hello', color: '#2a9d8f', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo "Hello from $(uname -n)"' } },
+    { id: 'hello', label: 'Hello', color: '#3a86ff', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo "Hello from $(uname -n)"' } },
     { id: 'time', label: 'Time', color: '#457b9d', x: 1, y: 0, trigger: 'tap', action: { type: 'exec', command: 'date', args: ['+%H:%M:%S %a %d %b'] } },
     {
       id: 'disk',
@@ -31,16 +38,16 @@ function posixButtons(configPath: string): ButtonInput[] {
     {
       id: 'count',
       label: 'Count to 5',
-      color: '#e76f51',
+      color: '#ffb703',
       x: 0,
       y: 2,
-      w: 2,
       whileRunning: 'cancel',
       action: {
         type: 'shell',
         script: 'for i in 1 2 3 4 5; do echo "@status $i of 5 (press again to cancel)"; echo "@progress $((i * 20))"; sleep 1; done; echo "@result Counted to 5"',
       },
     },
+    STOP_ALL,
     {
       id: 'edit-me',
       label: 'How do I change these buttons?',
@@ -57,7 +64,7 @@ function posixButtons(configPath: string): ButtonInput[] {
 
 function windowsButtons(configPath: string): ButtonInput[] {
   return [
-    { id: 'hello', label: 'Hello', color: '#2a9d8f', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo Hello from %COMPUTERNAME%' } },
+    { id: 'hello', label: 'Hello', color: '#3a86ff', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo Hello from %COMPUTERNAME%' } },
     { id: 'time', label: 'Time', color: '#457b9d', x: 1, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo %TIME% %DATE%' } },
     { id: 'version', label: 'Windows version', color: '#6a4c93', x: 0, y: 1, trigger: 'tap', action: { type: 'shell', script: 'ver' } },
     {
@@ -71,10 +78,9 @@ function windowsButtons(configPath: string): ButtonInput[] {
     {
       id: 'count',
       label: 'Count to 5',
-      color: '#e76f51',
+      color: '#ffb703',
       x: 0,
       y: 2,
-      w: 2,
       whileRunning: 'cancel',
       action: {
         type: 'shell',
@@ -82,6 +88,7 @@ function windowsButtons(configPath: string): ButtonInput[] {
         script: '1..5 | % { "@status $_ of 5 (press again to cancel)"; "@progress $($_ * 20)"; Start-Sleep 1 }; "@result Counted to 5"',
       },
     },
+    STOP_ALL,
     {
       id: 'edit-me',
       label: 'How do I change these buttons?',

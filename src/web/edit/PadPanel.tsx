@@ -79,7 +79,7 @@ export function PadPanel(
       <div class="ed-panel-body" data-scroll data-testid="pad-editor-body">
         <Section title="Pad">
           <Field label="Name" for={`${uid}-name`} error={p.errors.get('name')} testid="pad-name">
-            <TextInput id={`${uid}-name`} value={pad.name} placeholder="Lights" onValue={(v) => ed.patchPad({ name: v }, 'name')} testid="pad-name" invalid={!!p.errors.get('name')} />
+            <TextInput id={`${uid}-name`} value={pad.name} maxLength={60} placeholder="Lights" onValue={(v) => ed.patchPad({ name: v }, 'name')} testid="pad-name" invalid={!!p.errors.get('name')} />
           </Field>
           <div class="ed-field">
             <span class="ed-label">Grid</span>

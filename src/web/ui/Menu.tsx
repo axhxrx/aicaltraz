@@ -1,6 +1,6 @@
 /** The menu sheet: fullscreen, keep-awake status, device settings, edit entry, pairing. */
 import type { ComponentChildren } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Backend } from '../backend/types.ts';
 import { DemoBackend } from '../backend/demo.ts';
 import { fullscreenSupported, isFullscreen, toggleFullscreen } from '../lib/env.ts';
@@ -8,7 +8,7 @@ import { haptic, hapticsSupported, sound, unlockAudio } from '../lib/feedback.ts
 import { awake } from '../lib/keepawake.ts';
 import { setSetting, settings } from '../lib/settings.ts';
 import { useStore } from '../lib/store.ts';
-import { Bolt, Close, Expand, Link, Pencil, Speaker, Sun, Vibrate } from './icons.tsx';
+import { Bolt, Close, Expand, Hold, Link, Pencil, Speaker, Sun, Vibrate } from './icons.tsx';
 
 function Row(p: { icon: ComponentChildren; title: string; note?: string; children?: ComponentChildren; onClick?: () => void; testid?: string; danger?: boolean }) {
   const body = (
@@ -72,8 +72,17 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
     return () => window.removeEventListener('keydown', k);
   }, []);
   const host = snap.host;
+  // Locked pads open it with a long press: the click its release may make lands on whatever is under the finger now.
+  const opened = useRef(p.lock ? performance.now() : -Infinity);
   return (
-    <div class="bp-sheet-wrap" onPointerDown={(e) => e.target === e.currentTarget && p.onClose()} data-testid="menu">
+    <div
+      class="bp-sheet-wrap"
+      onPointerDown={(e) => e.target === e.currentTarget && p.onClose()}
+      onClickCapture={(e) => {
+        if (performance.now() - opened.current < 600) (e.preventDefault(), e.stopPropagation());
+      }}
+      data-testid="menu"
+    >
       <div class="bp-sheet" role="dialog" aria-label="Menu" data-scroll>
         <div class="bp-sheet-head">
           <div>
@@ -115,6 +124,9 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
             testid="toggle-haptics"
           />
         </Row>
+        <Row icon={<Hold />} title="Rough mode" note="Gloves, a shaky mount: one button at a time, firmer taps, a pause after each press" testid="rough">
+          <Toggle label="Rough mode" on={s.rough} onChange={(v) => setSetting('rough', v)} testid="toggle-rough" />
+        </Row>
 
         {snap.role === 'admin' && !p.lock && <Row icon={<Pencil />} title="Edit pads" note="Add, move and configure buttons" onClick={p.onEdit} testid="menu-edit" />}
 
@@ -123,12 +135,16 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
             <div class="bp-sheet-section">Demo</div>
             <Row icon={<Bolt />} title={demo.isOnline() ? 'Simulate losing the host' : 'Reconnect to the host'} note="See how buttons look offline" onClick={() => demo.setOnline(!demo.isOnline())} testid="demo-outage" />
             <Row icon={<Bolt />} title="Drop the next press" note="See “NO RESPONSE” after 2 s" onClick={() => (demo.dropAcks(1), p.onClose())} testid="demo-drop" />
+            <Row icon={<Bolt />} title="Simulate a host restart" note="What was running ends INTERRUPTED" onClick={() => (demo.restart(), p.onClose())} testid="demo-restart" />
             <Row icon={<Bolt />} title="Reset demo pads" onClick={() => (demo.reset(), p.onClose())} testid="demo-reset" />
           </>
         )}
         {/* Not on a locked (kiosk) pad: nobody there should be able to unpair it. */}
         {p.backend.kind === 'ws' && !p.lock && <RepairRow onRepair={p.onRepair} />}
-        <div class="bp-sheet-foot">Hold, tap or double-tap per the hint on each button. Keys on a paired keyboard or clicker work too.</div>
+        <div class="bp-sheet-foot">
+          Hold, tap or double-tap per the hint on each button. Keys on a paired keyboard or clicker work too, for buttons on any pad.
+          {p.lock && ' This pad is locked: press and hold the menu button to open this menu.'}
+        </div>
       </div>
     </div>
   );

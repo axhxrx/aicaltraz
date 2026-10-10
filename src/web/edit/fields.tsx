@@ -54,6 +54,7 @@ interface InputProps {
   mono?: boolean;
   invalid?: boolean;
   testid?: string;
+  maxLength?: number;
 }
 
 export function TextInput({ value, onValue, mono, invalid, testid, ...rest }: InputProps) {
@@ -96,9 +97,10 @@ export function TextArea(p: { id?: string; value: string; onValue(v: string): vo
 
 /**
  * Number field: what's typed stays as typed; every parseable value goes to the draft (range
- * errors come from validation), junk reverts on blur.
+ * errors come from validation: a half-typed number may be out of range on its way), junk reverts
+ * on blur. Arrow keys step within `min`..`max`.
  */
-export function NumberInput(p: { id?: string; value: number; onValue(n: number): void; unit?: string; invalid?: boolean; testid?: string; step?: number }) {
+export function NumberInput(p: { id?: string; value: number; onValue(n: number): void; unit?: string; invalid?: boolean; testid?: string; step?: number; min?: number; max?: number }) {
   const [text, setText] = useState(String(p.value));
   useEffect(() => {
     if (Number(text) !== p.value || text.trim() === '') setText(String(p.value));
@@ -125,7 +127,8 @@ export function NumberInput(p: { id?: string; value: number; onValue(n: number):
           if (e.key === 'Enter') e.currentTarget.blur();
           if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
             e.preventDefault();
-            p.onValue(p.value + (e.key === 'ArrowUp' ? 1 : -1) * (p.step ?? 1) * (e.shiftKey ? 10 : 1));
+            const n = p.value + (e.key === 'ArrowUp' ? 1 : -1) * (p.step ?? 1) * (e.shiftKey ? 10 : 1);
+            p.onValue(Math.min(p.max ?? Infinity, Math.max(p.min ?? -Infinity, n)));
           }
         }}
       />
@@ -140,9 +143,10 @@ export interface Option<T extends string> {
   icon?: ComponentChildren;
 }
 
-export function Segmented<T extends string>(p: { value: T; options: Option<T>[]; onChange(v: T): void; testid: string; label: string }) {
+/** `wrap`: long labels may take two lines (narrow panels). */
+export function Segmented<T extends string>(p: { value: T; options: Option<T>[]; onChange(v: T): void; testid: string; label: string; wrap?: boolean }) {
   return (
-    <div class="ed-seg" role="radiogroup" aria-label={p.label}>
+    <div class={`ed-seg${p.wrap ? ' is-wrap' : ''}`} role="radiogroup" aria-label={p.label}>
       {p.options.map((o) => (
         <button
           key={o.value}
@@ -205,7 +209,7 @@ const KEY_WORDS: Record<string, string> = { ' ': 'Space', Enter: 'Enter', ArrowU
  * "Press a key to bind": captures the next keydown (Esc cancels), before any other handler sees it.
  * Shortcuts (⌘/Ctrl/Alt + key, e.g. ⌘S to save) pass through: a remote doesn't send those.
  */
-export function KeyCapture(p: { value: string | undefined; onChange(k: string | undefined): void; conflict?: string; testid: string }) {
+export function KeyCapture(p: { value: string | undefined; onChange(k: string | undefined): void; conflict?: ComponentChildren; testid: string }) {
   const [listening, setListening] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
   const onChange = useRef(p.onChange);
@@ -265,16 +269,42 @@ export function KeyCapture(p: { value: string | undefined; onChange(k: string | 
           <Close />
         </button>
       )}
-      {p.conflict && <span class="ed-warn-note">Also bound to {p.conflict}: the first one wins.</span>}
+      {p.conflict && (
+        <span class="ed-warn-note" data-testid={`${p.testid}-conflict`}>
+          {p.conflict}
+        </span>
+      )}
     </div>
+  );
+}
+
+/** A toggle chip (multi-select). `implied`: on because something wider is (shown on, can't be turned off here). */
+export function Chip(p: { on: boolean; implied?: boolean; label: ComponentChildren; onClick(): void; testid?: string; title?: string; tone?: 'warn' }) {
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={p.on}
+      class={`ed-chip${p.implied ? ' is-implied' : ''}${p.tone ? ` is-${p.tone}` : ''}`}
+      disabled={p.implied}
+      title={p.title}
+      data-testid={p.testid}
+      onClick={p.onClick}
+    >
+      <i aria-hidden="true" />
+      <span>{p.label}</span>
+    </button>
   );
 }
 
 const hex = (c: string) => `#${toRGB(c).map((n) => n.toString(16).padStart(2, '0')).join('')}`;
 
-export function ColorPicker(p: { value: string; onChange(c: string): void; testid: string }) {
-  const [text, setText] = useState(p.value);
-  useEffect(() => setText(p.value), [p.value]);
+export function ColorPicker(p: { value: string; onChange(c: string): void; testid: string; warning?: ComponentChildren }) {
+  // While the text field has the focus it shows what's typed (half a hex code is fine), and every
+  // valid color typed on the way goes to the draft. It never syncs back from the draft meanwhile:
+  // such a sync lands a frame late and eats the keys typed since ("#d62828" became "#d6288").
+  const [typed, setTyped] = useState<string | null>(null);
+  const text = typed ?? p.value;
   const current = p.value.toLowerCase();
   const custom = !PALETTE.includes(current);
   return (
@@ -305,14 +335,16 @@ export function ColorPicker(p: { value: string; onChange(c: string): void; testi
           aria-label="Color (any CSS color)"
           placeholder="#2f6fde"
           testid={`${p.testid}-text`}
-          invalid={!isValidColor(text)}
+          invalid={!isValidColor(text.trim())}
+          onFocus={() => setTyped(p.value)}
           onValue={(t) => {
-            setText(t);
+            setTyped(t);
             if (t.trim() && isValidColor(t.trim())) p.onChange(t.trim());
           }}
-          onBlur={() => setText(p.value)}
+          onBlur={() => setTyped(null)}
         />
       </div>
+      {p.warning}
     </div>
   );
 }

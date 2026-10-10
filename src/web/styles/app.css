@@ -25,6 +25,9 @@
   --bad: #e3262b;
   --bad-ink: #ffffff;
   --amber: #ffb000;
+  --warn-ink: #1a1200;
+  --stop: #5b6472;
+  --stop-ink: #ffffff;
   --off-bg: #2a2e35;
   --off-line: #8a94a1;
   --off-ink: #c6ccd4;
@@ -41,11 +44,18 @@
 }
 /* Narrow phones: the green dot alone says LIVE; words appear when something is wrong. */
 @media (max-width: 420px) {
-  .bp-conn[data-status='online'] span {
+  .bp-conn[data-status='online']:not([data-demo]) span {
     display: none;
+  }
+  .bp-conn {
+    letter-spacing: 0.06em;
+    padding: 0 2px;
   }
   .bp-tab {
     padding: 0 11px;
+  }
+  .bp-sleepy span {
+    display: none;
   }
 }
 
@@ -142,6 +152,8 @@ button {
   gap: 6px;
   padding: 0 calc(var(--gap) - 2px);
 }
+/* The tabs scroll sideways when they don't fit (the active one is kept in view); the edges fade
+   to say there is more. */
 .bp-tabs {
   flex: 1;
   min-width: 0;
@@ -149,8 +161,13 @@ button {
   gap: 4px;
   height: 100%;
   align-items: center;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 18px), transparent);
+  mask-image: linear-gradient(90deg, transparent 0, #000 10px, #000 calc(100% - 18px), transparent);
+  padding: 0 10px 0 4px;
+  scroll-padding: 0 24px;
 }
 .bp-tab {
+  position: relative;
   flex: none;
   height: calc(var(--bar-h) - 10px);
   padding: 0 14px;
@@ -169,6 +186,42 @@ button {
   background: #ffffff17;
   box-shadow: inset 0 -3px 0 var(--text);
 }
+/* Something on another pad: failed (red), or running (pulsing white ring). */
+.bp-tab-dot {
+  position: absolute;
+  top: 5px;
+  right: 3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.bp-tab-dot.is-failure {
+  background: var(--bad);
+  box-shadow: 0 0 0 2px var(--app-bg);
+}
+.bp-tab-dot.is-running {
+  border: 2px solid var(--text);
+  animation: bp-blink 1s steps(1, end) infinite;
+}
+/* Keep screen awake is off (or not holding): the screen may go dark mid-job. */
+.bp-sleepy {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  font-weight: 900;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--amber);
+  box-shadow: inset 0 0 0 1.5px #ffb00099;
+  white-space: nowrap;
+}
+.bp-sleepy svg {
+  width: 15px;
+  height: 15px;
+}
 .bp-bar-title {
   flex: 1;
   min-width: 0;
@@ -179,17 +232,6 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-.bp-demo-tag {
-  flex: none;
-  font-weight: 900;
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  padding: 4px 7px;
-  border-radius: 6px;
-  color: #e9e3ff;
-  background: #6d4cff3d;
-  box-shadow: inset 0 0 0 1px #8f75ff80;
 }
 .bp-conn {
   flex: none;
@@ -211,6 +253,19 @@ button {
 .bp-conn[data-status='online'] .bp-dot {
   background: var(--ok);
   box-shadow: 0 0 0 3px #2bd46e33;
+}
+/* The demo isn't live anything: a DEMO badge, no green dot. */
+.bp-conn[data-demo][data-status='online'] {
+  padding: 4px 8px;
+  border-radius: 6px;
+  color: #e9e3ff;
+  background: #6d4cff3d;
+  box-shadow: inset 0 0 0 1px #8f75ff80;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+.bp-conn[data-demo][data-status='online'] .bp-dot {
+  display: none;
 }
 .bp-conn[data-status='connecting'] .bp-dot {
   border: 2.5px solid var(--amber);
@@ -242,6 +297,19 @@ button {
 .bp-icon-btn svg {
   width: 24px;
   height: 24px;
+}
+/* Locked pad: the menu opens on a long press; a ring fills meanwhile. */
+.bp-menu-btn {
+  position: relative;
+}
+.bp-menu-btn.is-holding::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border-radius: 10px;
+  border: 3px solid var(--text);
+  clip-path: inset(0 100% 0 0);
+  animation: bp-wipe var(--hold-ms, 1s) linear forwards;
 }
 .bp-icon-btn:active,
 .bp-tab:active {
@@ -648,5 +716,61 @@ button.bp-row:active {
 @keyframes bp-blink {
   50% {
     opacity: 0.18;
+  }
+}
+@keyframes bp-wipe {
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+/* ---- run-mode toast (a key pressed a button on another pad) ------------------------------- */
+
+.bp-toast {
+  position: absolute;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + var(--gap) + 10px);
+  z-index: 15;
+  translate: -50% 0;
+  max-width: calc(100% - 2 * var(--gap) - 16px);
+  padding: 12px 18px;
+  border-radius: 14px;
+  background: #0b0c0ff2;
+  border: 2px solid var(--text);
+  color: var(--text);
+  font-weight: 900;
+  font-size: 17px;
+  letter-spacing: 0.02em;
+  text-align: center;
+  pointer-events: none;
+  animation: bp-fade 0.16s ease-out both;
+}
+.bp-toast.is-warn {
+  border-color: var(--amber);
+  color: #ffe2a8;
+}
+
+/* ---- a pad that isn't there: in the app's frame, under the top bar ----------------------- */
+
+.bp-screen.bp-missing {
+  position: relative;
+  inset: auto;
+  flex: 1;
+  min-height: 0;
+  padding: 24px 20px;
+}
+.bp-pad-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* Forced colors: the LIVE/OFFLINE dot keeps its colors (it has an edge either way). */
+@media (forced-colors: active) {
+  .bp-dot,
+  .bp-tab-dot {
+    forced-color-adjust: none;
+    outline: 2px solid CanvasText;
   }
 }

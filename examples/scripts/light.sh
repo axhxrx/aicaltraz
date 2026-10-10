@@ -1,6 +1,8 @@
 #!/bin/sh
 # Fake smart light.  Usage: light.sh <key|fill|back|all> <on|off|toggle|0-100>
-# Takes 0.2-1.5 s to "reach" the light, remembers its level, reports e.g. "@result Key light ON 80%".
+# Takes 0.2-1.5 s to "reach" the light, remembers its level, reports e.g. "@result Key light ON 80%",
+# and latches the light's state on the button ("@state ON 80%" / "@state OFF"; not for "all": one
+# button's chip can't speak for three lights).
 . "$(dirname "$0")/_lib.sh"
 
 usage() {
@@ -46,5 +48,7 @@ if [ "$name" = all ]; then
 else
   echo "@status Connecting to $(cap "$name") light…"
   latency 200 1500
-  echo "@result $(set_one "$name" "$cmd")"
+  state=$(set_one "$name" "$cmd")
+  echo "@state ${state#* light }"
+  echo "@result $state"
 fi

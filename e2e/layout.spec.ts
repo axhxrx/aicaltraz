@@ -23,7 +23,7 @@ const STATES: ConfigInput = {
         x: i % 3,
         y: Math.floor(i / 3),
         trigger: 'tap' as const,
-        resultHoldMs: 600_000,
+        resultHoldMs: 60_000,
         action: sh(SCRIPTS[i]!),
         ...(i === 6 ? { whileRunning: 'cancel' as const } : i === 7 ? { timeoutMs: 300 } : {}),
       })),
@@ -69,9 +69,9 @@ for (const vp of [
     for (const [id, visual] of [['b0', 'running'], ['b2', 'success'], ['b3', 'failure'], ['b4', 'running'], ['b5', 'ready']] as const)
       await expect(btn(page, id)).toHaveAttribute('data-visual', visual);
     expect(await overflows(page)).toEqual([]);
-    // A short landscape failure keeps its title readable ("EXIT 3", not "E").
-    await expect(btn(page, 'b3')).toContainText('EXIT 3');
-    const title = await btn(page, 'b3').locator('.bp-title').evaluate((el) => ({ w: el.scrollWidth, box: el.clientWidth, font: parseFloat(getComputedStyle(el).fontSize) }));
+    // A failure's reason is its headline, readable in a short landscape button too (not "c…").
+    await expect(btn(page, 'b3')).toContainText('card full');
+    const title = await btn(page, 'b3').locator('.bp-headline').evaluate((el) => ({ w: el.scrollWidth, box: el.clientWidth, font: parseFloat(getComputedStyle(el).fontSize) }));
     expect(title.w).toBeLessThanOrEqual(title.box + 1);
     expect(title.font).toBeGreaterThanOrEqual(12);
 

@@ -125,34 +125,42 @@ export function chunks(text: string): Chunk[] {
 }
 
 /**
+ * Longest text measured in full (labels are ≤ 200 characters by the schema; result text is cut to
+ * 200 by the host). Anything longer is measured by its start: it gets the size of a text that
+ * doesn't fit anyway, and a 10 000-character string can't stall every client on the pad.
+ */
+const MAX_MEASURED = 240;
+
+/**
  * widths[k-1] = width (em) of the best k-line layout. Digits are measured as 0 (about the widest)
  * so ticking numbers neither grow the cache nor make the size jitter.
  */
 export function lineWidths(text: string, weight = 900): number[] {
-  const norm = text.replace(/\d/g, '0');
+  const norm = text.slice(0, MAX_MEASURED).replace(/\d/g, '0');
   const id = `${weight}|${norm}`;
   const hit = cache.get(id);
   if (hit) return hit;
   if (cache.size > 500) cache.clear();
   const parts = chunks(norm);
   if (!parts.length) return [];
-  const w = parts.map((c) => measureEm(c.text, weight));
   const space = measureEm(' ', weight);
   const n = parts.length;
-  // span(i, j) = width of chunks i..j-1 on one line
-  const span = (i: number, j: number) => {
-    let sum = 0;
-    for (let k = i; k < j; k++) sum += w[k]! + (k > i && parts[k]!.spaced ? space : 0);
-    return sum;
-  };
-  const out: number[] = [];
-  // best[k][j] = min possible max-line width putting the first j words on k lines
-  let prev = Array.from({ length: n + 1 }, (_, j) => (j === 0 ? 0 : span(0, j)));
-  out.push(prev[n]!);
+  // pre[j] = width of chunks 0..j-1 on one line; a line starting at chunk i drops the space before it.
+  const pre = [0];
+  parts.forEach((c, k) => pre.push(pre[k]! + measureEm(c.text, weight) + (k > 0 && c.spaced ? space : 0)));
+  const span = (i: number, j: number) => pre[j]! - pre[i]! - (i > 0 && parts[i]!.spaced ? space : 0);
+  const out: number[] = [pre[n]!];
+  // prev[j] = min possible max-line width putting the first j chunks on k-1 lines
+  let prev = pre.slice();
   for (let k = 2; k <= Math.min(n, MAX_LINES); k++) {
     const cur = Array<number>(n + 1).fill(Infinity);
     for (let j = k; j <= n; j++)
-      for (let i = k - 1; i < j; i++) cur[j] = Math.min(cur[j]!, Math.max(prev[i]!, span(i, j)));
+      for (let i = j - 1; i >= k - 1; i--) {
+        const line = span(i, j);
+        // Lines only get longer from here on: nothing further left can beat the best so far.
+        if (line >= cur[j]!) break;
+        cur[j] = Math.min(cur[j]!, Math.max(prev[i]!, line));
+      }
     out.push(cur[n]!);
     prev = cur;
   }

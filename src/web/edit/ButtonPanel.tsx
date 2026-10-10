@@ -1,19 +1,33 @@
-/** The button editor: look, press behavior, action, and its recent runs. */
+/** The button editor: look, press behavior, action (and what it stops), and its recent runs. */
 import type { ComponentChildren } from 'preact';
 import { useId } from 'preact/hooks';
 import type { Action, Button, Pad } from '../../core/config.ts';
 import type { Backend } from '../backend/types.ts';
+import { toRGB } from '../lib/color.ts';
 import { matchKey } from '../run/RunPad.tsx';
 import { Close, DoubleTap, Hold, Tap } from '../ui/icons.tsx';
 import type { Editor } from './editor.ts';
 import { ColorPicker, EnvEditor, Field, KeyCapture, ListEditor, NumberInput, Section, Segmented, SwitchRow, TextArea, TextInput } from './fields.tsx';
 import { Copy, Trash } from './icons.tsx';
-import { nameOf } from './ops.ts';
-import { RunLog } from './RunLog.tsx';
+import { isPlaceholder, nameOf, stateLookalike } from './ops.ts';
+import { fieldName } from './problems.ts';
+import { RunLog, type RunAsk } from './RunLog.tsx';
+import { StopsEditor } from './StopsEditor.tsx';
 
 export type Tab = 'button' | 'action' | 'runs';
 
-const secs = (ms: number) => (ms >= 60_000 ? `${+(ms / 60_000).toFixed(1)} min` : `${+(ms / 1000).toFixed(1)} s`);
+/** "400 ms", "2.5 s", "1.5 min", "2 h". */
+export const secs = (ms: number) =>
+  ms >= 3_600_000 ? `${+(ms / 3_600_000).toFixed(1)} h` : ms >= 60_000 ? `${+(ms / 60_000).toFixed(1)} min` : ms >= 1000 || ms === 0 ? `${+(ms / 1000).toFixed(1)} s` : `${ms} ms`;
+
+/** The schema's bounds (core/config.ts), for hints and arrow keys. */
+const RANGE = {
+  holdMs: [100, 5000],
+  confirmWindowMs: [500, 60_000],
+  cooldownMs: [0, 10_000],
+  timeoutMs: [100, 86_400_000],
+  resultHoldMs: [0, 60_000],
+} as const;
 
 const TRIGGER_NOTE: Record<Button['trigger'], string> = {
   hold: 'Fires after holding for the hold time. Safest against bumps and pockets.',
@@ -25,6 +39,11 @@ const WHILE_NOTE: Record<Button['whileRunning'], string> = {
   ignore: 'Presses do nothing until it finishes (the button flashes BUSY).',
   cancel: 'A press stops it (the whole process tree is killed).',
   queue: 'A press runs it once more after the current run.',
+};
+
+const LOOKALIKE: Record<'success' | 'failure', string> = {
+  failure: 'Reads like the red of ✗ FAILURE: on this button a failure is easy to miss, and READY looks like something failed. Another color is safer.',
+  success: 'Reads like the green of ✓ SUCCESS: on this button a success is easy to miss, and READY looks like something just worked. Another color is safer.',
 };
 
 export interface PanelChrome {
@@ -41,14 +60,45 @@ export function SheetGrab({ sheet }: PanelChrome) {
   );
 }
 
+const padName = (p: Pad) => p.name.trim() || p.id;
+
+/** Who else answers this key, and what a press of it does then (keys are global: the visible pad's button first, else the one unique match). */
+function keyNote(pads: Pad[], pi: number, b: Button): ComponentChildren {
+  if (b.key === undefined) return null;
+  const pad = pads[pi]!;
+  const here = matchKey(
+    pad.buttons.filter((x) => x !== b),
+    b.key,
+  );
+  const elsewhere = pads.flatMap((x, i) => {
+    const m = i === pi ? undefined : matchKey(x.buttons, b.key!);
+    return m ? [{ pad: x, button: m }] : [];
+  });
+  const notes: string[] = [];
+  if (here) notes.push(`Also bound to ${nameOf(here)} on this pad: the first one wins.`);
+  if (elsewhere.length) {
+    const list = elsewhere.map((e) => `${nameOf(e.button)} on ${padName(e.pad)}`).join(', ');
+    const rest = pads.length > elsewhere.length + 1;
+    notes.push(
+      `Also bound to ${list}. Keys work from every pad: on each of these pads its own button wins${rest ? '; from any other pad the key does nothing, since it isn’t unique' : ''}.`,
+    );
+  }
+  return notes.length ? notes.join(' ') : null;
+}
+
 export function ButtonPanel(
   p: PanelChrome & {
     ed: Editor;
     backend: Backend;
+    /** All pads of the draft, and the index of this button's. */
+    pads: Pad[];
+    pi: number;
     pad: Pad;
     ix: number;
     b: Button;
     errors: Map<string, string>;
+    /** The host's warnings from the last save, by field ('' = the button), while still relevant. */
+    warnings: Map<string, string>;
     tab: Tab;
     onTab(t: Tab): void;
     /** The same pad/button as currently on the host. */
@@ -59,6 +109,8 @@ export function ButtonPanel(
     saving: boolean;
     /** Save the draft, then `run` (Recent runs: "Save & run"). */
     onSaveAndRun(run: () => void): void;
+    /** Recent runs wants a yes first (a `confirm` button): the editor asks. */
+    onAsk(q: RunAsk): void;
     onClose(): void;
     onDuplicate(): void;
     onDelete(): void;
@@ -68,15 +120,28 @@ export function ButtonPanel(
   const uid = useId();
   const id = (k: string) => `${uid}-${k}`;
   const err = (k: string) => errors.get(k);
-  const actionBad = [...errors.keys()].some((k) => k.startsWith('action'));
-  const buttonBad = [...errors.keys()].some((k) => k && !k.startsWith('action'));
-  const conflict = b.key !== undefined ? matchKey(p.pad.buttons.filter((_, i) => i !== p.ix), b.key) : undefined;
+  /** Range errors in words with the unit ("Must be at most 60000 ms (1 min)"). */
+  const msErr = (k: string) => {
+    const e = err(k);
+    const m = e && /^Must be at (most|least) (\d+)$/.exec(e);
+    return m ? `Must be at ${m[1]} ${m[2]} ms${+m[2]! >= 1000 ? ` (${secs(+m[2]!)})` : ''}` : e;
+  };
+  const onActionTab = (k: string) => k.startsWith('action') || k.startsWith('stops');
+  const actionBad = [...errors.keys()].some(onActionTab);
+  const buttonBad = [...errors.keys()].some((k) => k && !onActionTab(k));
+  const look = stateLookalike(toRGB(b.color));
 
   const tabBtn = (t: Tab, label: string, bad: boolean) => (
     <button type="button" role="tab" class="ed-tab" aria-selected={p.tab === t} data-testid={`editor-tab-${t}`} onClick={() => p.onTab(t)}>
       {label}
       {bad && <i class="ed-tab-bad" aria-label="has problems" />}
     </button>
+  );
+
+  const num = (k: keyof typeof RANGE, label: string, hint: ComponentChildren, step: number) => (
+    <Field label={label} for={id(k)} error={msErr(k)} hint={hint} testid={k}>
+      <NumberInput id={id(k)} value={b[k]} unit="ms" step={step} min={RANGE[k][0]} max={RANGE[k][1]} onValue={(n) => ed.patchButton({ [k]: n }, k)} testid={`field-${k}`} invalid={!!err(k)} />
+    </Field>
   );
 
   return (
@@ -118,14 +183,31 @@ export function ButtonPanel(
             {err('')}
           </div>
         )}
+        {[...p.warnings].map(([k, w]) => (
+          <div key={k} class="ed-callout is-warn" data-testid="warning-button">
+            <b>The host warns:</b> {k ? `${fieldName(k)}: ` : ''}
+            {w}
+          </div>
+        ))}
         {p.tab === 'button' && (
           <>
             <Section title="Look">
               <Field label="Label" for={id('label')} error={err('label')} testid="label">
-                <TextInput id={id('label')} value={b.label} placeholder="What it does, in a word or two" onValue={(v) => ed.patchButton({ label: v }, 'label')} testid="field-label" />
+                <TextInput id={id('label')} value={b.label} maxLength={200} placeholder="What it does, in a word or two" onValue={(v) => ed.patchButton({ label: v }, 'label')} testid="field-label" />
               </Field>
-              <Field label="Color" error={err('color')} hint="Skip pure green and red: they mean success and failure.">
-                <ColorPicker value={b.color} onChange={(c) => ed.patchButton({ color: c }, 'color')} testid="field-color" />
+              <Field label="Color" error={err('color')} hint={look ? undefined : 'Skip green and red: they mean success and failure.'}>
+                <ColorPicker
+                  value={b.color}
+                  onChange={(c) => ed.patchButton({ color: c }, 'color')}
+                  testid="field-color"
+                  warning={
+                    look && (
+                      <span class="ed-warn-note" data-testid="color-warning" data-look={look}>
+                        {LOOKALIKE[look]}
+                      </span>
+                    )
+                  }
+                />
               </Field>
             </Section>
             <Section title="Press">
@@ -142,23 +224,16 @@ export function ButtonPanel(
               />
               <p class="ed-hint">{TRIGGER_NOTE[b.trigger]}</p>
               <div class="ed-pair">
-                {b.trigger === 'hold' && (
-                  <Field label="Hold for" for={id('hold')} error={err('holdMs')} hint="100–5000 ms" testid="holdMs">
-                    <NumberInput id={id('hold')} value={b.holdMs} unit="ms" step={50} onValue={(n) => ed.patchButton({ holdMs: n }, 'holdMs')} testid="field-holdMs" invalid={!!err('holdMs')} />
-                  </Field>
-                )}
+                {b.trigger === 'hold' && num('holdMs', 'Hold for', '100–5000 ms', 50)}
                 <Field label="Finger may slide" for={id('drift')} error={err('driftPx')} hint="before the press cancels" testid="driftPx">
-                  <NumberInput id={id('drift')} value={b.driftPx} unit="px" step={5} onValue={(n) => ed.patchButton({ driftPx: n }, 'driftPx')} testid="field-driftPx" invalid={!!err('driftPx')} />
+                  <NumberInput id={id('drift')} value={b.driftPx} unit="px" step={5} min={0} onValue={(n) => ed.patchButton({ driftPx: n }, 'driftPx')} testid="field-driftPx" invalid={!!err('driftPx')} />
                 </Field>
               </div>
               <SwitchRow title="Ask to confirm" note="Needs a second press: for things you can't take back." on={b.confirm} onChange={(v) => ed.patchButton({ confirm: v })} testid="field-confirm" />
-              {b.confirm && (
-                <Field label="Second press within" for={id('cw')} error={err('confirmWindowMs')} hint={`${secs(b.confirmWindowMs)} (at least 500 ms)`} testid="confirmWindowMs">
-                  <NumberInput id={id('cw')} value={b.confirmWindowMs} unit="ms" step={100} onValue={(n) => ed.patchButton({ confirmWindowMs: n }, 'confirmWindowMs')} testid="field-confirmWindowMs" invalid={!!err('confirmWindowMs')} />
-                </Field>
-              )}
+              {b.confirm && num('confirmWindowMs', 'Second press within', `${secs(b.confirmWindowMs)} (0.5–60 s)`, 100)}
+              {num('cooldownMs', 'Then ignore presses for', `${secs(b.cooldownMs)} after it fires (0–10 s; 0 = off): stops key chatter and bounces from firing it twice.`, 100)}
               <Field label="Keyboard key" error={err('key')} hint="Bluetooth clickers and remotes pair as keyboards: press theirs here.">
-                <KeyCapture value={b.key} onChange={(k) => ed.patchButton({ key: k })} conflict={conflict && nameOf(conflict)} testid="field-key" />
+                <KeyCapture value={b.key} onChange={(k) => ed.patchButton({ key: k })} conflict={keyNote(p.pads, p.pi, b)} testid="field-key" />
               </Field>
             </Section>
             <Section title="While it runs">
@@ -175,12 +250,8 @@ export function ButtonPanel(
               />
               <p class="ed-hint">{WHILE_NOTE[b.whileRunning]}</p>
               <div class="ed-pair">
-                <Field label="Time limit" for={id('to')} error={err('timeoutMs')} hint={`${secs(b.timeoutMs)}, then it's killed`} testid="timeoutMs">
-                  <NumberInput id={id('to')} value={b.timeoutMs} unit="ms" step={1000} onValue={(n) => ed.patchButton({ timeoutMs: n }, 'timeoutMs')} testid="field-timeoutMs" invalid={!!err('timeoutMs')} />
-                </Field>
-                <Field label="Show result for" for={id('rh')} error={err('resultHoldMs')} hint={`${secs(b.resultHoldMs)} of ✓ / ✗`} testid="resultHoldMs">
-                  <NumberInput id={id('rh')} value={b.resultHoldMs} unit="ms" step={500} onValue={(n) => ed.patchButton({ resultHoldMs: n }, 'resultHoldMs')} testid="field-resultHoldMs" invalid={!!err('resultHoldMs')} />
-                </Field>
+                {num('timeoutMs', 'Time limit', `${secs(b.timeoutMs)}, then it's killed (up to 24 h)`, 1000)}
+                {num('resultHoldMs', 'Show result for', `${secs(b.resultHoldMs)} of ✓ / ✗ (up to 60 s)`, 500)}
               </div>
             </Section>
             <Section title="Id">
@@ -190,13 +261,20 @@ export function ButtonPanel(
             </Section>
           </>
         )}
-        {p.tab === 'action' && <ActionFields ed={ed} a={b.action} errors={errors} id={id} />}
-        {p.tab === 'runs' && <RunLog backend={p.backend} padId={p.pad.id} buttonId={b.id} onHost={!!p.hostButton} changed={p.changed} saving={p.saving} onSaveAndRun={p.onSaveAndRun} />}
+        {p.tab === 'action' && (
+          <>
+            <ActionFields ed={ed} a={b.action} stops={!!b.stops?.length} errors={errors} id={id} />
+            <StopsEditor pads={p.pads} pi={p.pi} b={b} error={[...errors].find(([k]) => k.startsWith('stops'))?.[1]} onChange={(stops) => ed.patchButton({ stops })} />
+            {b.action.type !== 'none' && <OutputTips shell={b.action.type === 'shell'} />}
+          </>
+        )}
+        {p.tab === 'runs' && (
+          <RunLog backend={p.backend} padId={p.pad.id} button={b} hostButton={p.hostButton} changed={p.changed} saving={p.saving} onSaveAndRun={p.onSaveAndRun} onAsk={p.onAsk} />
+        )}
       </div>
     </>
   );
 }
-
 
 /** What the id is for, and what changing it breaks (the host still knows the button by its saved id). */
 function IdHint({ ed, pad, b, running }: { ed: Editor; pad: Pad; b: Button; running: boolean }) {
@@ -207,73 +285,89 @@ function IdHint({ ed, pad, b, running }: { ed: Editor; pad: Pad; b: Button; runn
     return (
       <span class="ed-warn-note" data-testid="id-warning">
         Saved as <code>{bp.id}/{bb.id}</code>: changing it breaks <code>POST /api/press/{bp.id}/{bb.id}</code> links, starts its run history over
-        {running ? ', and stops its current run' : ''}.
+        {running ? ', and stops its current run' : ''}. Buttons that stop it follow the new id.
       </span>
     );
   return (
     <>
-      Used by the HTTP API (<code>POST /api/press/{pad.id}/{b.id}</code>) and its run history: changing it breaks links to it.
+      Used by the HTTP API (<code>POST /api/press/{pad.id}/{b.id}</code>), its run history and other buttons' Stops: changing it breaks links to it.
     </>
   );
 }
 
-function ActionFields({ ed, a, errors, id }: { ed: Editor; a: Action; errors: Map<string, string>; id(k: string): string }) {
+const ACTION_NOTE: Record<Action['type'], string> = {
+  shell: 'Run by /bin/sh (or the shell set below; cmd.exe on Windows): pipes, && and variables work.',
+  exec: 'Started directly with these arguments: no shell, so no quoting surprises.',
+  none: "Runs nothing, and shows ✓ at once: for a button that only stops others (pick them under Stops).",
+};
+
+function ActionFields({ ed, a, stops, errors, id }: { ed: Editor; a: Action; stops: boolean; errors: Map<string, string>; id(k: string): string }) {
   const err = (k: string) => errors.get(k);
-  const patch = (x: Partial<Action>, field?: string) => ed.patchButton({ action: { ...a, ...x } as Action }, field && `action.${field}`);
+  const patch = (x: Partial<Extract<Action, { type: 'exec' | 'shell' }>>, field?: string) => ed.patchButton({ action: { ...a, ...x } as Action }, field && `action.${field}`);
   const argErr = [...errors].find(([k]) => k.startsWith('action.args'))?.[1];
   // Errors of one variable show on its row.
   const envErr = errors.get('action.env');
   return (
-    <>
-      <Section title="Action">
-        <Segmented
-          label="Action type"
-          value={a.type}
-          testid="field-action-type"
-          onChange={(t) => ed.setActionType(t)}
-          options={[
-            { value: 'shell', label: 'Shell script' },
-            { value: 'exec', label: 'Program' },
-          ]}
-        />
-        <p class="ed-hint">
-          {a.type === 'shell'
-            ? 'Run by a shell ($SHELL, else /bin/sh; cmd.exe on Windows): pipes, && and variables work.'
-            : 'Started directly with these arguments: no shell, so no quoting surprises.'}
+    <Section title="Action">
+      <Segmented
+        label="Action type"
+        value={a.type}
+        testid="field-action-type"
+        wrap
+        onChange={(t) => ed.setActionType(t)}
+        options={[
+          { value: 'shell', label: 'Shell script' },
+          { value: 'exec', label: 'Program' },
+          { value: 'none', label: 'Nothing (stop others)' },
+        ]}
+      />
+      <p class="ed-hint">{ACTION_NOTE[a.type]}</p>
+      {a.type === 'none' && !stops && (
+        <p class="ed-warn-note" data-testid="none-stops-nothing">
+          It stops nothing yet either: a press would just show ✓. Pick what it stops below.
         </p>
-        {a.type === 'shell' ? (
-          <>
-            <Field label="Script" for={id('script')} error={err('action.script')} testid="script">
-              <TextArea id={id('script')} value={a.script} rows={6} placeholder="echo 'hello'" onValue={(v) => patch({ script: v }, 'script')} invalid={!!err('action.script')} testid="field-script" />
-            </Field>
-            <Field label="Shell" for={id('shell')} error={err('action.shell')} hint="Leave empty for the host's default: $SHELL, or /bin/sh without one (cmd.exe on Windows).">
-              <TextInput id={id('shell')} value={a.shell ?? ''} mono placeholder="$SHELL (or /bin/sh)" onValue={(v) => patch({ shell: v || undefined }, 'shell')} testid="field-shell" />
-            </Field>
-          </>
-        ) : (
-          <>
-            <Field label="Program" for={id('cmd')} error={err('action.command')} hint="A path, or a name on the host's PATH. A relative path (./x.sh) starts in the working folder below." testid="command">
-              <TextInput id={id('cmd')} value={a.command} mono placeholder="/usr/bin/say" onValue={(v) => patch({ command: v }, 'command')} invalid={!!err('action.command')} testid="field-command" />
-            </Field>
-            <Field label="Arguments" error={argErr} hint="One per line, passed as-is: no quotes needed.">
-              <ListEditor items={a.args} onChange={(args, f) => patch({ args }, f)} errors={errors} testid="field-arg" addLabel="Add argument" placeholder="argument" />
-            </Field>
-          </>
-        )}
-        <Field
-          label="Working folder"
-          for={id('cwd')}
-          error={err('action.cwd')}
-          hint={`Where it runs. Default: the config file's folder; a relative folder starts there.${a.type === 'exec' ? ' A relative program path starts here.' : ''}`}
-        >
-          <TextInput id={id('cwd')} value={a.cwd ?? ''} mono placeholder="(config folder)" onValue={(v) => patch({ cwd: v || undefined }, 'cwd')} testid="field-cwd" />
-        </Field>
-        <Field label="Environment" error={envErr} hint="Added to the host's environment. Names: letters, digits and _.">
-          <EnvEditor env={a.env} errors={errors} onChange={(env, f) => patch({ env }, f)} />
-        </Field>
-      </Section>
-      <OutputTips shell={a.type === 'shell'} />
-    </>
+      )}
+      {a.type === 'shell' && (
+        <>
+          {isPlaceholder(a) && (
+            <p class="ed-warn-note" data-testid="placeholder-note">
+              Not set up yet: a press fails with “No action set”. Replace the script with what it should do.
+            </p>
+          )}
+          <Field label="Script" for={id('script')} error={err('action.script')} testid="script">
+            <TextArea id={id('script')} value={a.script} rows={6} placeholder="echo 'hello'" onValue={(v) => patch({ script: v }, 'script')} invalid={!!err('action.script')} testid="field-script" />
+          </Field>
+          <Field label="Shell" for={id('shell')} error={err('action.shell')} hint="Leave empty for /bin/sh (cmd.exe on Windows). Set it for bash, zsh… features.">
+            <TextInput id={id('shell')} value={a.shell ?? ''} mono placeholder="/bin/sh" onValue={(v) => patch({ shell: v || undefined }, 'shell')} testid="field-shell" />
+          </Field>
+        </>
+      )}
+      {a.type === 'exec' && (
+        <>
+          <Field label="Program" for={id('cmd')} error={err('action.command')} hint="A path, or a name on the host's PATH. A relative path (./x.sh) starts in the working folder below." testid="command">
+            <TextInput id={id('cmd')} value={a.command} mono placeholder="/usr/bin/say" onValue={(v) => patch({ command: v }, 'command')} invalid={!!err('action.command')} testid="field-command" />
+          </Field>
+          <Field label="Arguments" error={argErr} hint="One per line, passed as-is: no quotes needed.">
+            <ListEditor items={a.args} onChange={(args, f) => patch({ args }, f)} errors={errors} testid="field-arg" addLabel="Add argument" placeholder="argument" />
+          </Field>
+        </>
+      )}
+      {a.type !== 'none' && (
+        <>
+          <Field
+            label="Working folder"
+            for={id('cwd')}
+            error={err('action.cwd')}
+            hint={`Where it runs. Default: the config file's folder; a relative folder starts there.${a.type === 'exec' ? ' A relative program path starts here.' : ''}`}
+          >
+            <TextInput id={id('cwd')} value={a.cwd ?? ''} mono placeholder="(config folder)" onValue={(v) => patch({ cwd: v || undefined }, 'cwd')} testid="field-cwd" />
+          </Field>
+          <Field label="Environment" error={envErr} hint="Added to the host's environment. Names: letters, digits and _.">
+            <EnvEditor env={a.env} errors={errors} onChange={(env, f) => patch({ env }, f)} />
+          </Field>
+        </>
+      )}
+    </Section>
   );
 }
 
@@ -296,6 +390,10 @@ function OutputTips({ shell }: { shell: boolean }) {
           <Code>@result 12 files</Code>
         </dt>
         <dd>the result text</dd>
+        <dt>
+          <Code>@state REC ●</Code>
+        </dt>
+        <dd>a device state that stays on the button after the run (<Code>@state</Code> alone clears it)</dd>
       </dl>
       <p>
         Print these on their own line to stdout. Without <Code>@result</Code>, the last line printed is shown. Exit code 0 is a ✓; anything else is a ✗ with the last

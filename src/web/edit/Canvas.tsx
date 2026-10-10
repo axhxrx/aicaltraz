@@ -10,6 +10,7 @@ import type { Pad } from '../../core/config.ts';
 import { vmFor } from '../dev/Gallery.tsx';
 import { ButtonFace } from '../run/ButtonFace.tsx';
 import { cellStyle, PadGrid } from '../run/RunPad.tsx';
+import type { Flash } from './EditMode.tsx';
 import type { Editor } from './editor.ts';
 import { Plus, Resize } from './icons.tsx';
 import { fits, occupant, rectOf, refusal, sameRect, type Fit, type Rect } from './ops.ts';
@@ -80,10 +81,12 @@ export interface CanvasProps {
   sel: number | null;
   /** Indices of buttons with validation problems. */
   bad: ReadonlySet<number>;
+  /** Indices of buttons the host warned about at the last save (non-blocking). */
+  warned: ReadonlySet<number>;
   /** Indices of buttons running on the host right now (a save may stop them). */
   running: ReadonlySet<number>;
-  /** Refused keyboard move/resize, blocked pad shrink: flash these buttons. */
-  flash: { ixs: number[]; at: number } | null;
+  /** Point at these buttons: a refused keyboard move/resize or pad shrink (`refused`), a fresh copy (`added`). */
+  flash: Flash | null;
   /** A tap (no drag) on a button, or a button was just added (`added`). */
   onOpen(ix: number, added?: boolean): void;
   onDeselect(): void;
@@ -92,7 +95,7 @@ export interface CanvasProps {
   emptyHint: string;
 }
 
-export function Canvas({ ed, pad, sel, bad, running, flash, onOpen, onDeselect, onRefuse, emptyHint }: CanvasProps) {
+export function Canvas({ ed, pad, sel, bad, warned, running, flash, onOpen, onDeselect, onRefuse, emptyHint }: CanvasProps) {
   const root = useRef<HTMLDivElement>(null);
   const g = useRef<Gesture | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -207,7 +210,7 @@ export function Canvas({ ed, pad, sel, bad, running, flash, onOpen, onDeselect, 
     const d = drag?.ix === i ? drag : null;
     const r = d ? d.cand : b;
     const flashing = !!flash?.ixs.includes(i);
-    const refused = d && !d.fit.ok ? (d.fit.reason as string) : flashing ? 'flash' : undefined;
+    const refused = d && !d.fit.ok ? (d.fit.reason as string) : flashing && flash!.kind === 'refused' ? 'flash' : undefined;
     kids.push(
       <div
         key={`b${i}`}
@@ -221,6 +224,7 @@ export function Canvas({ ed, pad, sel, bad, running, flash, onOpen, onDeselect, 
         data-h={r.h}
         data-drag={d && !d.settling ? d.kind : undefined}
         data-refused={refused}
+        data-added={flashing && flash!.kind === 'added' ? '' : undefined}
         data-running={running.has(i) ? '' : undefined}
         tabIndex={0}
         role="button"
@@ -231,10 +235,16 @@ export function Canvas({ ed, pad, sel, bad, running, flash, onOpen, onDeselect, 
       >
         <ButtonFace vm={vmFor(b)} now={0} aria-hidden="true" style={{ position: 'absolute', inset: '0' }} />
         <div class="ed-ring" key={flashing ? flash!.at : 'ring'} />
-        {bad.has(i) && (
+        {bad.has(i) ? (
           <div class="ed-bad" aria-label="has problems">
             !
           </div>
+        ) : (
+          warned.has(i) && (
+            <div class="ed-bad is-warn" data-testid="warned-badge" aria-label="the host warns about it">
+              !
+            </div>
+          )
         )}
         {running.has(i) && (
           <div class="ed-running" data-testid="running-badge" aria-hidden="true">

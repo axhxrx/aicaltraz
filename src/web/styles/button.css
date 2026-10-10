@@ -1,13 +1,17 @@
 /*
  * Button faces. Every state differs in color AND motion AND shape (see docs/DESIGN.md):
- *   READY     solid color, huge label, still
- *   ARMING    ink fill rising bottom→top with a hard leading edge; pop + flash on fire
- *   CONFIRM   face dimmed, thick amber frame blinking 2 Hz, "… AGAIN TO CONFIRM", amber countdown
- *   SENDING   dimmed, three pulsing dots
- *   RUNNING   diagonal stripes scrolling; big elapsed clock; or left→right fill with big %
- *   SUCCESS   green flood from the center, giant ✓ popping in, then still; drain bar
- *   FAILURE   red flood, giant ✗ shaking in, slow dark pulse; drain bar
- *   OFFLINE   grey, dashed border, ⚠, dim label; shakes when pressed
+ *   READY       solid color, huge label, still; how the last run ended in the corner
+ *   ARMING      ink fill rising bottom→top with a hard leading edge; pop + flash on fire
+ *   CONFIRM     face dimmed, thick amber frame blinking 2 Hz, "… AGAIN TO CONFIRM", amber countdown
+ *   SENDING     dimmed, three pulsing dots
+ *   RUNNING     diagonal stripes scrolling; label big, elapsed clock under it; or a left→right
+ *               fill with the %, slow stripes still moving underneath
+ *   SUCCESS     green flood from the center, giant ✓ popping in, then still; drain bar
+ *   FAILURE     red flood, ✗ shaking in, the reason in big type, slow dark pulse; stays until touched
+ *   STOPPED     slate flood, ■, still: stopped on purpose, not a failure
+ *   UNKNOWN     amber flood, "?", dashed frame: NO RESPONSE / IT RAN
+ *   INTERRUPTED amber flood with dark hazard stripes, lightning glyph, pulse
+ *   OFFLINE     grey, dashed border, ⚠, dim label; shakes when pressed
  * Only transform/opacity animate. Sizes come from container query units of .bp-btn.
  */
 
@@ -22,11 +26,20 @@
   -webkit-user-select: none;
   user-select: none;
 }
+/* Run mode: each button also takes the half of the grid gap next to it, so no touch lands on
+   nothing. (Not in the editor, whose canvas has its own hit areas.) */
+.bp-grid[data-run] > .bp-btn::before {
+  content: '';
+  position: absolute;
+  inset: calc(var(--gap) / -2);
+}
 
 .bp-face {
   --pad: max(8px, 6cqmin);
+  --top-fs: clamp(10px, 4.6cqmin, 20px);
+  --top-h: 0px;
   --iw: calc(100cqw - 2 * var(--pad));
-  --ih: calc(100cqh - 2 * var(--pad));
+  --ih: calc(100cqh - 2 * var(--pad) - var(--top-h));
   --radius: clamp(10px, 7cqmin, 30px);
   position: absolute;
   inset: 0;
@@ -96,7 +109,7 @@
 
 .bp-content {
   position: absolute;
-  inset: var(--pad);
+  inset: calc(var(--pad) + var(--top-h)) var(--pad) var(--pad);
   z-index: 2;
   overflow: hidden;
   display: flex;
@@ -110,7 +123,8 @@
 /* Fitted text breaks only where lib/fit.ts measured it may: at its spaces and <wbr>s (keep-all:
    no breaks between CJK characters otherwise). anywhere stays as the emergency exit. */
 .bp-label,
-.bp-head {
+.bp-head,
+.bp-headline {
   flex: none;
   width: 100%;
   font-weight: 900;
@@ -128,6 +142,7 @@
     word-break: auto-phrase;
   }
 }
+/* RUNNING's clock / %: secondary to the label (what is running matters more than for how long). */
 .bp-num {
   flex: none;
   font-weight: 900;
@@ -135,7 +150,8 @@
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  --line-max: calc(var(--ih) * 0.34);
+  opacity: 0.92;
+  --line-max: min(calc(var(--ih) * 0.2), 64px);
 }
 /* Status / result text: fit to two lines; below --fit-min it clamps with an ellipsis instead. */
 .bp-sub {
@@ -155,13 +171,21 @@
   --fit-max: min(8cqh, 40px);
   --fit-min: 10px;
 }
-.bp-title {
-  flex: none;
-  font-weight: 900;
-  line-height: 1;
+/* A result's headline (the reason: ≤ 2 lines, big) and its small print (EXIT 3, stopped by…). */
+.bp-headline {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  --fit-h: calc(var(--ih) * 0.3);
+  --fit-max: 15cqh;
+  --fit-min: min(12px, 8cqh);
+}
+.bp-sub.bp-detail {
+  opacity: 0.85;
   letter-spacing: 0.02em;
-  white-space: nowrap;
-  --line-max: min(13cqh, 72px);
+  --fit-h: calc(var(--ih) * 0.13);
+  --fit-max: min(6.4cqh, 28px);
 }
 /* The glyph is the flexible part: it shrinks first when a small button runs out of room. */
 .bp-icon {
@@ -180,7 +204,8 @@
   opacity: 0.8;
 }
 
-/* READY hints: trigger + key chips along the bottom edge. */
+/* READY hints: trigger + key chips along the bottom edge. They shrink (the trigger chip first,
+   down to its icon) rather than spill out of a narrow button. */
 .bp-hints {
   position: absolute;
   left: 0;
@@ -200,15 +225,58 @@
   display: inline-flex;
   align-items: center;
   gap: 0.4em;
+  min-width: 0;
   padding: 0.38em 0.7em 0.38em 0.5em;
   border-radius: 99px;
   background: rgb(128 128 128 / 0.3);
   background: color-mix(in srgb, var(--ink) 16%, transparent);
   white-space: nowrap;
 }
+.bp-chip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bp-trigger {
+  flex: 0 1 auto;
+}
+.bp-key {
+  flex: none;
+  max-width: 60%;
+}
 .bp-chip svg {
+  flex: none;
   width: 1.2em;
   height: 1.2em;
+}
+/* Narrow: tighter chips; the key chip drops its keyboard glyph (a chip with a key name reads as a
+   key), and HOLD 1.5s keeps the duration (the icon says hold). */
+@container (max-width: 180px) {
+  .bp-hints {
+    gap: 4px;
+    letter-spacing: 0.03em;
+  }
+  .bp-chip {
+    gap: 0.3em;
+    padding: 0.38em 0.5em 0.38em 0.4em;
+  }
+  .bp-key svg,
+  .bp-trigger.has-extra .bp-chip-word,
+  .bp-hints:has(.bp-key) .bp-trigger.is-double .bp-chip-word {
+    display: none;
+  }
+}
+/* "12 s ago", or "12s" where that doesn't fit. */
+.bp-short {
+  display: none;
+}
+@container (max-width: 200px) {
+  .bp-btn:has(.bp-latched) .bp-last .bp-long {
+    display: none;
+  }
+  .bp-btn:has(.bp-latched) .bp-last .bp-short {
+    display: inline;
+  }
 }
 .bp-chip svg + svg {
   margin-left: 0.15em;
@@ -310,14 +378,16 @@
 .bp-btn[data-visual='running'] .bp-base {
   filter: brightness(0.86);
 }
+/* What is running stays the headline; the clock comes second. Never below a readable size. */
 .bp-btn[data-visual='running'] .bp-label {
-  --fit-h: calc(var(--ih) * 0.19);
-  --fit-max: 15cqh;
+  --fit-h: calc(var(--ih) * 0.4);
+  --fit-max: 30cqh;
+  --fit-min: min(16px, 9cqh);
 }
-.bp-btn[data-visual='success'] .bp-label,
-.bp-btn[data-visual='failure'] .bp-label {
-  --fit-h: calc(var(--ih) * 0.16);
+.bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-label {
+  --fit-h: calc(var(--ih) * 0.17);
   --fit-max: 13cqh;
+  --fit-min: min(13px, 8cqh);
 }
 .bp-stripes {
   --sw: clamp(10px, 8cqmin, 48px);
@@ -331,6 +401,13 @@
     bp-stripes 0.75s linear infinite,
     bp-fade 0.3s ease-out;
   will-change: transform;
+}
+/* Under a progress fill: fainter and slower, but moving, so 2% still reads as busy. */
+.bp-stripes.is-under {
+  opacity: 0.13;
+  animation:
+    bp-stripes 2.4s linear infinite,
+    bp-fade 0.3s ease-out;
 }
 .bp-prog {
   --p: 0;
@@ -369,7 +446,8 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.bp-pill.is-cancelling {
+.bp-pill.is-cancelling,
+.bp-pill.bp-again {
   animation: bp-blink 0.6s steps(1, end) infinite;
 }
 .bp-btn[data-visual='running'] .bp-dots {
@@ -382,7 +460,7 @@
   height: 3.6cqmin;
 }
 
-/* ---- SUCCESS / FAILURE ---------------------------------------------------------------- */
+/* ---- results: SUCCESS / FAILURE / STOPPED / UNKNOWN / INTERRUPTED ------------------------ */
 
 .bp-btn[data-visual='success'] .bp-face {
   --ink: var(--ok-ink);
@@ -392,10 +470,26 @@
   --ink: var(--bad-ink);
   --flood: var(--bad);
 }
-.bp-btn[data-visual='success'] .bp-base,
-.bp-btn[data-visual='failure'] .bp-base {
+.bp-btn[data-visual='stopped'] .bp-face {
+  --ink: var(--stop-ink);
+  --flood: var(--stop);
+}
+.bp-btn:is([data-visual='unknown'], [data-visual='interrupted']) .bp-face {
+  --ink: var(--warn-ink);
+  --flood: var(--amber);
+}
+.bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-base {
   background: var(--flood);
   box-shadow: none;
+}
+/* INTERRUPTED: hazard stripes, still. */
+.bp-btn[data-visual='interrupted'] .bp-base {
+  background: repeating-linear-gradient(-45deg, rgb(0 0 0 / 0.16) 0 max(10px, 6cqmin), transparent 0 max(20px, 12cqmin)), var(--flood);
+}
+/* UNKNOWN: a dashed frame (we don't know how it went). */
+.bp-btn[data-visual='unknown'] .bp-frame {
+  border: max(3px, 1.8cqmin) dashed var(--warn-ink);
+  opacity: 0.55;
 }
 .bp-flood {
   position: absolute;
@@ -409,11 +503,20 @@
   pointer-events: none;
   animation: bp-flood 0.42s cubic-bezier(0.15, 0.85, 0.3, 1) both;
 }
+.bp-btn[data-visual='interrupted'] .bp-flood {
+  background: transparent;
+}
 .bp-btn[data-visual='success'] .bp-icon {
   animation: bp-pop-in 0.5s cubic-bezier(0.2, 1.5, 0.4, 1) 0.1s both;
 }
-.bp-btn[data-visual='failure'] .bp-icon {
+.bp-btn:is([data-visual='failure'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
   animation: bp-shake-in 0.55s ease-out 0.08s both;
+}
+/* A failure's glyph gives the room to its reason. */
+.bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
+  flex-basis: min(26cqh, 44cqw);
+  min-height: 7cqh;
+  margin: -1.5cqh 0;
 }
 .bp-pulse {
   background: #000;
@@ -439,6 +542,35 @@
   background: var(--amber);
   opacity: 1;
   height: max(6px, 3cqmin);
+}
+/* Bottom-edge notes of a result: stays until touched, a queued re-run coming up. */
+.bp-sticky,
+.bp-next {
+  position: absolute;
+  left: 50%;
+  bottom: -0.15em;
+  translate: -50% 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0.32em 0.7em;
+  border-radius: 99px;
+  font-weight: 900;
+  font-size: clamp(9px, 4.4cqmin, 20px);
+  letter-spacing: 0.05em;
+  line-height: 1;
+  background: color-mix(in srgb, var(--ink) 18%, transparent);
+}
+.bp-next {
+  background: var(--ink);
+  color: var(--flood);
+}
+@container (min-height: 131px) {
+  .bp-btn[data-sticky] .bp-content,
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']):has(.bp-next) .bp-content {
+    padding-bottom: 1.7em;
+  }
 }
 
 /* ---- OFFLINE -------------------------------------------------------------------------- */
@@ -492,6 +624,12 @@
 .bp-tint.is-failure {
   background: var(--bad);
 }
+.bp-tint.is-stopped {
+  background: var(--stop);
+}
+.bp-tint:is(.is-unknown, .is-interrupted) {
+  background: var(--amber);
+}
 .bp-sub.bp-offline-was {
   display: block;
   width: auto;
@@ -502,13 +640,110 @@
   --line-max: clamp(10px, min(5cqh, 4.6cqw), 22px);
 }
 
+/* ---- the top edge: the last result / another device's run (left), latched state (right) -- */
+
+.bp-btn.has-top .bp-face {
+  --top-h: calc(var(--top-fs) * 1.75);
+}
+.bp-top {
+  position: absolute;
+  z-index: 3;
+  top: calc(var(--pad) * 0.7);
+  left: calc(var(--pad) * 0.7);
+  right: calc(var(--pad) * 0.7);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+  font-weight: 900;
+  font-size: var(--top-fs);
+  letter-spacing: 0.06em;
+  line-height: 1;
+  color: var(--ink);
+  pointer-events: none;
+}
+.bp-mark {
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 0.4em;
+  min-width: 0;
+  padding: 0.22em 0.6em 0.22em 0.22em;
+  border-radius: 99px;
+  white-space: nowrap;
+  background: color-mix(in srgb, var(--ink) 14%, transparent);
+}
+.bp-last i {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 1.3em;
+  height: 1.3em;
+  border-radius: 50%;
+  font-style: normal;
+  font-size: 0.95em;
+}
+.bp-last.is-ok i {
+  background: var(--ok);
+  color: var(--ok-ink);
+}
+.bp-last.is-bad i {
+  background: var(--bad);
+  color: var(--bad-ink);
+}
+.bp-last.is-stopped i {
+  background: var(--stop);
+  color: var(--stop-ink);
+}
+.bp-last.is-warn i {
+  background: var(--amber);
+  color: var(--warn-ink);
+}
+.bp-other {
+  padding-left: 0.5em;
+  background: transparent;
+  box-shadow: inset 0 0 0 0.14em color-mix(in srgb, var(--ink) 55%, transparent);
+}
+.bp-other svg {
+  flex: none;
+  width: 1.15em;
+  height: 1.15em;
+}
+/* Device state reported by the action (`@state`): solid, it matters (the corner mark yields first). */
+.bp-latched {
+  flex: none;
+  min-width: 0;
+  margin-left: auto;
+  max-width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0.3em 0.7em;
+  border-radius: 99px;
+  background: var(--ink);
+  color: var(--bg);
+  letter-spacing: 0.05em;
+}
+.bp-btn[data-visual='offline'] .bp-latched {
+  opacity: 0.6;
+}
+@container (max-width: 112px) {
+  .bp-mark .bp-chip-text {
+    display: none;
+  }
+  .bp-mark {
+    padding-right: 0.22em;
+  }
+  .bp-other {
+    padding: 0.22em;
+  }
+}
+
 /* ---- wide buttons (desktop rows, landscape phones): glyph or number beside the text ---- */
 
 @container (min-aspect-ratio: 9 / 4) {
-  .bp-btn[data-visual='success'] .bp-content,
-  .bp-btn[data-visual='failure'] .bp-content,
-  .bp-btn[data-visual='offline'] .bp-content,
-  .bp-btn[data-visual='running'] .bp-content {
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline'], [data-visual='running'])
+    .bp-content {
     --side: min(70cqh, 34cqw);
     display: grid;
     align-content: center;
@@ -517,15 +752,11 @@
     row-gap: 2.4cqh;
     text-align: left;
   }
-  /* success / failure / offline: [glyph | label, title, text] */
-  .bp-btn[data-visual='success'] .bp-content,
-  .bp-btn[data-visual='failure'] .bp-content,
-  .bp-btn[data-visual='offline'] .bp-content {
+  /* results / offline: [glyph | label, headline, text] */
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content {
     grid-template-columns: var(--side) minmax(0, 1fr);
   }
-  .bp-btn[data-visual='success'] .bp-content > *,
-  .bp-btn[data-visual='failure'] .bp-content > *,
-  .bp-btn[data-visual='offline'] .bp-content > * {
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content > * {
     grid-column: 2;
     --fit-w: calc(var(--iw) - var(--side) - 6cqh);
   }
@@ -537,63 +768,70 @@
     height: var(--side);
     margin: 0;
   }
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-content > .bp-icon {
+    width: calc(var(--side) * 0.75);
+    height: calc(var(--side) * 0.75);
+    justify-self: center;
+  }
   .bp-btn[data-visual='offline'] .bp-content > .bp-icon {
     width: calc(var(--side) * 0.7);
     height: calc(var(--side) * 0.7);
     justify-self: center;
   }
-  .bp-btn[data-visual='success'] .bp-label,
-  .bp-btn[data-visual='failure'] .bp-label,
-  .bp-btn[data-visual='offline'] .bp-label {
-    --fit-h: calc(var(--ih) * 0.3);
-    --fit-max: 30cqh;
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-label {
+    --fit-h: calc(var(--ih) * 0.26);
+    --fit-max: 26cqh;
   }
-  .bp-btn[data-visual='failure'] .bp-title {
-    --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
-    --line-max: 24cqh;
+  .bp-btn[data-visual] .bp-content > .bp-headline {
+    --fit-h: calc(var(--ih) * 0.42);
+    --fit-max: 26cqh;
   }
   .bp-btn[data-visual='offline'] .bp-offline-was {
     --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
   }
   .bp-btn[data-visual] .bp-content > .bp-sub {
-    --fit-h: calc(var(--ih) * 0.24);
-    --fit-max: 13cqh;
+    --fit-h: calc(var(--ih) * 0.2);
+    --fit-max: 12cqh;
   }
-  /* running: [label, status, pill | big number] */
+  /* running: [label, status, pill | number] */
   .bp-btn[data-visual='running'] .bp-content {
     grid-template-columns: minmax(0, 1fr) auto;
   }
   .bp-btn[data-visual='running'] .bp-content > * {
     grid-column: 1;
-    --fit-w: calc(var(--iw) * 0.5);
+    --fit-w: calc(var(--iw) * 0.62);
   }
   .bp-btn[data-visual='running'] .bp-label {
-    --fit-h: calc(var(--ih) * 0.32);
-    --fit-max: 30cqh;
+    --fit-h: calc(var(--ih) * 0.42);
+    --fit-max: 36cqh;
   }
   .bp-btn[data-visual='running'] .bp-content > .bp-num {
     grid-column: 2;
     grid-row: 1 / span 3;
     align-self: center;
-    --iw: calc((100cqw - 2 * var(--pad)) * 0.44);
-    --line-max: calc(var(--ih) * 0.8);
+    --iw: calc((100cqw - 2 * var(--pad)) * 0.32);
+    --line-max: calc(var(--ih) * 0.44);
   }
   .bp-btn[data-visual='running'] .bp-content > .bp-pill {
-    --iw: calc((100cqw - 2 * var(--pad)) * 0.5);
+    --iw: calc((100cqw - 2 * var(--pad)) * 0.6);
   }
 }
 
 /* ---- short buttons (many rows, landscape): one centered row, only what fits ---------- */
 
-/* Every item gets a fixed share of the row as its width (--ic: glyph + gap, --nw: number/title +
-   gap, the label the rest), and the font sizes are computed for those same widths: a label sized
+/* Every item gets a fixed share of the row as its width (--ic: glyph + gap, --nw: number/headline
+   + gap, the label the rest), and the font sizes are computed for those same widths: a label sized
    for two lines is laid out on two, never squeezed onto one and clipped. */
 @container (max-height: 84px) {
+  .bp-btn.has-top .bp-face {
+    --top-h: 0px;
+  }
   .bp-btn[data-visual] .bp-content {
     --gapw: max(6px, 2.4cqw);
     --icon: min(var(--ih), 14cqw);
     --ic: 0px;
     --nw: 0px;
+    --lw: 0px;
     display: flex;
     flex-direction: row;
     align-items: center;
@@ -601,16 +839,34 @@
     gap: var(--gapw);
     text-align: center;
   }
-  .bp-btn[data-visual] .bp-content > :is(.bp-sub, .bp-pill, .bp-time, .bp-hints, .bp-dots) {
+  /* The corner marks don't fit; latched state does, at the right end of the row. */
+  .bp-top > .bp-mark {
+    display: none;
+  }
+  .bp-top {
+    top: 50%;
+    translate: 0 -50%;
+    left: auto;
+    max-width: 30%;
+  }
+  .bp-btn:has(.bp-latched) .bp-content {
+    --lw: calc(var(--iw) * 0.3 + var(--gapw));
+    padding-right: var(--lw);
+  }
+  .bp-latched {
+    max-width: 100%;
+  }
+  .bp-btn[data-visual] .bp-content > :is(.bp-sub, .bp-pill, .bp-time, .bp-hints, .bp-dots, .bp-sticky, .bp-next) {
     display: none;
   }
   .bp-btn[data-visual] .bp-content > :is(.bp-label, .bp-head) {
     flex: none;
-    width: calc(var(--iw) - var(--ic) - var(--nw));
+    width: calc(var(--iw) - var(--ic) - var(--nw) - var(--lw));
     min-width: 0;
-    --fit-w: calc(var(--iw) - var(--ic) - var(--nw));
+    --fit-w: calc(var(--iw) - var(--ic) - var(--nw) - var(--lw));
     --fit-h: var(--ih);
     --fit-max: var(--ih);
+    --fit-min: 0px;
   }
   .bp-btn[data-visual] .bp-content > .bp-icon {
     flex: none;
@@ -619,23 +875,31 @@
     height: var(--icon);
     margin: 0;
   }
-  .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-title) {
+  .bp-btn[data-visual] .bp-content > .bp-num {
     flex: none;
     max-width: calc(var(--nw) - var(--gapw));
     --iw: calc(var(--nw) - var(--gapw));
     --line-max: var(--ih);
   }
+  .bp-btn[data-visual] .bp-content > .bp-headline {
+    flex: none;
+    width: calc(var(--nw) - var(--gapw));
+    --fit-w: calc(var(--nw) - var(--gapw));
+    --fit-h: var(--ih);
+    --fit-max: calc(var(--ih) * 0.6);
+    --fit-min: 0px;
+  }
   .bp-btn[data-visual='confirm'] .bp-content > .bp-label {
     display: none;
   }
   .bp-btn[data-visual='running'] .bp-content {
-    --nw: calc(var(--iw) * 0.36 + var(--gapw));
+    --nw: calc(var(--iw) * 0.3 + var(--gapw));
   }
-  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='offline']) .bp-content {
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-content {
     --ic: calc(var(--icon) + var(--gapw));
   }
-  .bp-btn[data-visual='failure'] .bp-content {
-    --nw: calc(var(--iw) * 0.32 + var(--gapw));
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-content {
+    --nw: calc(var(--iw) * 0.42 + var(--gapw));
   }
 }
 /* Not wide enough for the glyph too: color and motion say the state, the words get the room. */
@@ -647,12 +911,12 @@
     display: none;
   }
 }
-/* Not even for the number/title: the label alone. */
+/* Not even for the number/headline: the label alone. */
 @container (max-height: 84px) and (max-aspect-ratio: 12 / 5) {
   .bp-btn[data-visual] .bp-content {
     --nw: 0px !important;
   }
-  .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-title) {
+  .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-headline) {
     display: none;
   }
 }
@@ -703,6 +967,25 @@
   margin-top: 0.3em;
   font-size: 0.42em;
   letter-spacing: 0.12em;
+}
+/* Over a result: a small chip low on the face, so the result stays readable. */
+.bp-badge.is-small {
+  top: auto;
+  bottom: calc(var(--pad) + 2.4em);
+  translate: -50% 0;
+  font-size: clamp(11px, 5.6cqmin, 24px);
+  padding: 0.35em 0.7em;
+  border-radius: 99px;
+}
+.bp-badge.is-small small {
+  display: inline;
+  margin: 0 0 0 0.5em;
+  font-size: 1em;
+  letter-spacing: 0.04em;
+}
+/* The state in words, for forced-colors mode only (everything else is the same color there). */
+.bp-fc {
+  display: none;
 }
 
 /* Grid while connecting: no interaction affordances. */
@@ -821,9 +1104,11 @@
   .bp-btn .bp-num {
     font-size: clamp(20px, 9vmin, 96px) !important;
   }
+  .bp-btn .bp-headline {
+    font-size: clamp(14px, 5vmin, 48px) !important;
+  }
   .bp-btn .bp-sub,
-  .bp-btn .bp-pill,
-  .bp-btn .bp-title {
+  .bp-btn .bp-pill {
     font-size: clamp(11px, 3.4vmin, 28px) !important;
   }
   .bp-icon {
@@ -843,5 +1128,66 @@
   }
   .bp-btn[data-visual='confirm'] .bp-frame {
     animation: none;
+  }
+}
+
+/* Forced colors (Windows high contrast): the browser repaints every face in two colors, so the
+   states are told apart by edges, fills in the highlight color, and words. */
+@media (forced-colors: active) {
+  .bp-face {
+    border: 2px solid ButtonText;
+  }
+  .bp-arm::before,
+  .bp-arm::after,
+  .bp-prog::before,
+  .bp-prog::after,
+  .bp-drain,
+  .bp-pips i:first-child {
+    forced-color-adjust: none;
+    background: Highlight;
+  }
+  .bp-pips i {
+    forced-color-adjust: none;
+    border-color: CanvasText;
+  }
+  .bp-stripes {
+    forced-color-adjust: none;
+    background: repeating-linear-gradient(-45deg, transparent 0 var(--sw), Highlight var(--sw) calc(var(--sw) * 2));
+    opacity: 0.45;
+  }
+  .bp-btn[data-visual='confirm'] .bp-frame {
+    border-color: Highlight;
+  }
+  .bp-btn[data-visual='running'] .bp-face {
+    border: 4px dotted Highlight;
+  }
+  .bp-btn[data-visual='success'] .bp-face {
+    border: 6px double CanvasText;
+  }
+  .bp-btn:is([data-visual='failure'], [data-visual='interrupted']) .bp-face {
+    border: 8px solid CanvasText;
+  }
+  .bp-btn:is([data-visual='stopped'], [data-visual='unknown']) .bp-face {
+    border: 4px dashed CanvasText;
+  }
+  .bp-fc {
+    display: block;
+    position: absolute;
+    z-index: 4;
+    top: calc(var(--pad) * 0.6);
+    left: 50%;
+    translate: -50% 0;
+    padding: 0.2em 0.5em;
+    border: 2px solid CanvasText;
+    border-radius: 0.3em;
+    font-weight: 900;
+    font-size: clamp(10px, 4.4cqmin, 18px);
+    letter-spacing: 0.1em;
+    white-space: nowrap;
+  }
+  .bp-latched,
+  .bp-pill,
+  .bp-next {
+    border: 2px solid CanvasText;
   }
 }

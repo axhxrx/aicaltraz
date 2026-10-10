@@ -1,4 +1,4 @@
-/** Full-screen states outside the pad: pairing, token rejected, first connection. */
+/** Full-screen states outside the pad: pairing, token rejected, first connection, a pad that isn't there. */
 import type { ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { parseToken } from '../lib/env.ts';
@@ -92,8 +92,19 @@ export function RejectedScreen(p: { onToken(t: string): void; onRetry(): void })
   );
 }
 
-export function ConnectingScreen(p: { status: string; onRepair(): void }) {
+export function ConnectingScreen(p: { status: string; hostFull?: boolean; onRepair(): void }) {
   const failing = p.status === 'offline';
+  if (p.hostFull)
+    return (
+      <Screen testid="connecting" tone="warn">
+        <div class="bp-spinner is-failing" />
+        <h1 data-testid="host-full">Host is full (too many devices connected)</h1>
+        <p>
+          ButtPad on {location.host} is running, but turns new devices away until one disconnects. Close ButtPad on a device you aren't using. This one keeps
+          trying.
+        </p>
+      </Screen>
+    );
   return (
     <Screen testid="connecting">
       <div class={`bp-spinner${failing ? ' is-failing' : ''}`} />
@@ -109,5 +120,37 @@ export function ConnectingScreen(p: { status: string; onRepair(): void }) {
         </button>
       )}
     </Screen>
+  );
+}
+
+/**
+ * The pad this screen is for (`?pad=`, or the one on screen) isn't in the config (deleted, or
+ * renamed: id and name both changed). Never silently another pad's buttons: a kiosk that became
+ * another pad's remote is worse than one that says it has none.
+ */
+export function MissingPadScreen(p: { name: string; lock: boolean; pads: { id: string; name: string }[]; onPad(id: string): void }) {
+  return (
+    <main class="bp-screen bp-missing is-warn" data-testid="pad-missing" data-scroll>
+      <div class="bp-screen-card">
+        <div class="bp-screen-icon">
+          <Warn />
+        </div>
+        <h1>Pad “{p.name}” no longer exists</h1>
+        <p>
+          {p.lock
+            ? 'This screen is locked to that pad, so it shows no buttons. Whoever set it up can point it at another pad (the ?pad= part of its link), or bring the pad back.'
+            : 'It was deleted or renamed on the host. Pick a pad:'}
+        </p>
+        {!p.lock && (
+          <div class="bp-pad-list">
+            {p.pads.map((x) => (
+              <button key={x.id} type="button" class="bp-ghost" data-testid={`open-pad-${x.id}`} onClick={() => p.onPad(x.id)}>
+                {x.name}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </main>
   );
 }

@@ -41,7 +41,8 @@
           },
           "name": {
             "type": "string",
-            "minLength": 1
+            "minLength": 1,
+            "maxLength": 60
           },
           "cols": {
             "default": 2,
@@ -68,7 +69,8 @@
                 },
                 "label": {
                   "default": "",
-                  "type": "string"
+                  "type": "string",
+                  "maxLength": 200
                 },
                 "color": {
                   "default": "#2f6fde",
@@ -133,19 +135,32 @@
                   "default": 3000,
                   "type": "integer",
                   "minimum": 500,
-                  "maximum": 9007199254740991
+                  "maximum": 60000
                 },
                 "timeoutMs": {
-                  "default": 30000,
+                  "default": 120000,
                   "type": "integer",
                   "minimum": 100,
-                  "maximum": 9007199254740991
+                  "maximum": 86400000
                 },
                 "resultHoldMs": {
                   "default": 2500,
                   "type": "integer",
                   "minimum": 0,
-                  "maximum": 9007199254740991
+                  "maximum": 60000
+                },
+                "cooldownMs": {
+                  "default": 400,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 10000
+                },
+                "stops": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^(\\*|[\\w-]+\\/(\\*|[\\w-]+))$"
+                  }
                 },
                 "key": {
                   "type": "string"
@@ -221,6 +236,19 @@
                       "required": [
                         "type",
                         "script"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "none"
+                        }
+                      },
+                      "required": [
+                        "type"
                       ],
                       "additionalProperties": false
                     }

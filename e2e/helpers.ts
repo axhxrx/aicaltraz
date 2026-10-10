@@ -11,14 +11,50 @@ export async function expectVisual(page: Page, id: string, visual: string, timeo
 /** Records every backend.press() from now on; the returned getter lists the button ids so far. */
 export async function trackPresses(page: Page): Promise<() => Promise<string[]>> {
   await page.evaluate(() => {
-    type P = (pad: string, id: string, onSent?: () => void) => Promise<unknown>;
+    type P = (pad: string, id: string, opts?: unknown) => Promise<unknown>;
     const b = window.__buttpad!.backend as unknown as { press: P };
     const orig = b.press.bind(b);
     const w = window as unknown as { __presses: string[] };
     w.__presses = [];
-    b.press = (pad, id, onSent) => (w.__presses.push(id), orig(pad, id, onSent));
+    b.press = (pad, id, opts) => (w.__presses.push(id), orig(pad, id, opts));
   });
   return () => page.evaluate(() => (window as unknown as { __presses: string[] }).__presses.slice());
+}
+
+/** What the press frames carried (`at`, `confirm`), for a page on a real host: wraps WebSocket.send before the app loads. */
+export async function recordPressFrames(page: Page): Promise<() => Promise<{ button: string; at?: number; confirm?: boolean; sentAt: number }[]>> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __frames: unknown[] };
+    w.__frames = [];
+    const send = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (data) {
+      try {
+        const m = JSON.parse(String(data)) as { t?: string };
+        if (m.t === 'press') w.__frames.push({ ...m, sentAt: Date.now() });
+      } catch {
+        /* not JSON */
+      }
+      return send.call(this, data);
+    };
+  });
+  return () => page.evaluate(() => (window as unknown as { __frames: { button: string; at?: number; confirm?: boolean; sentAt: number }[] }).__frames.slice());
+}
+
+/** Runs `fn` against the page's demo backend (window.__buttpad.backend). */
+export function demo<T>(page: Page, fn: (b: DemoHandle) => T | Promise<T>): Promise<T> {
+  return page.evaluate(`(${fn.toString()})(window.__buttpad.backend)`) as Promise<T>;
+}
+
+/** The demo backend's test controls (src/web/backend/demo.ts). */
+export interface DemoHandle {
+  press(pad: string, id: string, opts?: { confirm?: boolean }): Promise<string>;
+  saveConfig(c: unknown, rev: string): Promise<{ ok: boolean }>;
+  snapshot: { get(): { config: unknown; rev: string; states: Record<string, { phase: string; runId: number }>; latched: Record<string, string> } };
+  setOnline(v: boolean): void;
+  dropAcks(n: number): void;
+  delayNextPress(ms: number): void;
+  dropLinkOnNextPress(): void;
+  restart(): void;
 }
 
 /** Before the app loads: navigator.vibrate records its patterns (window.__vib, as JSON strings). */
@@ -32,7 +68,17 @@ export async function recordVibrations(page: Page): Promise<() => Promise<string
 }
 
 /** Haptic patterns (src/web/lib/feedback.ts), as recordVibrations() sees them. */
-export const VIB = { touch: '8', fire: '35', failure: '[320]', success: '[40,70,40]', busy: '[18,50,18,50,18]', denied: '[70,50,70]', cancel: '[12,120,12]', unknown: '[100,80,100,80,100]' };
+export const VIB = {
+  touch: '8',
+  fire: '35',
+  confirm: '[25,60,25]',
+  failure: '[320]',
+  success: '[40,70,40]',
+  busy: '[18,50,18,50,18]',
+  denied: '[70,50,70]',
+  cancel: '[12,120,12]',
+  unknown: '[100,80,100,80,100]',
+};
 
 /** Seeds the demo backend's config (localStorage) before the app boots. */
 export async function seedDemo(page: Page, config: ConfigInput): Promise<void> {
@@ -83,6 +129,13 @@ export class Fingers {
     }
   }
 
+  /** Several fingers landing at once (one touch event), e.g. a palm. Fingers 1..n. */
+  async downAll(buttonIds: string[]): Promise<void> {
+    const points = await Promise.all(buttonIds.map((id) => this.center(id)));
+    points.forEach((p, i) => this.active.set(i + 1, p));
+    await this.send('touchStart');
+  }
+
   async move(dx: number, dy: number, finger = 1): Promise<void> {
     const p = this.active.get(finger);
     if (!p) throw new Error(`finger ${finger} is not down`);
@@ -125,6 +178,25 @@ export class Fingers {
     await this.stamped('up', p, at);
   }
 
+  /**
+   * A press of exactly `ms` (by the events' own time stamps, so a slow test machine can't stretch a
+   * 15 ms graze into a tap): on a button (by id) or a test id's element, or at a point.
+   */
+  async pressStamped(target: string | Pt, ms: number, { testid = false } = {}): Promise<void> {
+    let p: Pt;
+    if (typeof target !== 'string') p = target;
+    else if (!testid) p = await this.center(target);
+    else {
+      const box = await this.page.getByTestId(target).boundingBox();
+      if (!box) throw new Error(`no ${target}`);
+      p = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    }
+    const t0 = Date.now();
+    await this.stamped('down', p, t0);
+    await this.page.waitForTimeout(ms);
+    await this.stamped('up', p, t0 + ms);
+  }
+
   private async stamped(kind: 'down' | 'up', p: Pt, at: number) {
     this.cdp ??= await this.page.context().newCDPSession(this.page);
     const timestamp = at / 1000;
@@ -137,10 +209,32 @@ export class Fingers {
     await this.cdp.send('Input.dispatchMouseEvent', { type: kind === 'down' ? 'mousePressed' : 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: kind === 'down' ? 1 : 0, clickCount: 1, timestamp });
   }
 
-  async tap(buttonId: string): Promise<void> {
+  /** A real finger's tap: about 70 ms down (a tap shorter than 40 ms is a graze and doesn't fire). */
+  async tap(buttonId: string, ms = 70): Promise<void> {
     await this.down(buttonId);
-    await this.page.waitForTimeout(40);
+    await this.page.waitForTimeout(ms);
     await this.up();
+  }
+
+  /** A touch (or click) at a point that isn't a button: tabs, the menu button, grid gaps. */
+  async pressAt(p: Pt, ms: number): Promise<void> {
+    this.active.set(9, p);
+    if (this.touch) await this.send('touchStart');
+    else {
+      await this.page.mouse.move(p.x, p.y);
+      await this.page.mouse.down();
+    }
+    await this.page.waitForTimeout(ms);
+    this.active.delete(9);
+    if (this.touch) await this.send('touchEnd', new Map([[9, p]]));
+    else await this.page.mouse.up();
+  }
+
+  /** Press an element by test id for `ms` (touch on touch projects). */
+  async pressTestId(testid: string, ms: number): Promise<void> {
+    const box = await this.page.getByTestId(testid).boundingBox();
+    if (!box) throw new Error(`no ${testid}`);
+    await this.pressAt({ x: box.x + box.width / 2, y: box.y + box.height / 2 }, ms);
   }
 }
 

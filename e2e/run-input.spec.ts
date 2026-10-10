@@ -135,21 +135,23 @@ test('pressing again while the last press is still SENDING: BUSY, no second fire
 test('no ack in 2 s: NO RESPONSE, with the "unknown" buzz rather than the failure one', async ({ page }) => {
   await demo(page).run((b) => b.dropAcks(1));
   await f.tap('tap');
-  await expectVisual(page, 'tap', 'failure', 3500);
+  await expectVisual(page, 'tap', 'unknown', 3500);
   await expect(btn(page, 'tap')).toContainText('NO RESPONSE');
   expect(await count(VIB.unknown)).toBe(1);
   expect(await count(VIB.failure)).toBe(0);
 });
 
-test('a press that never left the device says NOT SENT, not NO RESPONSE', async ({ page }) => {
+test('a press that never left the device says NOT SENT (and keeps saying it until touched), not NO RESPONSE', async ({ page }) => {
   // A backend that gives up before sending (the socket closed under it).
   await page.evaluate(() => {
     (window.__buttpad!.backend as unknown as { press(): Promise<never> }).press = () => Promise.reject(new Error('not connected to the host'));
   });
   await f.tap('tap');
-  await expect(btn(page, 'tap')).toHaveAttribute('data-flash', 'notsent');
-  await expect(btn(page, 'tap').locator('.bp-badge')).toHaveText('NOT SENT');
+  await expectVisual(page, 'tap', 'failure');
+  await expect(btn(page, 'tap')).toContainText('NOT SENT');
+  await expect(btn(page, 'tap')).toHaveAttribute('data-sticky', '');
   await page.waitForTimeout(2300);
+  await expect(btn(page, 'tap')).toContainText('NOT SENT');
   await expect(btn(page, 'tap')).not.toContainText('NO RESPONSE');
   expect(await count(VIB.failure)).toBe(0);
 });
@@ -167,16 +169,19 @@ test('lost ack: once the link is back, a press that did run shows what it did (n
   expect(await count(VIB.failure)).toBe(0);
   await expectVisual(page, 'tap', 'ready', 3000);
 
-  // Back only after it finished and its result ran out: all we know is that it ran.
+  // Back only after it finished and its result ran out: READY's `last` says how it ended, so that
+  // shows (a result like any other, with its buzz), not NO RESPONSE.
   await demo(page).run((b) => b.dropLinkOnNextPress());
   await f.tap('tap');
   await expect(page.getByTestId('conn')).toHaveAttribute('data-status', 'offline');
   await page.waitForTimeout(1700);
   await demo(page).run((b) => b.setOnline(true));
-  await expect(btn(page, 'tap')).toHaveAttribute('data-flash', 'ran');
-  await expect(btn(page, 'tap').locator('.bp-badge')).toHaveText('IT RAN');
+  await expectVisual(page, 'tap', 'success');
+  await expect(btn(page, 'tap')).toContainText('tapped');
   await expect(btn(page, 'tap')).not.toContainText('NO RESPONSE');
+  await expect.poll(() => count(VIB.success)).toBe(2);
   expect(await count(VIB.failure)).toBe(0);
+  await expectVisual(page, 'tap', 'ready', 3000);
 });
 
 test('confirm: a second hold begun inside the window fires, even when it completes after the window', async ({ page }) => {
@@ -196,7 +201,12 @@ test('confirm: a second hold begun inside the window fires, even when it complet
 test('confirm: a confirming press that is let go early gives the window back', async ({ page }) => {
   await f.hold('confirm', 700);
   await expectVisual(page, 'confirm', 'confirm');
-  await f.hold('confirm', 150);
+  await page.waitForTimeout(450);
+  await f.down('confirm');
+  // It took the window over…
+  await expectVisual(page, 'confirm', 'arming');
+  await page.waitForTimeout(150);
+  await f.up();
   await expectVisual(page, 'confirm', 'confirm');
   await expect(btn(page, 'confirm')).toContainText('AGAIN TO CONFIRM');
 });
@@ -264,10 +274,14 @@ test('keyboard: auto-repeat is ignored, a double is two keydowns, confirm still 
   await expectVisual(page, 'tap', 'success');
   await page.keyboard.press('d');
   await expectVisual(page, 'double', 'ready');
+  await page.waitForTimeout(120);
   await page.keyboard.press('d');
   await expect.poll(presses).toEqual(['tap', 'double']);
   await page.keyboard.press('c');
   await expectVisual(page, 'confirm', 'confirm');
+  await expect(btn(page, 'confirm')).toContainText('PRESS AGAIN TO CONFIRM');
+  // A deliberate second press (not a bounce: 400 ms after CONFIRM came up, at the earliest).
+  await page.waitForTimeout(450);
   await page.keyboard.press('c');
   await expectVisual(page, 'confirm', 'success');
   expect(await presses()).toEqual(['tap', 'double', 'confirm']);
@@ -286,22 +300,27 @@ test('keyboard: a key held across a config broadcast does not fire again; a doub
   // First keydown of a double, a broadcast, the second keydown: still a double.
   await page.keyboard.press('d');
   await relabel(page, 'slow', 'Slow 3');
+  await page.waitForTimeout(80);
   await page.keyboard.press('d');
   await expect.poll(presses).toEqual(['tap', 'double']);
 });
 
 test('cancel: no hint and no cancel within 700 ms of the start (like the host); after that it cancels', async ({ page }) => {
+  const presses = await trackPresses(page);
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'running');
   await expect(btn(page, 'cancel')).not.toContainText('TO CANCEL');
-  // A second tap right away is a double press, not a cancel: ignored.
+  // A second tap right away is a double press (a bounce), not a cancel: this device doesn't even send it.
   await f.tap('cancel');
-  await expect(btn(page, 'cancel')).toHaveAttribute('data-flash', 'busy');
+  await expect(btn(page, 'cancel')).toHaveAttribute('data-flash', 'cooldown');
+  await expect(btn(page, 'cancel').locator('.bp-badge')).toHaveText('BUSY');
+  expect(await presses()).toEqual(['cancel']);
   await expect(btn(page, 'cancel')).toContainText('TAP TO CANCEL');
   await expectVisual(page, 'cancel', 'running');
   await f.tap('cancel');
-  await expectVisual(page, 'cancel', 'failure');
-  await expect(btn(page, 'cancel')).toContainText('CANCELLED');
+  await expectVisual(page, 'cancel', 'stopped');
+  await expect(btn(page, 'cancel')).toContainText('STOPPED');
+  expect(await count(VIB.failure)).toBe(0);
 });
 
 test('the demo answers presses like the host: cancelling while cancelling, ignored past the start limit', async ({ page }) => {
@@ -321,7 +340,7 @@ test('the demo answers presses like the host: cancelling while cancelling, ignor
 
 test('ignored on a READY button (the host is refusing starts for now) reads BUSY — TRY AGAIN', async ({ page }) => {
   await page.evaluate(() => {
-    (window.__buttpad!.backend as unknown as { press(p: string, b: string, onSent?: () => void): Promise<string> }).press = (_p, _b, onSent) => (onSent?.(), Promise.resolve('ignored'));
+    (window.__buttpad!.backend as unknown as { press(p: string, b: string, o?: { onSent?(): void }): Promise<string> }).press = (_p, _b, o) => (o?.onSent?.(), Promise.resolve('ignored'));
   });
   await f.tap('tap');
   await expect(btn(page, 'tap')).toHaveAttribute('data-flash', 'later');

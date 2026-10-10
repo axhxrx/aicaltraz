@@ -104,6 +104,8 @@ test('confirm: first fire asks again, second fires; the window times out', async
   await expectVisual(page, 'confirm', 'ready', 3000);
   await f.hold('confirm', 450);
   await expectVisual(page, 'confirm', 'confirm');
+  // A deliberate second press: 400 ms after CONFIRM came up at the earliest (a bounce is quicker).
+  await page.waitForTimeout(450);
   await f.hold('confirm', 450);
   await expectVisual(page, 'confirm', 'running');
   await expectVisual(page, 'confirm', 'success');
@@ -172,31 +174,37 @@ test('failure shows exit code and stderr text', async ({ page }) => {
   await expect(btn(page, 'fail')).toContainText('disk full');
 });
 
-test('cancel while running: CANCELLING… then CANCELLED', async ({ page }) => {
+test('cancel while running: CANCELLING… then STOPPED (neutral, not a failure)', async ({ page }) => {
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'running');
   await expect(btn(page, 'cancel')).toContainText('TAP TO CANCEL');
   await expect(btn(page, 'cancel')).toContainText('%');
   await f.tap('cancel');
-  await expectVisual(page, 'cancel', 'failure');
-  await expect(btn(page, 'cancel')).toContainText('CANCELLED');
+  await expectVisual(page, 'cancel', 'stopped');
+  await expect(btn(page, 'cancel')).toContainText('STOPPED');
 });
 
-test('queue while running runs again', async ({ page }) => {
+test('queue while running runs again: the result shows NEXT RUN QUEUED, then the re-run', async ({ page }) => {
   await f.tap('queue');
   await expectVisual(page, 'queue', 'running');
+  // (A second tap within the button's cooldown, 400 ms, would be a bounce.)
+  await page.waitForTimeout(450);
   await f.tap('queue');
   await expect(btn(page, 'queue')).toContainText('QUEUED');
   await expectVisual(page, 'queue', 'success', 4000);
+  await expect(btn(page, 'queue')).toContainText('NEXT RUN QUEUED');
+  await expectVisual(page, 'queue', 'running', 2000);
+  await expectVisual(page, 'queue', 'success', 4000);
+  await expect(btn(page, 'queue')).not.toContainText('NEXT RUN QUEUED');
 });
 
-test('no ack within 2 s → NO RESPONSE', async ({ page }) => {
+test('no ack within 2 s → NO RESPONSE (amber, not the red failure)', async ({ page }) => {
   await page.evaluate(() => (window.__buttpad!.backend as unknown as { dropAcks(n: number): void }).dropAcks(1));
   await f.tap('tap');
   await expectVisual(page, 'tap', 'sending');
   await page.waitForTimeout(1500);
   await expectVisual(page, 'tap', 'sending');
-  await expectVisual(page, 'tap', 'failure', 2000);
+  await expectVisual(page, 'tap', 'unknown', 2000);
   await expect(btn(page, 'tap')).toContainText('NO RESPONSE');
 });
 
@@ -220,21 +228,26 @@ test('offline: grey + dashed, presses only shake; recovers on reconnect', async 
 test('a run keeps going while offline: its last-known state stays visible, and shows again after reconnecting', async ({ page }) => {
   await f.tap('slow');
   await f.tap('fail');
+  await f.tap('tap');
   await expectVisual(page, 'slow', 'running');
   await expectVisual(page, 'fail', 'failure');
+  await expectVisual(page, 'tap', 'success');
   await page.evaluate(() => (window.__buttpad!.backend as unknown as { setOnline(v: boolean): void }).setOnline(false));
   await expectVisual(page, 'slow', 'offline');
   // OFFLINE on top, the running stripes (dimmed, still) and what it was doing underneath.
   await expect(btn(page, 'slow')).toHaveAttribute('data-under', 'running');
   await expect(btn(page, 'slow').locator('.bp-stripes')).toHaveCount(1);
   await expect(btn(page, 'slow')).toContainText('OFFLINE');
-  await expect(btn(page, 'slow')).toContainText('RUNNING');
+  await expect(btn(page, 'slow')).toContainText('LAST SEEN RUNNING');
   await expect(btn(page, 'fail')).toHaveAttribute('data-under', 'failure');
   await expect(btn(page, 'fail')).toContainText('LAST RUN: EXIT 2');
-  // A result runs out (resultHoldMs 1500) as it would have: then it's just OFFLINE.
-  await expect(btn(page, 'fail')).toHaveAttribute('data-under', 'ready', { timeout: 3000 });
+  // A success runs out (resultHoldMs 1000) as it would have: then it's just OFFLINE. This device's
+  // own failure stays until someone touches it.
+  await expect(btn(page, 'tap')).toHaveAttribute('data-under', 'ready', { timeout: 3000 });
+  await expect(btn(page, 'fail')).toHaveAttribute('data-under', 'failure');
   await page.evaluate(() => (window.__buttpad!.backend as unknown as { setOnline(v: boolean): void }).setOnline(true));
   await expectVisual(page, 'slow', 'running');
+  await expectVisual(page, 'fail', 'failure');
 });
 
 test('pad tabs switch pads; the last pad is remembered; ?pad and ?lock', async ({ page }) => {
@@ -253,7 +266,7 @@ test('pad tabs switch pads; the last pad is remembered; ?pad and ?lock', async (
 test('menu: device settings persist; keep-awake status is shown', async ({ page }) => {
   await page.getByTestId('menu-btn').click();
   await expect(page.getByTestId('menu')).toBeVisible();
-  await expect(page.getByTestId('keep-awake')).toContainText(/On|Waiting|Paused/);
+  await expect(page.getByTestId('keep-awake')).toContainText(/Keeping the screen on|Tap anywhere|Paused/);
   const sound = page.getByTestId('toggle-sound');
   await expect(sound).toHaveAttribute('aria-checked', 'false');
   await sound.click();

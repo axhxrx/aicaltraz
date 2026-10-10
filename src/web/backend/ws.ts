@@ -12,13 +12,19 @@
  *
  * Every socket has its own pending presses and timers (Conn), and every handler first checks that
  * its socket is still the current one: a stale socket's late events can't touch a newer one.
+ *
+ * Every press carries `at`: when it was made, in the host's clock (the offset is learned from each
+ * hello's serverNow, and kept with a clock the device's clock setting can't move, lib/clock.ts).
+ * A press that sat in a dead link for seconds is dropped by the host (`expired`) instead of
+ * running late.
  */
 import type { Config } from '../../core/config.ts';
-import type { PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
+import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
+import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { emptySnapshot, MAX_CONFIG_BYTES, PressError, TOO_LARGE, type Backend, type SaveResult, type Snapshot } from './types.ts';
+import { emptySnapshot, MAX_CONFIG_BYTES, PressError, TOO_LARGE, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
 
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 5000;
@@ -27,8 +33,14 @@ const BACKOFF_MAX = 5000;
  * its hello doesn't: a host (or proxy) that closes every socket must not be hammered.
  */
 const STABLE_AFTER = 10_000;
-/** No hello by then → dead. */
+/**
+ * No hello by then → dead. Doubles after each socket that died waiting (up to HELLO_TIMEOUT_MAX):
+ * a big config over a slow link takes longer than 5 s to arrive, and must get there eventually.
+ */
 const HELLO_TIMEOUT = 5000;
+const HELLO_TIMEOUT_MAX = 60_000;
+/** Offline and someone touched a button: a connection attempt older than this is given up for a new one. */
+const KICK_STALE_CONNECT = 1500;
 /** Visible and not a single frame for this long → probe. */
 const IDLE_PROBE = 5000;
 /** How long a probe waits for a frame. */
@@ -47,7 +59,7 @@ const SAVE_TIMEOUT = 10_000;
 const GET_TIMEOUT = 5000;
 
 interface Pending {
-  resolve: (r: PressResult) => void;
+  resolve: (a: PressAck) => void;
   reject: (e: Error) => void;
 }
 
@@ -55,7 +67,8 @@ interface Pending {
 interface Conn {
   ws: WebSocket;
   greeted: boolean;
-  /** mono() of the hello. */
+  /** mono() when it was opened, and of the hello. */
+  openedAt: number;
   greetedAt: number;
   /** mono() of the last frame from the host. */
   lastFrame: number;
@@ -85,6 +98,8 @@ export class WsBackend implements Backend {
   private seq = 0;
   private disposed = false;
   private hiddenAt = 0;
+  /** Sockets in a row that died waiting for their hello. */
+  private helloMisses = 0;
   private readonly offs: (() => void)[] = [];
 
   constructor(
@@ -138,9 +153,15 @@ export class WsBackend implements Backend {
     } catch {
       return this.scheduleRetry(null);
     }
-    const c: Conn = { ws, greeted: false, greetedAt: 0, lastFrame: mono(), pending: new Map(), pings: 0, probeDeadline: 0, probeSentAt: 0 };
+    const c: Conn = { ws, greeted: false, openedAt: mono(), greetedAt: 0, lastFrame: mono(), pending: new Map(), pings: 0, probeDeadline: 0, probeSentAt: 0 };
     this.conn = c;
-    c.helloTimer = setTimeout(() => this.lost(c), HELLO_TIMEOUT);
+    c.helloTimer = setTimeout(
+      () => {
+        this.helloMisses++;
+        this.lost(c);
+      },
+      Math.min(HELLO_TIMEOUT_MAX, HELLO_TIMEOUT * 2 ** this.helloMisses),
+    );
     ws.onmessage = (ev) => {
       if (this.conn === c) this.onFrame(c, ev.data);
     };
@@ -163,6 +184,7 @@ export class WsBackend implements Backend {
       c.greeted = true;
       c.greetedAt = mono();
       this.everGreeted = true;
+      this.helloMisses = 0;
       clearTimeout(c.helloTimer);
     }
     this.onMessage(c, msg);
@@ -224,6 +246,8 @@ export class WsBackend implements Backend {
   private lost(c: Conn) {
     if (this.conn !== c || this.disposed) return;
     this.drop(c);
+    // What the host was last seen doing is as of its last frame (the OFFLINE look freezes there).
+    if (c.greeted) this.patch({ lastSeen: wall() - (mono() - c.lastFrame) });
     this.scheduleRetry(c);
   }
 
@@ -238,8 +262,8 @@ export class WsBackend implements Backend {
   private scheduleRetry(c: Conn | null) {
     if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
     if (c?.greeted && mono() - c.greetedAt >= STABLE_AFTER) this.failures = 0;
-    // Browsers hide the HTTP status of a refused upgrade: ask over HTTP whether it was a 401.
-    if (!c?.greeted) void this.probeHttp();
+    // Browsers hide the HTTP status of a refused upgrade: ask over HTTP whether it was a 401 (or a 503).
+    if (!c?.greeted) void this.probeHttp(true);
     const attempt = this.failures++;
     const delay = attempt === 0 ? 0 : Math.round(Math.min(BACKOFF_MAX, BACKOFF_MIN * 2 ** (attempt - 1)) * (0.8 + Math.random() * 0.4));
     // Grace for the very first attempt at startup; after that, say it: offline.
@@ -250,9 +274,10 @@ export class WsBackend implements Backend {
 
   /**
    * The HTTP side: a rejected token (401/403) means stop and say so. Otherwise, while the socket
-   * isn't up, the host's states (and the layout, if none is cached) come from here.
+   * isn't up, the host's states (and the layout, if none is cached) come from here. After a socket
+   * that never got its hello (`failed`): was it turned away because the host is full (503)?
    */
-  private async probeHttp() {
+  private async probeHttp(failed = false) {
     const live = () => this.disposed || this.snapshot.get().status === 'online';
     try {
       const r = await this.http('GET', '/api/state');
@@ -263,10 +288,15 @@ export class WsBackend implements Backend {
         return;
       }
       if (!r.ok || live()) return;
+      // A plain GET of /ws gets the answer the upgrade got (426 "expected a WebSocket upgrade" when there's room).
+      if (failed) {
+        const full = (await this.http('GET', `/ws?token=${encodeURIComponent(this.token)}`).catch(() => null))?.status === 503;
+        if (!live() && full !== this.snapshot.get().hostFull) this.patch({ hostFull: full });
+      }
       const j = (await r.json()) as { states?: StateMap; serverNow?: number };
       // The socket got there first: its picture is the fresher one.
       if (live() || !j.states) return;
-      this.patch({ states: j.states, ...(typeof j.serverNow === 'number' ? { clockSkew: Date.now() - j.serverNow } : {}) });
+      this.patch({ states: j.states, ...(typeof j.serverNow === 'number' ? { clockSkew: wall() - j.serverNow } : {}) });
       if (this.snapshot.get().config) return;
       const rc = await this.http('GET', '/api/config');
       const jc = rc.ok ? ((await rc.json()) as { config?: WireConfig; rev?: string }) : null;
@@ -286,14 +316,26 @@ export class WsBackend implements Backend {
           config: m.config,
           rev: m.rev,
           states: m.states,
-          clockSkew: Date.now() - m.serverNow,
+          clockSkew: wall() - m.serverNow,
           host: m.host,
           retryAt: null,
+          // A v1 host has no latched state.
+          latched: m.latched ?? {},
+          hostFull: false,
+          lastSeen: null,
         });
         this.cache(m.config, m.rev);
         break;
       case 'state':
         this.snapshot.set((s) => ({ ...s, states: { ...s.states, [m.key]: m.state } }));
+        break;
+      case 'latched':
+        this.snapshot.set((s) => {
+          const latched = { ...s.latched };
+          if (m.text === null || m.text === '') delete latched[m.key];
+          else latched[m.key] = m.text;
+          return { ...s, latched };
+        });
         break;
       case 'config':
         this.patch({ config: m.config, rev: m.rev, configErrors: null });
@@ -302,7 +344,7 @@ export class WsBackend implements Backend {
       case 'ack': {
         const p = c.pending.get(m.id);
         c.pending.delete(m.id);
-        p?.resolve(m.result);
+        p?.resolve(m.runId === undefined ? { result: m.result } : { result: m.result, runId: m.runId });
         break;
       }
       case 'configError':
@@ -319,21 +361,29 @@ export class WsBackend implements Backend {
     lsSet(KEYS.configCache, JSON.stringify({ config: redact(config), rev } satisfies Cached));
   }
 
-  press(pad: string, button: string, onSent?: () => void): Promise<PressResult> {
+  press(pad: string, button: string, opts: PressOpts = {}): Promise<PressResult> {
     const c = this.conn;
     // Closed under us, its close event not in yet: that's offline now.
     if (c?.greeted && c.ws.readyState !== WebSocket.OPEN) this.lost(c);
     if (this.snapshot.get().status !== 'online' || this.conn !== c || !c?.greeted) return Promise.reject(new PressError(false, 'not connected to the host'));
     const id = `${Date.now().toString(36)}${(++this.seq).toString(36)}`;
+    // When it was made, in the host's clock: the host drops it if it got there too late.
+    const msg: ClientMsg = { t: 'press', id, pad, button, at: Math.round(wall() - this.snapshot.get().clockSkew), ...(opts.confirm ? { confirm: true } : {}) };
     return new Promise((resolve, reject) => {
       try {
-        c.ws.send(JSON.stringify({ t: 'press', id, pad, button }));
+        c.ws.send(JSON.stringify(msg));
       } catch (e) {
         return reject(new PressError(false, e instanceof Error ? e.message : String(e)));
       }
-      c.pending.set(id, { resolve, reject });
+      c.pending.set(id, {
+        resolve: (ack) => {
+          opts.onAck?.(ack);
+          resolve(ack.result);
+        },
+        reject,
+      });
       const sentAt = mono();
-      onSent?.();
+      opts.onSent?.();
       // No ack, and not one frame since: check the link now rather than at the next idle probe.
       setTimeout(() => this.conn === c && c.pending.has(id) && c.lastFrame < sentAt && this.probe(c, QUICK_PROBE_TIMEOUT), PRESS_DOUBT_AFTER);
     });
@@ -343,7 +393,9 @@ export class WsBackend implements Backend {
     // Never drops a socket that still answers (one that just said hello, say): it only checks.
     const c = this.conn;
     if (c?.greeted) this.probe(c, QUICK_PROBE_TIMEOUT);
-    else if (!c) this.connectNow();
+    // Offline, waiting for the next retry, or stuck opening a socket that should be open by now (one
+    // that is open and waiting for a slow hello is left to it): go now.
+    else if (!c || (c.ws.readyState === WebSocket.CONNECTING && mono() - c.openedAt > KICK_STALE_CONNECT)) this.connectNow();
   }
 
   private async http(method: string, path: string, body?: string, signal?: AbortSignal): Promise<Response> {
@@ -367,8 +419,8 @@ export class WsBackend implements Backend {
       const j = (await r.json().catch((e: unknown) => {
         if (ctl.signal.aborted) throw e;
         return {};
-      })) as { rev?: string; errors?: string[]; error?: string; invalid?: boolean };
-      if (r.ok && j.rev) return { ok: true, rev: j.rev };
+      })) as { rev?: string; errors?: string[]; error?: string; invalid?: boolean; warnings?: unknown };
+      if (r.ok && j.rev) return { ok: true, rev: j.rev, ...(Array.isArray(j.warnings) && j.warnings.length ? { warnings: j.warnings.map(String) } : {}) };
       if (r.status === 400) return { ok: false, kind: 'invalid', errors: j.errors ?? ['invalid config'] };
       if (r.status === 409) return { ok: false, kind: 'conflict', rev: j.rev ?? '', ...(j.invalid ? { invalid: true, errors: j.errors ?? [] } : {}) };
       if (r.status === 413) return { ok: false, kind: 'error', message: TOO_LARGE };

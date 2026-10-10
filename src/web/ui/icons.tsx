@@ -41,3 +41,15 @@ export const Pencil = (p: P) => svg(p, <path d="M4 20l1-4.5L16 4.5l3.5 3.5L8.5 1
 export const Link = (p: P) =>
   svg(p, <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" stroke-width="2.2" />);
 export const Bolt = (p: P) => svg(p, <path d="M13 2.5L4.5 13.5H11l-1 8 8.5-11H12z" fill="currentColor" stroke-width="1.4" />);
+/** STOPPED: a plain square. */
+export const Stop = (p: P) => svg(p, <rect x="5.5" y="5.5" width="13" height="13" rx="2" fill="currentColor" stroke="none" />);
+/** Outcome unknown (NO RESPONSE, IT RAN). */
+export const Question = (p: P) =>
+  svg(p, [<path key="q" d="M8.4 8.6a3.7 3.7 0 1 1 5.3 3.4c-1.1.6-1.7 1.4-1.7 2.6v.6" stroke-width="3" />, <circle key="d" cx="12" cy="19.6" r="0.5" stroke-width="3.2" />]);
+/** The host stopped mid-run. */
+export const Interrupted = (p: P) => svg(p, [<path key="z" d="M13.5 2.8L6 13.2h5.6L10 21.2l8-11.2h-5.7z" stroke-width="2.4" />]);
+/** A run started on another device. */
+export const Devices = (p: P) =>
+  svg(p, [<rect key="a" x="2.8" y="5" width="9.5" height="14.5" rx="1.8" stroke-width="2.2" />, <rect key="b" x="14.6" y="8.4" width="6.6" height="11.1" rx="1.5" stroke-width="2.2" />]);
+/** The screen may sleep. */
+export const Moon = (p: P) => svg(p, <path d="M19.5 14.6A8 8 0 0 1 9.4 4.5a8 8 0 1 0 10.1 10.1z" fill="currentColor" stroke-width="1.6" />);

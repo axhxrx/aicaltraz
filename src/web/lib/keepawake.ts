@@ -17,6 +17,16 @@ export interface AwakeStatus {
 
 export const awake = createStore<AwakeStatus>({ mode: 'none', active: false, note: 'Starting…' });
 
+/** Menu notes, in plain words. */
+const NOTE = {
+  wakelock: 'Keeping the screen on',
+  video: 'Keeping the screen on (video trick — plain-HTTP pages can’t use Wake Lock)',
+  paused: 'Paused: tap anywhere to keep the screen on',
+  waiting: 'Tap anywhere to keep the screen on',
+  released: 'Keeping the screen on (resumes when you come back to this page)',
+  off: 'Off: the screen may go dark and lock',
+};
+
 let sentinel: WakeLockSentinel | null = null;
 let video: HTMLVideoElement | null = null;
 let gestureArmed = false;
@@ -46,10 +56,10 @@ function ensureVideo(): HTMLVideoElement {
     s.type = type;
     v.append(s);
   }
-  v.addEventListener('playing', () => wantAwake() && set('video', true, 'On · video fallback (no Wake Lock on this page)'));
+  v.addEventListener('playing', () => wantAwake() && set('video', true, NOTE.video));
   v.addEventListener('pause', () => {
     if (awake.get().mode === 'video' && wantAwake() && document.visibilityState === 'visible') {
-      set('video', false, 'Paused · tap anywhere to resume');
+      set('video', false, NOTE.paused);
       armGesture();
     }
   });
@@ -88,17 +98,17 @@ function armGesture() {
 }
 
 async function acquire(): Promise<void> {
-  if (!wantAwake()) return set('none', false, 'Off');
+  if (!wantAwake()) return set('none', false, NOTE.off);
   if (document.visibilityState !== 'visible') return;
   if ('wakeLock' in navigator && window.isSecureContext) {
     if (sentinel && !sentinel.released) return;
     try {
       sentinel = await navigator.wakeLock.request('screen');
       video?.pause();
-      set('wakelock', true, 'On · Wake Lock');
+      set('wakelock', true, NOTE.wakelock);
       sentinel.addEventListener('release', () => {
         sentinel = null;
-        if (wantAwake()) set('wakelock', false, 'Released · re-acquiring when visible');
+        if (wantAwake()) set('wakelock', false, NOTE.released);
         if (document.visibilityState === 'visible') void acquire();
       });
       return;
@@ -107,11 +117,11 @@ async function acquire(): Promise<void> {
     }
   }
   const v = ensureVideo();
-  if (!v.paused) return set('video', true, 'On · video fallback (no Wake Lock on this page)');
+  if (!v.paused) return set('video', true, NOTE.video);
   try {
     await v.play();
   } catch {
-    set('video', false, 'Waiting · tap anywhere to activate');
+    set('video', false, NOTE.waiting);
     armGesture();
   }
 }
@@ -120,7 +130,7 @@ function release() {
   void sentinel?.release().catch(() => {});
   sentinel = null;
   video?.pause();
-  set('none', false, 'Off');
+  set('none', false, NOTE.off);
 }
 
 /** Idempotent; follows the device setting from then on. */

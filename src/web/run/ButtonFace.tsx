@@ -2,18 +2,19 @@
  * The pure visual of one button: a ButtonVM in, DOM out. No input handling of its own (handlers
  * are passed through), so edit mode can render the same face with a static READY vm.
  */
-import { Fragment, type HTMLAttributes } from 'preact';
+import { Fragment, type HTMLAttributes, type JSX } from 'preact';
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
+import { wall } from '../lib/clock.ts';
 import { inkFor } from '../lib/color.ts';
 import { fmtElapsed } from '../lib/env.ts';
 import { chunks, fitFontSize, langOf, lineFontSize, lineWidths, useFontEpoch } from '../lib/fit.ts';
-import { Check, Cross, DoubleTap, Hold, Keyboard, Lock, Tap, Warn } from '../ui/icons.tsx';
+import { Check, Cross, Devices, DoubleTap, Hold, Interrupted, Keyboard, Lock, Question, Stop, Tap, Warn } from '../ui/icons.tsx';
 import type { FlashKind } from './controller.ts';
-import type { ButtonVM } from './view.ts';
+import { holdChip, isResult, verbOf, type ButtonVM, type Visual } from './view.ts';
 
 export interface FaceProps extends Omit<HTMLAttributes<HTMLDivElement>, 'style' | 'class'> {
   vm: ButtonVM;
-  /** Local clock for elapsed/countdowns. */
+  /** Local clock (lib/clock.ts wall()) for elapsed/countdowns. */
   now: number;
   class?: string;
   style?: Record<string, string>;
@@ -25,6 +26,9 @@ const calm = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-mot
 /** Pop/shake are decoration; the fill, flash and colors carry the meaning, so they stay. */
 const move = (el: HTMLElement | null, k: Keyframe[], o: KeyframeAnimationOptions) => !calm?.matches && el?.animate(k, o);
 
+/** Longest text rendered (labels are ≤ 200 characters by the schema; anything longer is cut). */
+const MAX_TEXT = 400;
+
 /**
  * Multi-line text sized to its box (see lib/fit.ts); `weight` must match the CSS. It is laid out
  * from the same chunks it was measured with: a space or a <wbr> between two, and no other breaks
@@ -32,10 +36,11 @@ const move = (el: HTMLElement | null, k: Keyframe[], o: KeyframeAnimationOptions
  */
 function Fit({ text, class: cls, weight = 900, lines }: { text: string; class: string; weight?: number; lines?: number }) {
   useFontEpoch();
-  const parts = useMemo(() => chunks(text), [text]);
+  const shown = text.length > MAX_TEXT ? `${text.slice(0, MAX_TEXT)}…` : text;
+  const parts = useMemo(() => chunks(shown), [shown]);
   if (!parts.length) return null;
   return (
-    <div class={cls} lang={langOf(text)} style={{ fontSize: fitFontSize(text, weight, lines) }}>
+    <div class={cls} lang={langOf(shown)} style={{ fontSize: fitFontSize(shown, weight, lines) }}>
       {parts.map((c, i) => (
         <Fragment key={i}>
           {i === 0 ? null : c.spaced ? ' ' : <wbr />}
@@ -46,9 +51,9 @@ function Fit({ text, class: cls, weight = 900, lines }: { text: string; class: s
   );
 }
 
-const Sub = ({ text }: { text: string }) => <Fit class="bp-sub" text={text} weight={700} lines={2} />;
+const Sub = ({ text, class: cls = '' }: { text: string; class?: string }) => <Fit class={`bp-sub${cls ? ` ${cls}` : ''}`} text={text} weight={700} lines={2} />;
 
-/** One line that shrinks to fit the width: clock, %, pill, failure title. */
+/** One line that shrinks to fit the width: clock, %, pill. */
 function Line({ text, class: cls, extraEm = 0, trackEm = 0 }: { text: string; class: string; extraEm?: number; trackEm?: number }) {
   useFontEpoch();
   return (
@@ -58,26 +63,62 @@ function Line({ text, class: cls, extraEm = 0, trackEm = 0 }: { text: string; cl
   );
 }
 
-const verb = (t: ButtonVM['trigger']) => (t === 'hold' ? 'HOLD' : t === 'tap' ? 'TAP' : 'DOUBLE-TAP');
-
 function Hints({ vm }: { vm: ButtonVM }) {
   const T = vm.trigger === 'hold' ? Hold : vm.trigger === 'tap' ? Tap : DoubleTap;
+  // HOLD 1.5s: on a narrow button the word goes first (the icon says it), the duration stays.
+  const [word, extra] = vm.trigger === 'hold' ? [holdChip(vm.holdMs).slice(0, 4), holdChip(vm.holdMs).slice(4)] : [vm.trigger === 'tap' ? 'TAP' : '2× TAP', ''];
   return (
     <div class="bp-hints">
-      <span class="bp-chip">
+      <span class={`bp-chip bp-trigger${extra ? ' has-extra' : ''}${vm.trigger === 'double' ? ' is-double' : ''}`}>
         <T />
-        {vm.trigger === 'hold' ? 'HOLD' : vm.trigger === 'tap' ? 'TAP' : '2× TAP'}
+        <span class="bp-chip-text">
+          <span class="bp-chip-word">{word}</span>
+          {extra}
+        </span>
         {vm.confirm && <Lock />}
       </span>
       {vm.keyHint && (
         <span class="bp-chip bp-key">
           <Keyboard />
-          {vm.keyHint}
+          <span class="bp-chip-text">{vm.keyHint}</span>
         </span>
       )}
     </div>
   );
 }
+
+const LAST_GLYPH = { ok: '✓', bad: '✗', stopped: '■', warn: '!' } as const;
+
+/** The top edge: another device's run, or how the last run ended (left); latched device state (right). */
+function TopBand({ vm }: { vm: ButtonVM }) {
+  const left = vm.other ? (
+    <span class="bp-mark bp-other" data-testid={`other-${vm.id}`}>
+      <Devices />
+      <span class="bp-chip-text">OTHER DEVICE</span>
+    </span>
+  ) : vm.last ? (
+    <span class={`bp-mark bp-last is-${vm.last.tone}`} data-testid={`last-${vm.id}`}>
+      <i>{LAST_GLYPH[vm.last.tone]}</i>
+      <span class="bp-chip-text">
+        <span class="bp-long">{vm.last.ago}</span>
+        <span class="bp-short">{vm.last.ago.replace(/ (\w) ago$/, '$1')}</span>
+      </span>
+    </span>
+  ) : null;
+  if (!left && !vm.latched) return null;
+  return (
+    <div class="bp-top">
+      {left ?? <span />}
+      {vm.latched && (
+        <span class="bp-latched" data-testid={`latched-${vm.id}`}>
+          {vm.latched}
+        </span>
+      )}
+    </div>
+  );
+}
+
+const GLYPH: Partial<Record<Visual, (p: { class?: string }) => JSX.Element>> = { failure: Cross, stopped: Stop, unknown: Question, interrupted: Interrupted };
 
 function Content({ vm, now }: { vm: ButtonVM; now: number }) {
   const label = <Fit class="bp-label" text={vm.label} />;
@@ -87,6 +128,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
       return (
         <>
           {label}
+          {vm.doubleWait && <Line class="bp-pill bp-again" text="TAP AGAIN" extraEm={1.9} trackEm={0.07} />}
           <Hints vm={vm} />
         </>
       );
@@ -94,7 +136,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
       return (
         <>
           {label}
-          <Fit class="bp-head" text={`${verb(vm.trigger)} AGAIN TO CONFIRM`} />
+          <Fit class="bp-head" text={`${vm.confirmVerb ?? verbOf(vm.trigger)} AGAIN TO CONFIRM`} />
         </>
       );
     case 'sending':
@@ -108,7 +150,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
       const elapsed = fmtElapsed(now - (vm.startedAt ?? now));
       const det = vm.progress !== undefined;
       const sub = [vm.status, det ? elapsed : null].filter(Boolean).join(' · ');
-      const pill = vm.cancelling ? 'CANCELLING…' : vm.queued ? '+1 QUEUED' : vm.cancelHint ? `${verb(vm.trigger)} TO CANCEL` : null;
+      const pill = vm.cancelling ? 'CANCELLING…' : vm.queued ? '+1 QUEUED' : vm.cancelHint ? `${verbOf(vm.trigger)} TO CANCEL` : null;
       return (
         <>
           {label}
@@ -125,27 +167,34 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
           {label}
           <Check class="bp-icon" />
           {vm.text && <Sub text={vm.text} />}
-          <div class="bp-time">{fmtElapsed((vm.endedAt ?? 0) - (vm.startedAt ?? 0))}</div>
+          {vm.nextQueued ? <NextQueued /> : vm.elapsedMs !== undefined && <div class="bp-time">{fmtElapsed(vm.elapsedMs)}</div>}
         </>
       );
     case 'failure':
+    case 'stopped':
+    case 'unknown':
+    case 'interrupted': {
+      const G = GLYPH[vm.visual]!;
       return (
         <>
           {label}
-          <Cross class="bp-icon" />
-          <Line class="bp-title" text={vm.title ?? ''} trackEm={0.02} />
-          {vm.text && <Sub text={vm.text} />}
+          <G class="bp-icon" />
+          {vm.title && <Fit class="bp-headline" text={vm.title} lines={2} />}
+          {vm.detail && <Sub class="bp-detail" text={vm.detail} />}
+          {vm.nextQueued ? <NextQueued /> : vm.sticky && <div class="bp-sticky">{vm.trigger === 'hold' ? 'HOLD TO RETRY' : 'TAP TO CLEAR'}</div>}
         </>
       );
+    }
     case 'offline': {
       // What the host was last seen doing (its look stays underneath, dimmed and still).
+      const u = vm.under;
       const was =
-        vm.under === 'running'
-          ? `RUNNING · ${vm.progress !== undefined ? `${Math.round(vm.progress)}%` : fmtElapsed(now - (vm.startedAt ?? now))}`
-          : vm.under === 'success'
+        u === 'running'
+          ? `LAST SEEN RUNNING${vm.progress !== undefined ? ` · ${Math.round(vm.progress)}%` : vm.seenElapsed !== undefined ? ` · ${fmtElapsed(vm.seenElapsed)}` : ''}`
+          : u === 'success'
             ? 'LAST RUN OK'
-            : vm.under === 'failure'
-              ? `LAST RUN: ${vm.title ?? 'FAILED'}`
+            : isResult(u)
+              ? `LAST RUN: ${vm.code ?? vm.title ?? 'FAILED'}`
               : null;
       return (
         <>
@@ -159,6 +208,8 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
   }
 }
 
+const NextQueued = () => <div class="bp-next">NEXT RUN QUEUED</div>;
+
 const Dots = () => (
   <div class="bp-dots" aria-hidden="true">
     <i />
@@ -168,16 +219,41 @@ const Dots = () => (
 );
 
 /** Flash badges: [big word, smaller second line]. */
-const BADGE: Partial<Record<FlashKind, [string, string?]>> = {
-  busy: ['BUSY'],
-  later: ['BUSY', 'TRY AGAIN'],
-  unknown: ['NOT ON HOST'],
-  notsent: ['NOT SENT'],
-  ran: ['IT RAN'],
-};
-const SHAKES: FlashKind[] = ['busy', 'later', 'denied', 'notsent'];
+function badgeOf(kind: FlashKind, vm: ButtonVM): [string, string?] | undefined {
+  switch (kind) {
+    case 'busy':
+    case 'cooldown':
+      return ['BUSY'];
+    case 'later':
+      return ['BUSY', 'TRY AGAIN'];
+    case 'already':
+      return ['ALREADY', 'RUNNING'];
+    case 'queued':
+      return ['ALREADY', 'QUEUED'];
+    case 'unknown':
+      return ['NOT ON HOST'];
+    case 'slipped':
+      return ['SLIPPED', `${verbOf(vm.trigger)} AGAIN`];
+    case 'denied':
+      return undefined;
+  }
+}
+const SHAKES: FlashKind[] = ['busy', 'later', 'denied', 'already'];
 /** As big as the button allows: the word (plus padding) fits 88% of the width. */
 const badgeSize = (word: string) => `clamp(12px, min(17cqh, calc(88cqw / ${((lineWidths(word)[0] ?? 3) + 1.1 + 0.04 * word.length).toFixed(3)})), 110px)`;
+
+/** Forced-colors mode paints every face the same: the state goes in words too. */
+const FC_WORD: Partial<Record<Visual, string>> = {
+  confirm: 'CONFIRM?',
+  sending: 'SENDING',
+  running: 'RUNNING',
+  success: 'DONE',
+  failure: 'FAILED',
+  stopped: 'STOPPED',
+  unknown: 'UNKNOWN',
+  interrupted: 'INTERRUPTED',
+  offline: 'OFFLINE',
+};
 
 export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
   const face = useRef<HTMLDivElement>(null);
@@ -192,7 +268,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
     if (!el || !vm.arming) return;
     armAnim.current?.cancel();
     const a = el.animate([{ transform: 'translateY(100%)', opacity: 1 }, { transform: 'translateY(0)', opacity: 1 }], { duration: vm.arming.ms, easing: 'linear', fill: 'forwards' });
-    a.currentTime = Math.min(vm.arming.ms, Math.max(0, Date.now() - vm.arming.at));
+    a.currentTime = Math.min(vm.arming.ms, Math.max(0, wall() - vm.arming.at));
     armAnim.current = a;
   }, [vm.arming?.at]);
 
@@ -212,7 +288,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
 
   // Fired: pop + flash, and the full fill fades away.
   useLayoutEffect(() => {
-    if (!vm.firedAt || Date.now() - vm.firedAt > 400) return;
+    if (!vm.firedAt || wall() - vm.firedAt > 400) return;
     move(face.current, POP, { duration: 320, easing: 'cubic-bezier(.2,.8,.3,1)' });
     flash.current?.animate([{ opacity: 0.65 }, { opacity: 0 }], { duration: 420, easing: 'ease-out' });
     const el = arm.current;
@@ -222,48 +298,55 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
     }
   }, [vm.firedAt]);
 
-  // BUSY / pressed while offline / not sent: shake.
+  // BUSY / pressed while offline / someone else's run: shake.
   useLayoutEffect(() => {
     if (vm.flash && SHAKES.includes(vm.flash.kind)) move(face.current, SHAKE, { duration: 420, easing: 'ease-out' });
   }, [vm.flash?.at]);
 
   // Countdown bars: start where the host (or the confirm window) says they started.
   const drain = useMemo(() => {
-    if ((v === 'success' || v === 'failure') && vm.endedAt !== undefined && vm.resultHoldMs)
-      return { kind: 'result', duration: vm.resultHoldMs, delay: Math.min(0, vm.endedAt - Date.now()) };
-    if (v === 'confirm' && vm.confirmUntil && vm.confirmMs) return { kind: 'confirm', duration: vm.confirmMs, delay: Math.min(0, vm.confirmUntil - vm.confirmMs - Date.now()) };
+    if (isResult(v) && vm.endedAt !== undefined && vm.resultHoldMs) return { kind: 'result', duration: vm.resultHoldMs, delay: Math.min(0, vm.endedAt - wall()) };
+    if (v === 'confirm' && vm.confirmUntil && vm.confirmMs) return { kind: 'confirm', duration: vm.confirmMs, delay: Math.min(0, vm.confirmUntil - vm.confirmMs - wall()) };
     return null;
-  }, [v, vm.endedAt, vm.confirmUntil]);
+  }, [v, vm.endedAt, vm.confirmUntil, vm.resultHoldMs]);
 
   const ink = inkFor(vm.color);
   // Offline: the last-known state's layers stay, under the OFFLINE look.
   const u = v === 'offline' ? vm.under : v;
-  const badge = vm.flash ? BADGE[vm.flash.kind] : undefined;
+  const badge = vm.flash ? badgeOf(vm.flash.kind, vm) : undefined;
+  const top = !!(vm.latched || vm.last || vm.other);
   return (
     <div
-      class={`bp-btn${cls ? ` ${cls}` : ''}`}
+      class={`bp-btn${cls ? ` ${cls}` : ''}${top ? ' has-top' : ''}`}
       data-visual={v}
       data-under={v === 'offline' ? vm.under : undefined}
       data-testid={`btn-${vm.id}`}
       data-flash={vm.flash?.kind}
+      data-sticky={vm.sticky ? '' : undefined}
       role="button"
-      aria-label={`${vm.label || vm.id}: ${v}${v === 'offline' && vm.under && vm.under !== 'ready' ? ` (last seen ${vm.under})` : ''}`}
+      aria-label={`${vm.label || vm.id}: ${v}${vm.title ? ` (${vm.title})` : ''}${v === 'offline' && vm.under && vm.under !== 'ready' ? ` (last seen ${vm.under})` : ''}${vm.latched ? `, ${vm.latched}` : ''}`}
       style={{ '--bg': vm.color, '--ink': ink, ...style }}
       {...rest}
     >
       <div ref={face} class={`bp-face${vm.pressed ? ' is-pressed' : ''}`}>
         <div class="bp-base" />
-        {u === 'running' && vm.progress === undefined && <div class="bp-stripes" />}
+        {u === 'running' && <div class={`bp-stripes${vm.progress !== undefined ? ' is-under' : ''}`} />}
         {u === 'running' && vm.progress !== undefined && <div class="bp-prog" style={{ '--p': String(vm.progress / 100) }} />}
-        {(v === 'success' || v === 'failure') && <div key={`${v}${vm.endedAt}`} class="bp-flood" />}
-        {v === 'offline' && (u === 'success' || u === 'failure') && <div class={`bp-tint is-${u}`} />}
-        {v === 'failure' && <div class="bp-pulse" />}
+        {isResult(v) && <div key={`${v}${vm.endedAt}`} class="bp-flood" />}
+        {v === 'offline' && isResult(u) && <div class={`bp-tint is-${u}`} />}
+        {(v === 'failure' || v === 'interrupted') && <div class="bp-pulse" />}
         <div ref={arm} class="bp-arm" />
         <div ref={flash} class="bp-flash" />
-        {(v === 'confirm' || v === 'offline') && <div class="bp-frame" />}
+        {(v === 'confirm' || v === 'offline' || v === 'unknown' || v === 'interrupted') && <div class="bp-frame" />}
+        <TopBand vm={vm} />
         <div class="bp-content">
           <Content vm={vm} now={now} />
         </div>
+        {FC_WORD[v] && (
+          <span class="bp-fc" aria-hidden="true">
+            {FC_WORD[v]}
+          </span>
+        )}
         {vm.doubleWait && (
           <div class="bp-pips" aria-hidden="true">
             <i />
@@ -272,7 +355,7 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
         )}
         {drain && <div key={`${drain.kind}${vm.endedAt ?? vm.confirmUntil}`} class={`bp-drain bp-drain-${drain.kind}`} style={{ animationDuration: `${drain.duration}ms`, animationDelay: `${drain.delay}ms` }} />}
         {vm.flash && badge && (
-          <div key={vm.flash.at} class="bp-badge" style={{ fontSize: badgeSize(badge[0]) }}>
+          <div key={vm.flash.at} class={`bp-badge${isResult(v) ? ' is-small' : ''}`} style={{ fontSize: isResult(v) ? undefined : badgeSize(badge[0]), animationDuration: `${vm.flash.ms ?? 1200}ms` }}>
             {badge[0]}
             {badge[1] && <small>{badge[1]}</small>}
           </div>

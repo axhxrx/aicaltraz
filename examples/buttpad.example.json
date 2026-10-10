@@ -10,7 +10,7 @@
       "id": "lights",
       "name": "Lights",
       "cols": 3,
-      "rows": 3,
+      "rows": 4,
       "buttons": [
         {
           "id": "all-on",
@@ -36,6 +36,10 @@
           "color": "#3d405b",
           "x": 2,
           "y": 0,
+          "confirm": true,
+          "stops": [
+            "lights/*"
+          ],
           "key": "0",
           "action": {
             "type": "exec",
@@ -49,7 +53,7 @@
         {
           "id": "key-80",
           "label": "Key 80%",
-          "color": "#f4a261",
+          "color": "#ffd166",
           "x": 0,
           "y": 1,
           "trigger": "tap",
@@ -113,7 +117,7 @@
         {
           "id": "back-30",
           "label": "Back 30%",
-          "color": "#2a9d8f",
+          "color": "#4895ef",
           "x": 1,
           "y": 2,
           "trigger": "tap",
@@ -124,6 +128,36 @@
               "back",
               "30"
             ]
+          }
+        },
+        {
+          "id": "haze",
+          "label": "Haze 45 s",
+          "color": "#8d99ae",
+          "x": 0,
+          "y": 3,
+          "whileRunning": "cancel",
+          "action": {
+            "type": "exec",
+            "command": "./scripts/haze.sh",
+            "args": [
+              "45"
+            ]
+          }
+        },
+        {
+          "id": "stop-all",
+          "label": "STOP ALL",
+          "color": "#212529",
+          "x": 1,
+          "y": 3,
+          "w": 2,
+          "trigger": "tap",
+          "stops": [
+            "*"
+          ],
+          "action": {
+            "type": "none"
           }
         }
       ]
@@ -137,7 +171,7 @@
         {
           "id": "rec",
           "label": "● REC",
-          "color": "#d62828",
+          "color": "#5a189a",
           "x": 0,
           "y": 0,
           "w": 2,
@@ -169,7 +203,7 @@
         {
           "id": "battery",
           "label": "Battery",
-          "color": "#2a9d8f",
+          "color": "#577590",
           "x": 1,
           "y": 1,
           "trigger": "tap",
@@ -200,7 +234,7 @@
         {
           "id": "format",
           "label": "Format card",
-          "color": "#9d0208",
+          "color": "#4a4e69",
           "x": 1,
           "y": 2,
           "holdMs": 1500,
@@ -237,7 +271,7 @@
         {
           "id": "flaky",
           "label": "Flaky (30%)",
-          "color": "#fb8500",
+          "color": "#ffbe0b",
           "x": 1,
           "y": 0,
           "trigger": "tap",
@@ -261,7 +295,7 @@
         {
           "id": "slow",
           "label": "Slow 20 s (press again to cancel)",
-          "color": "#5f0f40",
+          "color": "#3f37c9",
           "x": 0,
           "y": 1,
           "whileRunning": "cancel",
@@ -273,7 +307,7 @@
         {
           "id": "timeout",
           "label": "Times out after 3 s",
-          "color": "#9a031e",
+          "color": "#560bad",
           "x": 1,
           "y": 1,
           "timeoutMs": 3000,
@@ -313,7 +347,7 @@
         {
           "id": "double",
           "label": "Double-tap me",
-          "color": "#00afb9",
+          "color": "#4cc9f0",
           "x": 1,
           "y": 2,
           "trigger": "double",
@@ -338,7 +372,7 @@
         {
           "id": "clicker",
           "label": "Clicker: PageDown",
-          "color": "#06d6a0",
+          "color": "#9b5de5",
           "x": 0,
           "y": 3,
           "w": 2,

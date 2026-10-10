@@ -12,9 +12,10 @@
  */
 import './edit.css';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { buttonKey, findButton, parseConfig, type Config } from '../../core/config.ts';
+import { buttonKey, findButton, parseConfig, type Button, type Config } from '../../core/config.ts';
 import type { WireConfig } from '../../core/protocol.ts';
 import type { Backend } from '../backend/types.ts';
+import { wall } from '../lib/clock.ts';
 import { useStore } from '../lib/store.ts';
 import { Close, Warn } from '../ui/icons.tsx';
 import { ButtonPanel, type Tab } from './ButtonPanel.tsx';
@@ -26,7 +27,8 @@ import { Dialog, typingIn } from './fields.tsx';
 import { Plus, Redo, Sliders, Undo } from './icons.tsx';
 import { merge3, type Conflict, type MergeResult, type Side } from './merge.ts';
 import { PadPanel } from './PadPanel.tsx';
-import { nameOf, rectOf, refusal } from './ops.ts';
+import type { RunAsk } from './RunLog.tsx';
+import { nameOf, rectOf, refusal, same } from './ops.ts';
 import { buttonFieldErrors, describe, padFieldErrors, toProblems, type Problem } from './problems.ts';
 
 export interface EditModeProps {
@@ -87,6 +89,7 @@ export function EditMode(p: EditModeProps) {
 }
 
 type Toast = { msg: string; tone?: 'bad'; action?: { label: string; run(): void }; at: number };
+export type Flash = { ixs: number[]; at: number; kind: 'refused' | 'added' };
 type Modal = 'leave' | 'discard' | 'delete-pad' | null;
 interface SaveOpts {
   /** Replace whatever is on the host (the user said so). */
@@ -129,15 +132,22 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const [padOpen, setPadOpen] = useState(false);
   const [tab, setTab] = useState<Tab>('button');
   const [toast, setToast] = useState<Toast | null>(null);
-  const [flash, setFlash] = useState<{ ixs: number[]; at: number } | null>(null);
+  const [flash, setFlash] = useState<Flash | null>(null);
   const [saving, setSaving] = useState(false);
   const [showProblems, setShowProblems] = useState(false);
   const [hostErrors, setHostErrors] = useState<{ list: Problem[]; draft: Config } | null>(null);
+  /** The host's warnings about the last save (`sent`: what was saved; problems index into it). */
+  const [warnings, setWarnings] = useState<{ list: Problem[]; sent: Config; shown: boolean } | null>(null);
+  /** "+N more" opened up: the file's errors, the problems list. */
+  const [moreFile, setMoreFile] = useState(false);
+  const [moreProblems, setMoreProblems] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<{ rev: string; again?: boolean; opts: SaveOpts } | null>(null);
   const [merging, setMerging] = useState<Merging | null>(null);
   const [ask, setAsk] = useState<Ask | null>(null);
   const [modal, setModal] = useState<Modal>(null);
+  /** Run now / Save & run of a `confirm` button: asked here, over everything. */
+  const [runAsk, setRunAsk] = useState<RunAsk | null>(null);
   /** The host's config as last known (socket or HTTP, own saves included). */
   const [hostNow, setHostNowState] = useState(() => ({ rev: backend.snapshot.get().rev ?? '', config: backend.snapshot.get().config as Config }));
   const hostNowRef = useRef(hostNow);
@@ -215,6 +225,18 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const problems = hostErrors?.draft === draft ? [...clientProblems, ...hostErrors.list] : clientProblems;
   const bad = useMemo(() => new Set(problems.filter((x) => x.pad === pi && x.button !== null).map((x) => x.button!)), [problems, pi]);
   const padsBad = new Set(problems.map((x) => x.pad));
+  /** The host's warnings from the last save about this draft button, by field, while what they're about is as saved. */
+  const warningsFor = (b: Button): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const w of warnings?.list ?? []) {
+      const sb = w.pad !== null && w.button !== null ? warnings!.sent.pads[w.pad]?.buttons[w.button] : undefined;
+      if (!sb || !ed.sameThing(b, sb)) continue;
+      const k = w.field ?? '';
+      if ((k.startsWith('action') ? same(b.action, sb.action) : same(b, sb)) && !out.has(k)) out.set(k, w.message);
+    }
+    return out;
+  };
+  const warned = useMemo(() => new Set(pad.buttons.flatMap((b, i) => (warningsFor(b).size ? [i] : []))), [pad, warnings]);
   const full = pad.buttons.reduce((n, b) => n + b.w * b.h, 0) >= pad.cols * pad.rows;
 
   useEffect(() => unsavedEdits.set(dirty), [dirty]);
@@ -229,9 +251,10 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     toastTimer.current = setTimeout(() => setToast(null), extra.action ? 6000 : 3200);
   };
   const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const blink = (ixs: number[]) => {
+  /** Point at buttons: `refused` (red ring, a shake: that didn't work) or `added` (a calm glow: here it is). */
+  const blink = (ixs: number[], kind: Flash['kind'] = 'refused') => {
     clearTimeout(flashTimer.current);
-    setFlash({ ixs, at: Date.now() });
+    setFlash({ ixs, at: Date.now(), kind });
     flashTimer.current = setTimeout(() => setFlash(null), 900);
   };
   useEffect(() => () => (clearTimeout(toastTimer.current), clearTimeout(flashTimer.current)), []);
@@ -288,6 +311,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   /** The host's config is `theirs` now, and it's news: follow it, or merge it into unsaved changes. */
   const hostChanged = (theirs: Config, rev: string) => {
     setHostErrors(null);
+    // The host's warnings were about what we saved: someone else's config now.
+    setWarnings(null);
     if (!ed.dirty) {
       ed.reset(theirs, rev);
       return;
@@ -368,13 +393,23 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     if (pr.pad !== ed.state.view.pad) ed.showPad(pr.pad);
     if (pr.button !== null) {
       ed.select(pr.button);
-      setTab(pr.field?.startsWith('action') ? 'action' : 'button');
+      setTab(pr.field?.startsWith('action') || pr.field?.startsWith('stops') ? 'action' : 'button');
       setSheetOpen(true);
     } else {
       ed.select(null);
       setPadOpen(true);
       setSheetOpen(true);
     }
+  };
+
+  /** A problem about `warnings.sent` (the config as saved): to that pad and button in the draft, wherever they are now. */
+  const goToSent = (w: Problem) => {
+    const sp = w.pad === null ? undefined : warnings?.sent.pads[w.pad];
+    const sb = sp && w.button !== null ? sp.buttons[w.button] : undefined;
+    const d = ed.state.draft;
+    const at = sp ? d.pads.findIndex((x) => ed.sameThing(x, sp)) : -1;
+    const bi = at >= 0 && sb ? d.pads[at]!.buttons.findIndex((x) => ed.sameThing(x, sb)) : -1;
+    if (at >= 0) goTo({ ...w, pad: at, button: bi >= 0 ? bi : null });
   };
 
   /** Running buttons this config would end: deleted, or their pad's or their own id changed. */
@@ -386,7 +421,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
       const [p, b] = key.split('/') as [string, string];
       if (findButton(next, p, b)) continue;
       const hb = s.config && findButton(s.config as Config, p, b);
-      out.push({ name: hb ? nameOf(hb) : b, ms: Date.now() - (rs.startedAt + s.clockSkew) });
+      out.push({ name: hb ? nameOf(hb) : b, ms: wall() - (rs.startedAt + s.clockSkew) });
     }
     return out;
   };
@@ -409,6 +444,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
 
   const save = async (o: SaveOpts = {}): Promise<boolean> => {
     if (inFlight.current) return false;
+    // Exactly what the host will keep (trimmed labels and names): or the host's copy would differ from ours.
+    ed.tidy();
     const sent = ed.state.draft;
     const r = parseConfig(sent);
     if (!r.ok) {
@@ -428,13 +465,16 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setHostErrors(null);
     let ok = false;
     let again = false;
+    let warned = 0;
     try {
       const res = await backend.saveConfig(r.config, ed.state.baseRev, { force: o.force });
       if (res.ok) {
         landed(sent, res.rev);
         ok = true;
+        warned = res.warnings?.length ?? 0;
+        setWarnings(warned ? { list: toProblems(res.warnings!, sent), sent, shown: true } : null);
       } else if (res.kind === 'invalid') {
-        const list = toProblems(res.errors);
+        const list = toProblems(res.errors, sent);
         setHostErrors({ list, draft: sent });
         setShowProblems(true);
         goTo(list[0]);
@@ -458,7 +498,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
     if (again) return save({ ...o, retried: true });
     if (ok) {
-      say('Saved: live on every device now');
+      say(warned ? `Saved, with ${warned} warning${warned === 1 ? '' : 's'} from the host` : 'Saved: live on every device now');
       o.then?.();
     }
     return ok;
@@ -490,6 +530,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     unsure.current = [];
     setHostErrors(null);
     setSaveError(null);
+    setWarnings(null);
     deselect();
     undoable('Changes discarded');
   };
@@ -545,7 +586,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const dup = () => {
     const ni = ed.duplicate();
     if (ni === null) say('No room for a copy: make the grid bigger first', { tone: 'bad' });
-    else blink([ni]);
+    else blink([ni], 'added');
   };
   const nudge = ([dx, dy]: [number, number], grow: boolean) => {
     if (sel === null || !button) return;
@@ -559,7 +600,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
   };
 
-  const dialogOpen = !!(modal || conflict || merging || ask || stored);
+  const dialogOpen = !!(modal || conflict || merging || ask || stored || runAsk);
 
   // ---- keyboard ---------------------------------------------------------------------------
 
@@ -664,7 +705,22 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           <Warn />
           <span>
             <b>The config file on the host has errors</b> (it still runs the previous config): {fileErrors[0]}
-            {fileErrors.length > 1 ? ` (+${fileErrors.length - 1} more)` : ''}. Someone may be editing it right now: saving asks before it replaces the file.
+            {fileErrors.length > 1 && !moreFile && (
+              <>
+                {' '}
+                <button type="button" class="ed-link is-inline" data-testid="file-errors-more" onClick={() => setMoreFile(true)}>
+                  +{fileErrors.length - 1} more
+                </button>
+              </>
+            )}
+            . Someone may be editing it right now: saving asks before it replaces the file.
+            {moreFile && fileErrors.length > 1 && (
+              <ul class="ed-errlist" data-testid="file-errors-list">
+                {fileErrors.slice(1).map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            )}
           </span>
         </div>
       )}
@@ -714,17 +770,47 @@ function Session({ backend, padId, onExit }: EditModeProps) {
               </button>
             )}
             <ul>
-              {problems.slice(0, 4).map((x, i) => (
+              {(moreProblems ? problems : problems.slice(0, 4)).map((x, i) => (
                 <li key={i}>
                   <button type="button" class="ed-link" data-testid="problem-item" onClick={() => goTo(x)}>
                     {describe(x, draft)}
                   </button>
                 </li>
               ))}
-              {problems.length > 4 && <li class="ed-more">and {problems.length - 4} more</li>}
             </ul>
+            {wide && problems.length > 4 && (
+              <button type="button" class="ed-link ed-more" data-testid="problems-more" aria-expanded={moreProblems} onClick={() => setMoreProblems((m) => !m)}>
+                {moreProblems ? 'Show fewer' : `and ${problems.length - 4} more: show all`}
+              </button>
+            )}
           </div>
           <button type="button" class="ed-icon" aria-label="Dismiss" onClick={() => setShowProblems(false)}>
+            <Close />
+          </button>
+        </div>
+      )}
+      {warnings?.shown && (
+        <div class="ed-notice is-warn" role="status" data-testid="notice-warnings">
+          <Warn />
+          <div class="ed-problems is-all">
+            <b>
+              Saved, but the host warns about {warnings.list.length === 1 ? 'this' : `${warnings.list.length} things`}:
+            </b>
+            <ul>
+              {warnings.list.map((w, i) => (
+                <li key={i}>
+                  {w.button !== null ? (
+                    <button type="button" class="ed-link" data-testid="warning-item" onClick={() => goToSent(w)}>
+                      {describe(w, warnings.sent)}
+                    </button>
+                  ) : (
+                    <span data-testid="warning-item">{describe(w, warnings.sent)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <button type="button" class="ed-icon" aria-label="Dismiss" data-testid="warnings-dismiss" onClick={() => setWarnings({ ...warnings, shown: false })}>
             <Close />
           </button>
         </div>
@@ -813,6 +899,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
             pad={pad}
             sel={sel}
             bad={bad}
+            warned={warned}
             running={running}
             flash={flash}
             emptyHint={`${wide ? 'Click' : 'Tap'} a square to add a button`}
@@ -862,10 +949,13 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 key={`${pi}:${sel}`}
                 ed={ed}
                 backend={backend}
+                pads={draft.pads}
+                pi={pi}
                 pad={pad}
                 ix={sel}
                 b={button}
                 errors={buttonFieldErrors(problems, pi, sel)}
+                warnings={warningsFor(button)}
                 tab={tab}
                 onTab={setTab}
                 hostButton={hostButton}
@@ -873,6 +963,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 running={running.has(sel)}
                 saving={saving}
                 onSaveAndRun={(run) => void save({ then: run })}
+                onAsk={setRunAsk}
                 sheet={sheet}
                 onClose={deselect}
                 onDuplicate={dup}
@@ -971,6 +1062,26 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           }
         >
           {pad.buttons.length ? `Its ${pad.buttons.length} button${pad.buttons.length === 1 ? '' : 's'} go with it. ` : ''}You can undo this until you save.
+        </Dialog>
+      )}
+      {runAsk && (
+        <Dialog
+          title={runAsk.title}
+          testid="dialog-run-confirm"
+          tone="danger"
+          onClose={() => setRunAsk(null)}
+          actions={
+            <>
+              <button type="button" class="ed-btn is-danger" data-testid="run-confirm-yes" onClick={() => (setRunAsk(null), runAsk.go())}>
+                {runAsk.yes}
+              </button>
+              <button type="button" class="ed-btn is-quiet" data-testid="run-confirm-no" data-autofocus onClick={() => setRunAsk(null)}>
+                Cancel
+              </button>
+            </>
+          }
+        >
+          <p>{runAsk.body}</p>
         </Dialog>
       )}
       {conflict && <ConflictDialog again={!!conflict.again} onMerge={() => (setConflict(null), void startMerge())} onOverwrite={() => void overwrite(conflict)} onCancel={() => setConflict(null)} />}

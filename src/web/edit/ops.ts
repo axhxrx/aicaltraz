@@ -88,10 +88,44 @@ export function nextColor(pad: Pad): string {
   return PALETTE.find((c) => !used.has(c)) ?? PALETTE[pad.buttons.length % PALETTE.length]!;
 }
 
+/** sRGB bytes → OKLCH lightness, chroma, hue (degrees). */
+export function oklch([r, g, b]: readonly [number, number, number]): { l: number; c: number; h: number } {
+  const lin = (v: number) => ((v /= 255) <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+  const [R, G, B] = [lin(r), lin(g), lin(b)];
+  const l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+  const m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+  const s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+  const L = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s;
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s;
+  const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s;
+  const h = (Math.atan2(bb, a) * 180) / Math.PI;
+  return { l: L, c: Math.hypot(a, bb), h: h < 0 ? h + 360 : h };
+}
+
+/**
+ * Does a READY color read as a result? SUCCESS floods green (#2bd46e, hue ≈151°) and FAILURE red
+ * (#e3262b, ≈26°): a button that is already that color makes the two hard to tell apart. By OKLCH
+ * hue and chroma, so the palette's pink, orange and teal are fine.
+ */
+export function stateLookalike(rgb: readonly [number, number, number]): 'success' | 'failure' | null {
+  const { c, h } = oklch(rgb);
+  if (c < 0.1) return null;
+  if (h >= 10 && h <= 36) return 'failure';
+  if (h >= 125 && h <= 170) return 'success';
+  return null;
+}
+
 // ---- new things -------------------------------------------------------------------------------
 
-/** Harmless, and shows off status + result text on the first press. */
-export const STARTER_SCRIPT = "echo '@status working'; sleep 1; echo 'Done'";
+/** What a new button runs until it's set up: it fails, saying so (a ✓ "Done" would hide that nothing is set up yet). */
+export const NO_ACTION_TEXT = 'No action set — edit this button';
+export const STARTER_SCRIPT = `echo '${NO_ACTION_TEXT}' >&2; exit 1`;
+/** Earlier versions' starter scripts: placeholders too. */
+const OLD_STARTERS = new Set(["echo '@status working'; sleep 1; echo 'Done'"]);
+
+/** A new button's placeholder action, never set up: switching its type starts the other type blank. */
+export const isPlaceholder = (a: Action) =>
+  a.type === 'shell' && (a.script === STARTER_SCRIPT || OLD_STARTERS.has(a.script)) && a.shell === undefined && a.cwd === undefined && a.env === undefined;
 
 /**
  * `reserved`: ids to stay clear of besides the pad's own, i.e. the host's buttons on this pad. A new
@@ -110,6 +144,33 @@ export function newPad(cfg: Config, reserved: Iterable<string> = []): Pad {
   let n = cfg.pads.length + 1;
   while (ids.has(`pad-${n}`)) n++;
   return Pad.parse({ id: `pad-${n}`, name: `Pad ${n}`, cols: 2, rows: 3 });
+}
+
+// ---- stops ------------------------------------------------------------------------------------
+
+/**
+ * A `stops` pattern after a rename or delete. `from`/`to`: a button (`pad/button`) or a pad (`pad`,
+ * which carries its `pad/…` patterns along). `to` null: it was deleted, and patterns naming it go (null).
+ */
+export function renamePattern(pattern: string, from: string, to: string | null): string | null {
+  if (from.includes('/')) return pattern === from ? to : pattern;
+  if (!pattern.startsWith(`${from}/`)) return pattern;
+  return to === null ? null : `${to}/${pattern.slice(from.length + 1)}`;
+}
+
+/** What `pattern` names in `cfg` (itself left out, as the host does): `null` when it names nothing there. */
+export function stopTargets(cfg: Pick<Config, 'pads'>, pattern: string, self?: { pad: string; button: string }): { pad: Pad; button: Button }[] | null {
+  const all = cfg.pads.flatMap((pad) => pad.buttons.map((button) => ({ pad, button })));
+  const out =
+    pattern === '*'
+      ? all
+      : pattern.endsWith('/*')
+        ? cfg.pads.some((p) => p.id === pattern.slice(0, -2))
+          ? all.filter((t) => t.pad.id === pattern.slice(0, -2))
+          : null
+        : all.filter((t) => `${t.pad.id}/${t.button.id}` === pattern);
+  if (!out || (!out.length && pattern !== '*' && !pattern.endsWith('/*'))) return null;
+  return self ? out.filter((t) => t.pad.id !== self.pad || t.button.id !== self.button) : out;
 }
 
 /** A copy for "Duplicate": new id and spot, and no key binding (one key, one button). */
@@ -150,9 +211,15 @@ export function simpleWords(script: string): string[] | null {
 /** Shells whose `-c SCRIPT` runs SCRIPT, by file name. */
 const SHELLS = /^(?:.*[/\\])?(?:sh|bash|zsh|dash|ksh|mksh|ash|fish)$/;
 
-/** Switch exec ⇄ shell keeping the behavior: simple commands split into argv, anything else via `sh -c` (and back). */
+/**
+ * Switch exec ⇄ shell keeping the behavior: simple commands split into argv, anything else via
+ * `sh -c` (and back). To `none`: nothing to keep. From `none` or a placeholder (a new button's
+ * starter): there's nothing to keep either, so the new type starts blank (no sample `-c` args).
+ */
 export function convertAction(a: Action, type: Action['type']): Action {
   if (a.type === type) return a;
+  if (type === 'none') return { type };
+  if (a.type === 'none' || isPlaceholder(a)) return type === 'exec' ? { type, command: '', args: [] } : { type, script: '' };
   const common = { ...(a.cwd !== undefined ? { cwd: a.cwd } : {}), ...(a.env !== undefined ? { env: a.env } : {}) };
   if (type === 'shell') {
     const ex = a as Extract<Action, { type: 'exec' }>;

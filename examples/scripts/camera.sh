@@ -3,16 +3,18 @@
 . "$(dirname "$0")/_lib.sh"
 
 case ${1:-} in
-  rec) # toggles recording
+  rec) # toggles recording; the button shows a REC ● chip while it records
     echo "@status Talking to the camera…"
     latency 200 700
     if [ -f "$STATE_DIR/camera-rec" ]; then
       secs=$(($(date +%s) - $(cat "$STATE_DIR/camera-rec")))
       rm -f "$STATE_DIR/camera-rec"
       clip=$(counter camera-clip 41)
+      echo "@state"
       echo "@result REC stopped · clip_$(printf %04d "$clip").mov ($(printf '%d:%02d' $((secs / 60)) $((secs % 60))))"
     else
       date +%s > "$STATE_DIR/camera-rec"
+      echo "@state REC ●"
       echo "@result ● Recording"
     fi
     ;;

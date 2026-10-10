@@ -10,7 +10,7 @@
 import type { Action, Button, Config, Pad } from '../../core/config.ts';
 import { createStore, type Store } from '../lib/store.ts';
 import type { MergeResult, Origins } from './merge.ts';
-import { clipped, convertAction, copyOf, fits, freeSpot, newButton, newPad, sameRect, slug, stable, uniqueId, type Fit, type Rect } from './ops.ts';
+import { clipped, convertAction, copyOf, fits, freeSpot, newButton, newPad, renamePattern, sameRect, slug, stable, uniqueId, type Fit, type Rect } from './ops.ts';
 
 export { stable } from './ops.ts';
 
@@ -267,6 +267,22 @@ export class Editor {
     return this.fresh.has(o) && !this.savedUids.has(this.uid(o));
   }
 
+  /**
+   * Labels and pad names as the host keeps them (trimmed), so what's saved is exactly the draft.
+   * Not an undo step of its own.
+   */
+  tidy(): void {
+    const s = this.state;
+    let next = s.draft;
+    s.draft.pads.forEach((p, pi) => {
+      if (p.name !== p.name.trim()) next = this.withPad(next, pi, (x) => ({ ...x, name: x.name.trim() }));
+      p.buttons.forEach((b, bi) => {
+        if (b.label !== b.label.trim()) next = this.withButton(next, pi, bi, (x) => ({ ...x, label: x.label.trim() }));
+      });
+    });
+    if (next !== s.draft) this.store.set({ ...s, draft: next });
+  }
+
   /** The host accepted `sent` as `rev`. Edits made meanwhile stay in the draft. */
   saved(sent: Config, rev: string): void {
     // Saved things have real ids now: renaming a label must not change them any more. Things made
@@ -307,12 +323,13 @@ export class Editor {
   /** Patch the selected (or given) button. `field` names the merge group for typing. */
   patchButton(patch: Partial<Button>, field?: string, bi = this.state.view.sel ?? -1): void {
     const s = this.state;
+    const pi = s.view.pad;
     const cur = this.pad.buttons[bi];
     if (!cur || same(cur, patch)) return;
     const manualId = 'id' in patch;
-    const next = this.withButton(
+    let next = this.withButton(
       s.draft,
-      s.view.pad,
+      pi,
       bi,
       (b, pad) => {
         const nb = { ...b, ...patch };
@@ -323,10 +340,30 @@ export class Editor {
       },
       !manualId,
     );
-    this.commit(next, {}, field && `b:${s.view.pad}:${bi}:${field}`);
+    // A renamed button stays stopped by the buttons that stop it (unless another one keeps the old id).
+    const pad = next.pads[pi]!;
+    const id = pad.buttons[bi]!.id;
+    if (id !== cur.id && !pad.buttons.some((b) => b.id === cur.id)) next = this.retarget(next, (x) => renamePattern(x, `${pad.id}/${cur.id}`, `${pad.id}/${id}`));
+    this.commit(next, {}, field && `b:${pi}:${bi}:${field}`);
   }
 
-  setActionType(type: 'exec' | 'shell'): void {
+  /** Every button's `stops` patterns through `fn` (identities kept). */
+  private retarget(cfg: Config, fn: (pattern: string) => string | null): Config {
+    let out = cfg;
+    cfg.pads.forEach((pad, pi) =>
+      pad.buttons.forEach((b, bi) => {
+        if (!b.stops?.some((x) => fn(x) !== x)) return;
+        out = this.withButton(out, pi, bi, (x) => {
+          const stops = x.stops!.map(fn).filter((p): p is string => p !== null);
+          const { stops: _s, ...rest } = x;
+          return stops.length ? { ...x, stops } : rest;
+        });
+      }),
+    );
+    return out;
+  }
+
+  setActionType(type: Action['type']): void {
     const b = this.button();
     if (!b || b.action.type === type) return;
     // Switching straight back gives the action as it was (conversions can't always be exact).
@@ -367,12 +404,13 @@ export class Editor {
 
   removeButton(bi = this.state.view.sel ?? -1): Button | null {
     const s = this.state;
-    const b = this.pad.buttons[bi];
+    const pad = this.pad;
+    const b = pad.buttons[bi];
     if (!b) return null;
-    this.commit(
-      this.withPad(s.draft, s.view.pad, (p) => ({ ...p, buttons: p.buttons.filter((_, i) => i !== bi) })),
-      { sel: null },
-    );
+    let next = this.withPad(s.draft, s.view.pad, (p) => ({ ...p, buttons: p.buttons.filter((_, i) => i !== bi) }));
+    // Nothing stops a button that's gone (undo brings both back).
+    if (!next.pads[s.view.pad]!.buttons.some((x) => x.id === b.id)) next = this.retarget(next, (x) => renamePattern(x, `${pad.id}/${b.id}`, null));
+    this.commit(next, { sel: null });
     return b;
   }
 
@@ -408,7 +446,8 @@ export class Editor {
     if (same(this.pad, patch)) return;
     const manualId = 'id' in patch;
     const pi = s.view.pad;
-    const next = this.withPad(s.draft, pi, (p) => {
+    const was = this.pad.id;
+    let next = this.withPad(s.draft, pi, (p) => {
       const np = { ...p, ...patch };
       if (patch.name !== undefined && !manualId && this.isFresh(p)) {
         np.id = uniqueId(slug(patch.name) || 'pad', s.draft.pads.filter((_, i) => i !== pi).map((x) => x.id));
@@ -417,6 +456,9 @@ export class Editor {
     });
     // A hand-typed id is final.
     if (manualId) this.fresh.delete(next.pads[pi] ?? {});
+    // Its buttons stay stopped by the buttons that stop them (unless another pad keeps the old id).
+    const id = next.pads[pi]!.id;
+    if (id !== was && !next.pads.some((p) => p.id === was)) next = this.retarget(next, (x) => renamePattern(x, was, id));
     this.commit(next, {}, field && `p:${pi}:${field}`);
   }
 
@@ -438,9 +480,11 @@ export class Editor {
 
   removePad(pi = this.state.view.pad): boolean {
     const s = this.state;
-    if (s.draft.pads.length <= 1 || !s.draft.pads[pi]) return false;
-    const pads = s.draft.pads.filter((_, i) => i !== pi);
-    this.commit({ ...s.draft, pads }, { pad: Math.min(pi, pads.length - 1), sel: null });
+    const gone = s.draft.pads[pi];
+    if (s.draft.pads.length <= 1 || !gone) return false;
+    let next: Config = { ...s.draft, pads: s.draft.pads.filter((_, i) => i !== pi) };
+    if (!next.pads.some((p) => p.id === gone.id)) next = this.retarget(next, (x) => renamePattern(x, gone.id, null));
+    this.commit(next, { pad: Math.min(pi, next.pads.length - 1), sel: null });
     return true;
   }
 

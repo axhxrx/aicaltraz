@@ -80,9 +80,9 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 | GET | `/` | none | the web app (Bun HTML import of `src/web/index.html`) |
 | GET | `/api/health` | none | `{ok:true, version, protocol}`; no host name (anyone can ask, even a DNS-rebinding page; `hello` has it) |
 | GET | `/api/config` | any | `{config: WireConfig, rev}` (redacted for press) |
-| PUT | `/api/config` | admin | body `{config, baseRev, force?}` → 200 `{rev}`; 400 `{errors:string[]}`; 409 `{rev, invalid?, errors?}` if `baseRev` ≠ the rev of the file's bytes now, valid or not (`invalid: true` + the file's `errors` when they aren't a valid config). `force: true` skips the check (replace whatever is there) |
+| PUT | `/api/config` | admin | body `{config, baseRev, force?}` → 200 `{rev, warnings: string[]}` (saved; `warnings`: what would fail when pressed, see Config store); 400 `{errors:string[]}`, `parseConfig`'s `path: message` with index paths (`pads.0.buttons.5.holdMs: …`, for mapping onto fields); 409 `{rev, invalid?, errors?}` if `baseRev` ≠ the rev of the file's bytes now, valid or not (`invalid: true` + the file's `errors`, worded by id, when they aren't a valid config). `force: true` skips the check (replace whatever is there). 500 `{error, errors:[error]}` when the write fails (disk full, read-only file system…): the message says why, and the file is left as it was |
 | GET | `/api/state` | any | `{states: StateMap, serverNow}` |
-| POST | `/api/press/:pad/:button` | any | → `{result: PressResult, state}`; 404 unknown button. For curl/Stream Deck/etc. |
+| POST | `/api/press/:pad/:button` | any | For curl/Stream Deck/etc. Optional `at` (when it was pressed: host clock, epoch ms; absent = now) and `confirm`, as `?at=…&confirm=1` or a JSON body `{"at": …, "confirm": true}`. → 200 `{result: PressResult, runId?, state}` (`expired` included); 404 unknown button; 428 `{result: "needs-confirm", error}` for a `confirm` button pressed without confirm; 503 `{error: "host full", reason: "rate limited" \| "too many running actions", result: "ignored"}` + `Retry-After: 1` when a limit refuses it; 400 for a malformed `at`, `confirm` or body |
 | GET | `/api/runs?pad=&button=` | admin | `RunRecord[]`, newest first, last 20 per button (both params optional) |
 
 JSON bodies capped at 1 MB. Unknown routes 404.
@@ -91,22 +91,65 @@ JSON bodies capped at 1 MB. Unknown routes 404.
 
 See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 
-- On connect: `hello` (role, redacted-or-full config, rev, all states, serverNow, host info).
-- Every state change → `state` to **all** clients. Config change (UI save or hand edit) → `config`
-  to all (each redacted for its role).
+- On connect: `hello` (role, redacted-or-full config, rev, all states, serverNow, host info, and
+  `latched`: the latched device state per button key, see `@state`).
+- Every state change → `state` to **all** clients; a latched device state change → `latched`
+  `{key, text}` (`null` = cleared) to all. Config change (UI save or hand edit) → `config` to all
+  (each redacted for its role).
 - `press` → host replies `ack` to that client with the `PressResult`, then state broadcasts follow.
-- Malformed message → `error`, keep the socket.
-- At most 64 connections (all roles together); beyond that the upgrade is refused with 503.
+  For `started`/`queued`/`cancelling` the ack carries `runId`: the run the press started, is queued
+  behind, or is cancelling. A press may carry `at` (when the user fired it, in the host's clock:
+  the client's clock plus the offset learned from `hello.serverNow`) and `confirm: true` (it went
+  through the button's confirm step); see State store.
+- Malformed message → `error`, keep the socket (also for a non-number `at`, a non-boolean `confirm`).
+- At most 64 connections (all roles together; the last 8 only for the admin token) and 16 per
+  client address; beyond that the upgrade is refused with 503
+  `{"error":"host full","reason":"too many connections"}`. Logged at most once per 10 s, with a count.
 
 ### Config store
 
-- Source of truth is the file. Hand edits are first-class: watch the file (debounce ~200 ms),
-  re-parse, and on success swap + broadcast. On failure keep the old config, log the errors and
-  send `configError` to admins.
+- Source of truth is the file. Hand edits are first-class: watch the file (debounce ~200 ms, at
+  most 1 s for a file that keeps changing), re-parse, and on success swap + broadcast. On failure
+  keep the old config, log the errors and send `configError` to admins.
+- Watching = `fs.watch` on the directories (survives editors' rename-over) **plus a stat poll every
+  2 s** (dev/ino/size/mtime of the configured path, and the identity of each watched directory), for
+  what fs.watch misses: the directory moved away and recreated, a symlinked directory swapped
+  (deploy-style `ln -sfn rel2 current`), a single-file bind mount edited from outside, network file
+  systems. A watched directory that was replaced gets a new watcher.
+- Only regular files are read: a FIFO, device, socket or directory is refused ("… is a named pipe
+  (FIFO), not a regular file") without blocking (stat first, then open non-blocking and fstat). At
+  most 16 MB.
 - `rev` = sha256 (hex, first 16 chars) of the file's bytes.
-- UI saves: validate with `parseConfig`, write atomically (temp file + rename), compact output
-  (omit button fields equal to their schema defaults; 2-space JSON). A new file is created 0600 (it
-  holds commands and their env); a rewrite keeps the file's mode.
+- The file's errors (CLI, host log, `configError`, a 409's `errors`) are worded for whoever edits it:
+  JSON syntax errors as `invalid JSON at line 12, column 5: a comma is missing between "holdMs" and
+  "key"`; validation errors all in one pass (field errors together with
+  duplicate ids, overlaps and buttons outside the grid), named by id, with the line, in file order:
+  `pad "lights" › button "key": holdMs must be ≤ 5000 (line 42)` (`pad #2` / `button #3` when the id
+  can't name it). `parseConfig` itself, and so PUT's 400, keeps `path: message` with index paths,
+  which the editor maps onto its fields.
+- UI saves: validate with `parseConfig`, write safely (below), compact output (omit button fields
+  equal to their schema defaults; 2-space JSON). A new file is created 0600 (it holds commands and
+  their env); a rewrite keeps the file's mode.
+- Every file the host writes (config, secrets, state) goes through one safe write
+  (`atomicWrite`, src/server/files.ts): a temp file in the same directory, written fully (short
+  writes continued), fsync'ed, read back and compared, renamed over the target, then the directory
+  fsync'ed. Any failure throws with the target untouched and no temp file left: a full disk is a
+  500 "no space left on the device (ENOSPC); it was left as it was", never a cut-off file. A target
+  that can't be renamed over (a single-file bind mount, Docker-style: EBUSY/EXDEV; a directory
+  without write permission) is rewritten in place instead: grown first (a full disk fails before
+  any old byte changes), overwritten, truncated, fsync'ed, read back; on failure its old bytes are
+  put back. It refuses to replace anything but a regular file, or a file without write permission;
+  errors name the real cause (EROFS), not a failed cleanup.
+- After a save, the 200 carries `warnings` (also logged, and printed at startup): what would fail
+  when pressed, resolved as the runner resolves it (relative to the action's working folder, else
+  PATH, from the action's env if it sets one): command not found / not executable / no `#!` line /
+  interpreter missing, shell missing, working folder missing, `stops` patterns that match no other
+  button. They never block the save.
+- Paths given to `--config`, `--secrets`, `--tls-cert`/`--tls-key` and `BUTTPAD_CONFIG` may start
+  with `~/` (quoted, or after `=`, the shell leaves it). Startup failures say what to fix: `can't
+  listen on 192.0.2.7:8787: no network interface on this machine has the address 192.0.2.7
+  (server.host in the config); …`, `port 8787 is in use (another ButtPad?)`, a host name that doesn't
+  resolve, unreadable TLS files.
 - A save's `baseRev` must name the file's bytes as they are at that moment, valid config or not: a
   hand edit with a typo, or one caught mid-write by a non-atomic editor, is someone's work too, so
   it gets a 409 (`invalid: true`), never a silent overwrite. The file is read again right before
@@ -114,14 +157,20 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
   chose to overwrite) skips both checks.
 - A symlinked config is read and watched through its path: saves replace the link's current
   target; edits of the target and replacing the link itself (`sed -i`) are both picked up. Relative
-  paths (actions, secrets) resolve against the directory of the file it pointed to at startup.
+  paths (actions, secrets) resolve against the directory of the file the path's own symlink points
+  to (a config linked from a dotfiles checkout runs the scripts next to the real file); symlinked
+  directories above it are followed when an action starts, so after a deploy-style swap actions run
+  from the new release.
 - Removing a button that is running kills its action. Changing a running button's action does not
   affect the current run.
 
 ### Runner
 
-- `exec`: `Bun.spawn([command, ...args])`. `shell`: POSIX `[shell ?? $SHELL ?? '/bin/sh', '-c', script]`;
-  Windows `[shell ?? %ComSpec% ?? 'cmd.exe', '/d', '/s', '/c', script]`.
+- `exec`: `Bun.spawn([command, ...args])`. `shell`: POSIX `[shell ?? '/bin/sh', '-c', script]` —
+  never `$SHELL`, so a script behaves the same whether the host was started from a terminal or by a
+  service (a bash-ism that worked by hand would fail under systemd); Windows
+  `[shell ?? %ComSpec% ?? 'cmd.exe', '/d', '/s', '/c', script]`. `none`: no process at all (see
+  State store, `stops`).
 - `cwd` defaults to the config file's directory; relative `cwd` resolves against it too.
 - env = host env + action `env` (names `[A-Za-z_][A-Za-z0-9_]*`) + `BUTTPAD_PAD`, `BUTTPAD_BUTTON`,
   `BUTTPAD_RUN_ID`, `BUTTPAD_LABEL`.
@@ -129,32 +178,116 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
   SIGTERM to `-pid`, then SIGKILL after 2 s. Windows: `taskkill /T /F /PID`. A killed run is
   *dying* until its group is seen empty (on Linux, zombies awaiting their reaper don't count) or got
   the SIGKILL. A group seen empty is never signalled again: its id may be recycled.
-- **Output protocol** (stdout, line-based, UTF-8):
-  - `@progress N` (0–100) → `progress`; `@status text` → `status`; `@result text` → result text.
+- **Output protocol** (stdout, line-based, UTF-8; `\n`, `\r\n` or a bare `\r` ends a line, so a
+  progress bar's last line is what was left on screen):
+  - `@progress N` (0–100) → `progress`; `@status text` → `status`; `@result text` → result text;
+    `@state text` → the button's latched device state ("REC ●", "ON 80%"; ≤ 40 chars), `@state`
+    alone clears it (see State store).
   - Without `@result`, result text = last non-empty, non-`@` stdout line; on failure with no
     stdout, last non-empty stderr line; spawn error → the error message. Truncate to 200 chars.
+  - Result, status and latched text are sanitized: ANSI CSI/OSC/DCS sequences, C0/C1 control
+    characters and bidi overrides/isolates (U+202A–U+202E, U+2066–U+2069) are removed, tabs become
+    spaces. Cut between graphemes, with an ellipsis.
   - A last line without a newline counts, even while a background process holds the pipe open.
   - Output is read in turns with everything else: a flood (`yes`) can't stall timers or other presses.
+  - When the main process has exited and its pipes had 250 ms to drain, the host closes its ends
+    and stops reading: a background process still writing there gets EPIPE/SIGPIPE (`(yes &); echo
+    x` would otherwise keep the host at 100% CPU forever). Background children of a finished run are
+    otherwise left alone, not killed (a button may start a daemon on purpose: redirect its output).
 - Timeout (`timeoutMs`) → kill → failure reason `timeout`. Spawn failure → `spawn`, with text like
   `command not found: X`, `permission denied (chmod +x?): P`, `is a directory: P`,
   `not executable as a program (missing #! line?): P`, `interpreter not found (check the #! line): P`.
+  Every client sees that text, so it names files by their base name (`command not found:
+  light.sh`); the admin run log's `error` has the full path.
+- Run log (`RunRecord`, admin): `command` (what ran: the argv shell-quoted, `/bin/sh -c '…'` for a
+  shell action), `cwd` (resolved), `error` (the spawn failure in full, or how the host stopped it).
 - Durations and throttles use a monotonic clock; only `startedAt`/`endedAt` are wall-clock (epoch ms).
 - Keep only tails in memory: 16 KB per stream per run; last 20 runs per button.
 
 ### State store
 
 Holds `RunState` per button, runs `transition()` from `machine.ts`, performs the effects (start →
-runner, kill → runner, scheduleReset → timer that feeds back `reset`), broadcasts every change.
+runner, kill → runner, scheduleReset → timer that feeds back `reset`, scheduleRequeue → timer that
+feeds back `requeue`), broadcasts every change. READY's `last` (how the previous run ended) comes
+from the machine; it is restored from the state file at startup.
 
-A press gets `ignored` instead of its usual result when:
+A press is answered, checked in this order, with:
 
-- (`whileRunning: cancel`) it comes within 700 ms of the run's start: a double press must not
-  start and cancel at once. Also when the cancel no longer reaches a process (the action already
-  exited, its output is still draining): the run ends as what it was. A cancel drops a queued re-run.
-- it would start a run while an earlier run of that button is still alive or dying (e.g. the button
-  was removed and re-added meanwhile): never two instances of one button.
-- the limits over all buttons are hit: presses that start or queue a run draw from a token bucket
-  (bursts of 20, then 10/s), and at most 32 runs at a time. Logged once per streak of refusals.
+- `unknown-button`: no such button.
+- `expired`: it carries `at`, and by the host's clock it is more than `PRESS_MAX_AGE_MS` (3 s) old
+  when the host gets to it. Nothing runs; logged (at most once per 10 s, with a count). A press made
+  in a dead zone that TCP delivers 14–45 s later lands here, and so does one that waited while the
+  host itself was frozen (SIGSTOP, a stalled event loop): the age is taken when the host handles
+  it. An `at` in the future (clock skew) counts as now; no `at` (curl) is accepted.
+- `ignored`: a re-run is already queued (`queued` on RUNNING, or on the result it shows before the
+  re-run starts).
+- `needs-confirm`: it would start (or queue) a run of a `confirm` button and doesn't carry
+  `confirm: true` (HTTP: `?confirm=1` / `{"confirm": true}`). Cancelling needs no confirm. The
+  browser's confirm step is an accident guard; this makes it a rule for every client: a press token
+  handed out by QR code can't run "Format card" with a bare curl.
+- `ignored`: running with `whileRunning: ignore`; (`cancel`) within 700 ms of the run's start (a
+  double press must not start and cancel at once), or the cancel no longer reaches a process (the
+  action already exited, its output is still draining: the run ends as what it was); it would start
+  a run while an earlier one of that button is still alive or dying (removed and re-added
+  meanwhile, a killed group in its grace period, a previous host's leftover): never two instances
+  of one button; or a limit refuses it (below).
+- otherwise `started` / `queued` / `cancelling`. A cancel drops a queued re-run.
+
+Limits, on presses that would start or queue a run: token buckets of bursts of 10, then 5/s, per
+WebSocket connection and per client address (all of an address's connections and its HTTP presses
+together: more sockets don't buy a device more presses), so one press token can't lock everyone
+out; one over all sources of bursts of 40, then 20/s; and at most 32 runs at a time. A refusal is
+`ignored` over WebSocket and a 503 "host full" over HTTP; logged at most once per 10 s with a
+count. Behind a reverse proxy every client has the proxy's address, and shares these limits (and
+the 16-connection cap).
+
+Queue: when a run with a queued re-run ends, its result is broadcast (with `queued: true`) and shown
+for `REQUEUE_GAP_MS` (800 ms) before the re-run starts, so a failure is seen rather than hidden
+behind the next run. The re-run waits longer while an earlier run's processes are dying or 32 runs
+are going.
+
+`stops` and `none`: a press that will start a run (a queued re-run too) first cancels every RUNNING
+button its patterns name (`pad/button`, `pad/*`, `*`; never itself), whatever their own
+`whileRunning`, and drops their queued re-runs (also one waiting out its result). Those runs end
+FAILURE `cancelled` with the text `Stopped by <label>`. Action `none` runs nothing: success at once,
+text `Stopped N` when it stopped N > 0 runs, else `Done`.
+
+Kill reasons, distinct in RunRecord.error and the host log (`■ pad/button #7 1.2s <reason>`):
+`cancelled from a device` (the log adds the connection's address), `stopped by <label>`,
+`stopped: button removed by a config change`, `stopped: host shutdown` (reason `interrupted`),
+`timed out after <time>` (reason `timeout`, logged `✗`).
+
+`@state` (latched device state): per button, kept across runs (failed ones too) and restarts; sent
+in `hello.latched` and as `latched` broadcasts; `@state` alone clears it; removing the button
+drops it.
+
+### Run state file
+
+`buttpad.state.json` next to the config (mode 0600) holds what must survive a restart or a crash:
+per button the last run id, last result and latched state; the runs in flight `{key, runId, pid,
+pgid, startedAt, fingerprint, command, cwd}`. Written with the config store's safe atomic write,
+throttled: routine changes at most every 250 ms (≤ 4/s), a run's start or end within 50 ms; and at
+shutdown and in the process `exit` handler. A save that fails is logged once (and when it works
+again); the host keeps going.
+
+At startup, once the port is bound (a second host that can't bind never touches the first one's
+runs):
+
+- Run ids continue where they left off, also past runs that were in flight.
+- Each run that was in flight: if its process is still alive and its start-time fingerprint matches
+  (Linux: `/proc/PID/stat` starttime plus the boot id; elsewhere `ps -o lstart=`) — the PID may
+  have been reused — the host SIGTERMs its process group and SIGKILLs it after 2 s; presses of that
+  button are `ignored` until it is gone. Anything else (another process now has the PID, no
+  fingerprint) is left alone. Either way the button shows FAILURE `interrupted`
+  ("Interrupted: host restarted") for its resultHoldMs, then READY with that as `last`; the run log
+  gets a record of it. On Windows there is no fingerprint: nothing is killed.
+- A graceful shutdown keeps the runs it stopped in the file (`stopped: "shutdown"`): the next host
+  reports them the same way.
+- A missing, unreadable or unknown-version file: start fresh, with a log line; the next save replaces
+  it. A file whose writer is still running (its pid and fingerprint alive): this host neither saves
+  nor touches that host's runs, and says so.
+- Not covered: a crash during a killed run's 2 s grace period (its main process had already exited)
+  leaves SIGTERM-ignoring grandchildren behind; background processes of a finished run aren't tracked.
 
 ## Client
 
@@ -264,16 +397,35 @@ the handler.
 
 - Entered from the menu. Grid lines visible. Tap an empty cell → new button there. Drag a button
   to move, drag its corner handle to resize; snaps to cells; overlap/out-of-bounds is refused
-  visibly.
+  visibly (red ring, a shake). A duplicate lands with a calm glow instead.
 - Selecting a button opens an editor (bottom sheet on phones, side panel on wide screens): label,
-  color, trigger, holdMs, driftPx, whileRunning, confirm, timeoutMs, resultHoldMs, key, action
-  (type switch; exec: command + args list + cwd + env; shell: script + shell + cwd + env).
-  Duplicate, delete.
+  color, trigger, holdMs, driftPx, confirm (+ confirmWindowMs), cooldownMs, key, whileRunning,
+  timeoutMs, resultHoldMs, id; the action (type switch: shell: script + shell + cwd + env; exec:
+  command + args list + cwd + env; **Nothing (stop others)**: `none`), and **Stops** (any type):
+  chips per pad for `pad/button`, "All of <pad>" for `pad/*`, a switch for `*` (everything); a
+  wider pick shows what it covers, a pattern naming nothing is listed to remove. Renaming or
+  deleting a button or pad in the editor carries the patterns along (or drops them), in the same
+  undo step. Duplicate, delete.
+- Number fields show their range (hold 100–5000 ms, confirm window 0.5–60 s, cooldown 0–10 s,
+  time limit up to 24 h, result up to 60 s); arrow keys stay inside it; an out-of-range value is an
+  inline error in words ("Must be at most 60000 ms (1 min)") that blocks saving. A half-typed value
+  is left alone. Labels (≤ 200) and pad names (1–60, not blank) are saved trimmed: the draft is
+  tidied right before the PUT, so the host's copy is exactly the draft.
+- Non-blocking warnings: a READY color that reads like SUCCESS green or FAILURE red (by OKLCH hue
+  and chroma; the palette's pink/orange/teal are fine); a key also bound on another pad (keys work
+  from every pad: the visible pad's button first, else the one unique match, else nothing); a
+  Nothing button that stops nothing.
+- A new button's action is a placeholder that fails visibly when pressed ("No action set — edit
+  this button", via stderr and exit 1), never a ✓ for nothing. Switching a placeholder (or
+  Nothing) to another type starts that type blank: no sample `sh -c` arguments left behind.
 - Pad management: add, rename, delete, reorder, cols/rows (shrinking that would clip buttons is
   refused with an explanation).
 - Edits are a local draft until **Save** (PUT with `baseRev`). Unsaved indicator; **Discard**
-  (undoable) in plain sight on every layout. Validation errors from the host are shown. Dialogs that
-  could destroy work focus their safe way out (Cancel / Keep editing).
+  (undoable) in plain sight on every layout. Validation errors from the host are shown; long lists
+  ("+3 more": a broken file's errors, the problems) open up in full. The host's PUT `warnings`
+  (saved, but e.g. a program it can't find) show after the save as a notice, and on the button they
+  name (an amber badge, a callout in its editor) until that part of it changes. Dialogs that could
+  destroy work focus their safe way out (Cancel / Keep editing).
 - The draft is kept on the device (localStorage, per host origin; written right after each change
   and when the page is hidden) until saved or discarded: a reload, an evicted tab, a rotated token
   (401) or a pairing link opened in the tab don't lose it (a pairing link opened while the draft is
@@ -302,8 +454,13 @@ the handler.
   `NAME=value`, globs, `$`, shell syntax or builtins); anything else becomes `sh -c SCRIPT`, which
   switches back unwrapped. argv becomes a properly quoted command line. Empty arguments get a
   warning (allowed); env names are checked as typed.
-- Admin extra: per-button run log (from `/api/runs`) to see why something failed. **Run now** for a
-  saved, unchanged button; otherwise **Save & run** (saves the draft, then runs the saved version).
+- Admin extra: per-button run log (from `/api/runs`) to see why something failed: outcome, the
+  output tails, what ran (`command`), in which folder (`cwd`), and why it couldn't start or was
+  stopped (`error`). It refetches every second while the button runs. **Run now** for a saved,
+  unchanged button; otherwise **Save & run** (saves the draft, then runs the saved version). On a
+  `confirm` button both ask first (a dialog that focuses Cancel) and the press then carries
+  `confirm: true` (the host refuses unconfirmed ones). While the button runs, Run now is never a
+  silent cancel: it's **Cancel run** for `whileRunning: cancel`, else a disabled "Running…".
 
 ## Testing
 

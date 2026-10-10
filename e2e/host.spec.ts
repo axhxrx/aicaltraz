@@ -54,7 +54,8 @@ test('press role has no Edit entry; admin does', async ({ page }) => {
 
 test('"Pair again" takes a second tap to forget the token, and a locked pad (?lock) has none', async ({ page }) => {
   await open(page, host.pressToken, '?pad=main&lock');
-  await page.getByTestId('menu-btn').click();
+  // Locked: the menu opens on a long press only.
+  await page.getByTestId('menu-btn').click({ delay: 1200 });
   await expect(page.getByTestId('menu')).toBeVisible();
   await expect(page.getByTestId('menu-repair')).toHaveCount(0);
   await open(page);
@@ -104,11 +105,13 @@ test('failure: exit code and stderr', async ({ page, hasTouch }) => {
   await expect(btn(page, 'fail')).toContainText('disk full');
 });
 
-test('ignored press while running flashes BUSY; cancel kills the run', async ({ page, hasTouch }) => {
+test('ignored press while running flashes BUSY; cancel kills the run (STOPPED)', async ({ page, hasTouch }) => {
   await open(page);
   const f = new Fingers(page, hasTouch);
   await f.tap('slow');
   await expectVisual(page, 'slow', 'running');
+  // Past the button's cooldown (a quicker second press is taken as a bounce and not sent).
+  await page.waitForTimeout(450);
   await f.tap('slow');
   await expect(btn(page, 'slow')).toHaveAttribute('data-flash', 'busy');
   await f.tap('cancel');
@@ -118,8 +121,8 @@ test('ignored press while running flashes BUSY; cancel kills the run', async ({ 
   // hint only appears once a cancel would count.
   await expect(btn(page, 'cancel')).toContainText('TAP TO CANCEL');
   await f.tap('cancel');
-  await expectVisual(page, 'cancel', 'failure');
-  await expect(btn(page, 'cancel')).toContainText('CANCELLED');
+  await expectVisual(page, 'cancel', 'stopped');
+  await expect(btn(page, 'cancel')).toContainText('STOPPED');
 });
 
 test('confirm and keyboard against the host', async ({ page, hasTouch }) => {
@@ -127,6 +130,8 @@ test('confirm and keyboard against the host', async ({ page, hasTouch }) => {
   const f = new Fingers(page, hasTouch);
   await f.hold('confirm', 400);
   await expectVisual(page, 'confirm', 'confirm');
+  // The confirming press is a deliberate one: 400 ms after CONFIRM came up at the earliest.
+  await page.waitForTimeout(450);
   await f.hold('confirm', 400);
   await expectVisual(page, 'confirm', 'success');
   await page.keyboard.press('t');

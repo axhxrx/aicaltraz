@@ -30,6 +30,12 @@ let iosSwitch: HTMLLabelElement | null = null;
 
 export const hapticsSupported = canVibrate || isIOS;
 
+/**
+ * iOS has no vibrate(): all it can play is a count of ticks. The ones that matter most read
+ * apart: fired 1, success 2, failure 3.
+ */
+const IOS_TICKS: Record<Cue, number> = { touch: 1, fire: 1, confirm: 2, success: 2, failure: 3, busy: 2, denied: 2, cancel: 1, unknown: 3 };
+
 function iosTick(count: number) {
   if (!iosSwitch) {
     iosSwitch = document.createElement('label');
@@ -56,7 +62,7 @@ export function haptic(cue: Cue): void {
   if (!settings.get().haptics) return;
   try {
     if (canVibrate) navigator.vibrate(VIBES[cue]);
-    else if (isIOS) iosTick(cue === 'success' || cue === 'confirm' || cue === 'denied' ? 2 : cue === 'busy' || cue === 'unknown' ? 3 : 1);
+    else if (isIOS) iosTick(IOS_TICKS[cue]);
   } catch {
     /* vibrate can throw before the first user activation */
   }

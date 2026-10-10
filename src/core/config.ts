@@ -95,29 +95,63 @@ export const Config = z
     pads: z.array(Pad).min(1),
   })
   .superRefine((cfg, ctx) => {
-    const padIds = new Set<string>();
-    cfg.pads.forEach((pad, pi) => {
-      if (padIds.has(pad.id)) ctx.addIssue({ code: 'custom', path: ['pads', pi, 'id'], message: `duplicate pad id "${pad.id}"` });
+    for (const issue of gridIssues(cfg)) ctx.addIssue({ code: 'custom', ...issue });
+  });
+
+interface GridIssue {
+  path: (string | number)[];
+  message: string;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+/** A grid size as written (absent: the default 2), or undefined when it isn't a valid one. */
+const gridSize = (v: unknown) => (v === undefined ? 2 : Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 12 ? (v as number) : undefined);
+const cellNum = (v: unknown, min: number) => (Number.isInteger(v) && (v as number) >= min ? (v as number) : undefined);
+
+/**
+ * Duplicate pad ids, duplicate button ids within a pad, buttons outside their pad's grid or overlapping.
+ * Works on any input, valid or not (zod skips refinements after some field errors, so parseConfig
+ * also runs this on the raw input): whatever it can't read (a pad without a valid grid size, a button
+ * without valid x/y/w/h) is left to the field checks.
+ */
+function gridIssues(input: unknown): GridIssue[] {
+  const out: GridIssue[] = [];
+  const pads = isRecord(input) && Array.isArray(input.pads) ? input.pads : [];
+  const padIds = new Set<string>();
+  pads.forEach((pad: unknown, pi) => {
+    if (!isRecord(pad)) return;
+    if (typeof pad.id === 'string') {
+      if (padIds.has(pad.id)) out.push({ path: ['pads', pi, 'id'], message: `duplicate pad id "${pad.id}"` });
       padIds.add(pad.id);
-      const ids = new Set<string>();
-      const occupied = new Map<string, string>();
-      pad.buttons.forEach((b, bi) => {
-        const path = ['pads', pi, 'buttons', bi];
-        if (ids.has(b.id)) ctx.addIssue({ code: 'custom', path: [...path, 'id'], message: `duplicate button id "${b.id}"` });
+    }
+    const cols = gridSize(pad.cols);
+    const rows = gridSize(pad.rows);
+    const ids = new Set<string>();
+    const occupied = new Map<string, string>();
+    (Array.isArray(pad.buttons) ? pad.buttons : []).forEach((b: unknown, bi) => {
+      if (!isRecord(b)) return;
+      const path = ['pads', pi, 'buttons', bi];
+      const name = typeof b.id === 'string' ? `"${b.id}"` : `#${bi + 1}`;
+      if (typeof b.id === 'string') {
+        if (ids.has(b.id)) out.push({ path: [...path, 'id'], message: `duplicate button id "${b.id}"` });
         ids.add(b.id);
-        if (b.x + b.w > pad.cols || b.y + b.h > pad.rows) {
-          ctx.addIssue({ code: 'custom', path, message: `button "${b.id}" extends outside the ${pad.cols}x${pad.rows} grid` });
-          return;
+      }
+      const [x, y, w, h] = [cellNum(b.x, 0), cellNum(b.y, 0), cellNum(b.w ?? 1, 1), cellNum(b.h ?? 1, 1)];
+      if (cols === undefined || rows === undefined || x === undefined || y === undefined || w === undefined || h === undefined) return;
+      if (x + w > cols || y + h > rows) {
+        out.push({ path, message: `button ${name} extends outside the ${cols}x${rows} grid` });
+        return;
+      }
+      for (let cx = x; cx < x + w; cx++)
+        for (let cy = y; cy < y + h; cy++) {
+          const other = occupied.get(`${cx},${cy}`);
+          if (other) out.push({ path, message: `button ${name} overlaps ${other} at cell ${cx},${cy}` });
+          else occupied.set(`${cx},${cy}`, name);
         }
-        for (let x = b.x; x < b.x + b.w; x++)
-          for (let y = b.y; y < b.y + b.h; y++) {
-            const other = occupied.get(`${x},${y}`);
-            if (other) ctx.addIssue({ code: 'custom', path, message: `button "${b.id}" overlaps "${other}" at cell ${x},${y}` });
-            else occupied.set(`${x},${y}`, b.id);
-          }
-      });
     });
   });
+  return out;
+}
 
 export type ExecAction = z.infer<typeof ExecAction>;
 export type ShellAction = z.infer<typeof ShellAction>;
@@ -131,10 +165,17 @@ export type ConfigInput = z.input<typeof Config>;
 
 export type ParseResult = { ok: true; config: Config } | { ok: false; errors: string[] };
 
+/**
+ * Validate a config as written. Errors are `path: message` with index paths
+ * (`pads.0.buttons.5.holdMs: Too big: expected number to be <=5000`), all of them in one pass: the
+ * grid and id checks run even when fields are invalid. (The host words them for people, by id:
+ * src/server/config-errors.ts.)
+ */
 export function parseConfig(raw: unknown): ParseResult {
   const r = Config.safeParse(raw);
   if (r.success) return { ok: true, config: r.data };
-  return { ok: false, errors: r.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`) };
+  const issues: GridIssue[] = [...r.error.issues.map((i) => ({ path: i.path as (string | number)[], message: i.message })), ...gridIssues(raw)];
+  return { ok: false, errors: [...new Set(issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`))] };
 }
 
 export function findButton(cfg: Config, padId: string, buttonId: string): Button | undefined {

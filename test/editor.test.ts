@@ -144,3 +144,104 @@ describe('snapshot / restore (a draft kept on the device)', () => {
     expect(again.state.draft.pads[0]!.buttons[2]!.id).toBe('fog-machine');
   });
 });
+
+describe('stops follow renames and deletes', () => {
+  const withStops = (): Config =>
+    Config.parse({
+      ...INPUT,
+      pads: [
+        { ...INPUT.pads[0]!, buttons: [...INPUT.pads[0]!.buttons!, { id: 'off', label: 'All off', x: 2, y: 0, stops: ['main/lamp', 'other/*', 'other/solo'], action: { type: 'none' } }] },
+        { ...INPUT.pads[1]!, buttons: [{ ...INPUT.pads[1]!.buttons![0]!, stops: ['main/lamp'] }] },
+      ],
+    });
+  const stops = (ed: Editor) => ed.state.draft.pads.flatMap((p) => p.buttons.map((b) => b.stops ?? null));
+
+  test("a button's new id (typed, or following its label) goes into every pattern naming it; undo takes it back", () => {
+    const ed = new Editor(withStops(), 'r1');
+    ed.select(0);
+    ed.patchButton({ id: 'desk' }, 'id');
+    expect(stops(ed)).toEqual([null, null, ['main/desk', 'other/*', 'other/solo'], ['main/desk']]);
+    ed.undo();
+    expect(stops(ed)).toEqual([null, null, ['main/lamp', 'other/*', 'other/solo'], ['main/lamp']]);
+    // A new button's id follows its label: so do the patterns.
+    const ix = ed.addButton(0, 1)!;
+    ed.select(2);
+    ed.patchButton({ stops: ['main/button-4'] });
+    ed.patchButton({ label: 'Fog' }, 'label', ix);
+    expect(ed.button(ix)!.id).toBe('fog');
+    expect(ed.button(2)!.stops).toEqual(['main/fog']);
+  });
+
+  test('another button still having the old id keeps the patterns as they are', () => {
+    const ed = new Editor(withStops(), 'r1');
+    ed.select(1);
+    ed.patchButton({ id: 'lamp' }, 'id'); // a duplicate for now
+    ed.select(0);
+    ed.patchButton({ id: 'desk' }, 'id');
+    expect(ed.button(2)!.stops).toEqual(['main/lamp', 'other/*', 'other/solo']);
+  });
+
+  test("a pad's new id carries its `pad/…` patterns", () => {
+    const ed = new Editor(withStops(), 'r1');
+    ed.showPad(1);
+    ed.patchPad({ id: 'studio' }, 'id');
+    expect(stops(ed)).toEqual([null, null, ['main/lamp', 'studio/*', 'studio/solo'], ['main/lamp']]);
+  });
+
+  test('a deleted button or pad leaves no patterns behind (the last one: no `stops` at all); undo brings them back', () => {
+    const ed = new Editor(withStops(), 'r1');
+    ed.removeButton(0);
+    expect(stops(ed)).toEqual([null, ['other/*', 'other/solo'], null]);
+    expect(ed.state.draft.pads[1]!.buttons[0]).not.toHaveProperty('stops');
+    ed.undo();
+    ed.removePad(1);
+    expect(stops(ed)).toEqual([null, null, ['main/lamp']]);
+    ed.undo();
+    expect(stops(ed)).toEqual([null, null, ['main/lamp', 'other/*', 'other/solo'], ['main/lamp']]);
+  });
+
+  test("identities hold through it: the patched buttons are still the host's", () => {
+    const ed = new Editor(withStops(), 'r1');
+    ed.select(0);
+    ed.patchButton({ id: 'desk' }, 'id');
+    expect(ed.origins()).toEqual([
+      { pad: 'main', buttons: ['lamp', 'button-2', 'off'] },
+      { pad: 'other', buttons: ['solo'] },
+    ]);
+  });
+});
+
+describe('tidy (before a save)', () => {
+  test('labels and pad names are trimmed as the host keeps them, without an undo step of their own', () => {
+    const ed = new Editor(host(), 'r1');
+    ed.select(0);
+    ed.patchButton({ label: '  Lamp  ' }, 'label');
+    ed.patchPad({ name: 'Main ' }, 'name');
+    const steps = ed.state.past.length;
+    ed.tidy();
+    expect(ed.button(0)!.label).toBe('Lamp');
+    expect(ed.state.draft.pads[0]!.name).toBe('Main');
+    expect(ed.state.past.length).toBe(steps);
+    expect(ed.dirty).toBe(false);
+    expect(ed.origins()[0]).toEqual({ pad: 'main', buttons: ['lamp', 'button-2'] });
+  });
+});
+
+describe('action type none', () => {
+  test('to Nothing and straight back gives the action as it was; from Nothing to another type, it starts blank', () => {
+    const ed = new Editor(host(), 'r1');
+    ed.select(0);
+    ed.setActionType('none');
+    expect(ed.button()!.action).toEqual({ type: 'none' });
+    ed.setActionType('shell');
+    expect(ed.button()!.action).toEqual({ type: 'shell', script: 'echo lamp' });
+    ed.setActionType('none');
+    ed.setActionType('exec');
+    expect(ed.button()!.action).toEqual({ type: 'exec', command: '', args: [] });
+    ed.setActionType('none');
+    ed.setActionType('exec');
+    ed.setActionType('none');
+    ed.setActionType('shell');
+    expect(ed.button()!.action).toEqual({ type: 'shell', script: '' });
+  });
+});

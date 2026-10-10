@@ -3,6 +3,7 @@ dist/
 buttpad.config.json
 buttpad.secrets.json
 *.secrets.json
+buttpad.state.json
 test-results/
 playwright-report/
 .DS_Store

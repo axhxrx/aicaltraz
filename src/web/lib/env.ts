@@ -5,9 +5,9 @@ import { createStore } from './store.ts';
 export interface AppOptions {
   /** `?demo`: in-browser backend, no host needed. */
   demo: boolean;
-  /** `?pad=ID`: open this pad. */
+  /** `?pad=ID` (or its name, any case): open this pad, and only it — never silently another one. */
   pad: string | null;
-  /** `?lock`: no pad tabs, no edit entry (kiosk / handlebar mount). */
+  /** `?lock`: no pad tabs, no edit entry, the menu only on a long press (kiosk / handlebar mount). */
   lock: boolean;
   /** `?demo&exact`: no random durations or failures in the demo (tests). */
   exact: boolean;
@@ -18,7 +18,7 @@ export interface AppOptions {
 export function readOptions(search = location.search): AppOptions {
   const q = new URLSearchParams(search);
   const flag = (k: string) => q.has(k) && q.get(k) !== '0' && q.get(k) !== 'false';
-  return { demo: flag('demo') || flag('gallery'), pad: q.get('pad'), lock: flag('lock'), exact: flag('exact'), gallery: flag('gallery') };
+  return { demo: flag('demo') || flag('gallery'), pad: q.get('pad')?.trim() || null, lock: flag('lock'), exact: flag('exact'), gallery: flag('gallery') };
 }
 
 /** Accepts a pairing URL (`…#token=X`), a bare `#token=X`, or a raw token. */
@@ -29,10 +29,16 @@ export function parseToken(input: string): string | null {
   return /^[\w-]{8,}={0,2}$/.test(t) ? t : null;
 }
 
+/**
+ * The token for this tab, when storage is blocked: pairing then lasts until the tab closes (the
+ * app says so) rather than not working at all.
+ */
+let memoryToken: string | null = null;
+
 /** Moves `#token=` from the URL into storage and strips it from the address bar. */
 export function takeHashToken(): void {
   const t = readHashToken();
-  if (t) lsSet(KEYS.token, t);
+  if (t) saveToken(t);
 }
 
 /** The `#token=` in the URL, stripped from the address bar (not stored). */
@@ -43,8 +49,11 @@ export function readHashToken(): string | null {
   return t;
 }
 
-export const loadToken = () => lsGet(KEYS.token);
-export const saveToken = (t: string | null) => lsSet(KEYS.token, t);
+export const loadToken = () => lsGet(KEYS.token) ?? memoryToken;
+export function saveToken(t: string | null): void {
+  memoryToken = t;
+  lsSet(KEYS.token, t);
+}
 
 // ---- fullscreen -------------------------------------------------------------------------------
 

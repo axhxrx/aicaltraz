@@ -1,8 +1,11 @@
 /**
  * Validation errors ("pads.0.buttons.2.action.command: …", from parseConfig or the host's 400)
- * mapped onto the draft: which pad, which button, which field, in plain words.
+ * mapped onto the draft: which pad, which button, which field, in plain words. Also the host's
+ * worded form, which names things by id (`pad "lights" › button "key": …`, or `pad #2` when an id
+ * doesn't say which): PUT warnings come that way (src/server/config-warnings.ts), resolved against
+ * the config they're about.
  */
-import { ENV_NAME_MESSAGE, type Config } from '../../core/config.ts';
+import { ENV_NAME_MESSAGE, type Button, type Config } from '../../core/config.ts';
 
 export interface Problem {
   pad: number | null;
@@ -27,6 +30,8 @@ const FIELD: Record<string, string> = {
   confirmWindowMs: 'Confirm window',
   timeoutMs: 'Timeout',
   resultHoldMs: 'Result time',
+  cooldownMs: 'Ignore presses after',
+  stops: 'Stops',
   key: 'Key',
   action: 'Action',
   'action.type': 'Action type',
@@ -43,6 +48,7 @@ export function fieldName(field: string): string {
   if (arg) return `Argument ${Number(arg[1]) + 1}`;
   const env = /^action\.env\.(.+)$/.exec(field);
   if (env) return `Variable ${env[1]}`;
+  if (/^stops\.\d+$/.test(field)) return 'Stops';
   return FIELD[field] ?? field;
 }
 
@@ -53,7 +59,9 @@ export function pretty(msg: string): string {
   if ((m = /^Too big: expected number to be <=?(.+)$/.exec(msg))) return `Must be at most ${m[1]}`;
   if (/expected int, received number/.test(msg)) return 'Must be a whole number';
   if (/expected number, received/.test(msg)) return 'Must be a number';
+  if ((m = /^Too big: expected string to have <=(\d+) characters?$/.exec(msg))) return `At most ${m[1]} characters`;
   if (/^Too small: expected array to have >=1 items?$/.test(msg)) return 'Needs at least one';
+  if (msg === 'use pad/button, pad/* or *') return 'Use pad/button, pad/* or *';
   if (/^duplicate button id/.test(msg)) return 'Another button on this pad has this id';
   if (/^duplicate pad id/.test(msg)) return 'Another pad has this id';
   if (msg === 'letters, digits, _ and - only') return 'Letters, digits, _ and - only';
@@ -61,9 +69,40 @@ export function pretty(msg: string): string {
   return msg;
 }
 
-/** Split "path: message" (the message may contain ": " itself). */
-export function toProblems(errors: string[]): Problem[] {
+/** `pad "x" › button "y": message` (either may be `#n`, 1-based). */
+const BY_ID = /^pad (?:"([\w-]+)"|#(\d+))(?: › button (?:"([\w-]+)"|#(\d+)))?: ([\s\S]*)$/;
+
+/**
+ * A host warning's field, by what it says (config-warnings.ts): the program for exec, the shell for
+ * shell actions, the folder, a stops pattern. The message loses the words the field name says.
+ */
+function warningField(msg: string, b: Pick<Button, 'action'> | undefined): { field: string | null; message: string } {
+  let m: RegExpExecArray | null;
+  const program = b?.action.type === 'shell' ? 'action.shell' : 'action.command';
+  if ((m = /^cwd not found: ([\s\S]*)$/.exec(msg))) return { field: 'action.cwd', message: `not found: ${m[1]}` };
+  if ((m = /^(command|shell) not found: ([\s\S]*)$/.exec(msg))) return { field: m[1] === 'shell' ? 'action.shell' : 'action.command', message: `not found: ${m[2]}` };
+  if ((m = /^stops "(.*)" matches no other button$/.exec(msg))) return { field: 'stops', message: `“${m[1]}” matches no other button` };
+  if (/^(is a directory|not a regular file|permission denied|not executable|interpreter not found)/.test(msg)) return { field: program, message: msg };
+  return { field: null, message: msg };
+}
+
+/**
+ * Split "path: message" (the message may contain ": " itself). `cfg`: the config they're about, to
+ * resolve the host's by-id form (without it, those stay general).
+ */
+export function toProblems(errors: string[], cfg?: Pick<Config, 'pads'>): Problem[] {
   return errors.map((raw) => {
+    const byId = BY_ID.exec(raw);
+    if (byId) {
+      const [, padId, padN, btnId, btnN, msg = ''] = byId as unknown as (string | undefined)[];
+      const pi = padN !== undefined ? Number(padN) - 1 : (cfg?.pads.findIndex((p) => p.id === padId) ?? -1);
+      const pad = cfg?.pads[pi];
+      if (!pad) return { pad: null, button: null, field: null, message: raw };
+      if (btnId === undefined && btnN === undefined) return { pad: pi, button: null, field: null, message: msg };
+      const bi = btnN !== undefined ? Number(btnN) - 1 : pad.buttons.findIndex((b) => b.id === btnId);
+      if (!pad.buttons[bi]) return { pad: pi, button: null, field: null, message: msg };
+      return { pad: pi, button: bi, ...warningField(msg, pad.buttons[bi]) };
+    }
     const at = raw.indexOf(': ');
     const path = at >= 0 ? raw.slice(0, at) : '(root)';
     const message = pretty(at >= 0 ? raw.slice(at + 2) : raw);

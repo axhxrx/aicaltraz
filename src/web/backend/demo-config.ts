@@ -16,11 +16,11 @@ export const DEMO_CONFIG: ConfigInput = {
       cols: 2,
       rows: 3,
       buttons: [
-        { id: 'key-light', label: 'Key light', color: '#facc15', x: 0, y: 0, key: '1', action: { type: 'shell', script: "echo '@status dimming up'; sleep 0.8; echo 'Key light at 80%'" } },
+        { id: 'key-light', label: 'Key light', color: '#facc15', x: 0, y: 0, key: '1', action: { type: 'shell', script: "echo '@status dimming up'; sleep 0.8; echo '@state ON 80%'; echo 'Key light at 80%'" } },
         { id: 'fill-light', label: 'Fill light', color: '#2f6fde', x: 1, y: 0, trigger: 'tap', key: '2', action: { type: 'shell', script: "sleep 0.5; echo 'Fill on'" } },
         { id: 'strobe', label: 'Strobe', color: '#db2777', x: 0, y: 1, trigger: 'double', key: '3', action: { type: 'shell', script: "echo '@status flash'; sleep 0.6; echo '@status flash flash'; sleep 0.6; echo 'Flashed 3×'" } },
         { id: 'backdrop', label: 'Backdrop sunset', color: '#7c3aed', x: 1, y: 1, key: '4', action: { type: 'shell', script: `${progress(8, 3.2, (i) => (i < 4 ? 'fading in' : 'warming'))}; echo 'Sunset scene on'` } },
-        { id: 'all-off', label: 'ALL OFF', color: '#4338ca', x: 0, y: 2, w: 2, holdMs: 800, confirm: true, key: '0', action: { type: 'shell', script: "echo '@status cutting power'; sleep 1.2; echo 'Everything off'" } },
+        { id: 'all-off', label: 'ALL OFF', color: '#4338ca', x: 0, y: 2, w: 2, holdMs: 800, confirm: true, key: '0', stops: ['lights/*'], action: { type: 'shell', script: "echo '@status cutting power'; sleep 1.2; echo 'Everything off'" } },
       ],
     },
     {
@@ -42,7 +42,7 @@ export const DEMO_CONFIG: ConfigInput = {
       cols: 1,
       rows: 2,
       buttons: [
-        { id: 'rec', label: 'REC', color: '#f97316', x: 0, y: 0, key: 'Enter', action: { type: 'shell', script: "echo '@status starting'; sleep 0.9; echo 'Recording'" } },
+        { id: 'rec', label: 'REC', color: '#f97316', x: 0, y: 0, key: 'Enter', action: { type: 'shell', script: "echo '@status starting'; sleep 0.9; echo '@state REC ●'; echo 'Recording'" } },
         { id: 'mark', label: 'Mark clip', color: '#2f6fde', x: 0, y: 1, trigger: 'tap', key: ' ', action: { type: 'shell', script: "sleep 0.3; echo 'Marked 00:14:32'" } },
       ],
     },

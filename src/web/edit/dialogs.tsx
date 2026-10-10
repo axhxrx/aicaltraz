@@ -3,6 +3,7 @@
  * resolve, a save that would stop running actions, a broken config file on the host, and a draft
  * kept from an earlier session. Each that can destroy work focuses its safe way out.
  */
+import { useState } from 'preact/hooks';
 import type { Conflict, Side } from './merge.ts';
 import { Dialog, Segmented } from './fields.tsx';
 import { fieldName } from './problems.ts';
@@ -139,6 +140,7 @@ export function StopDialog(p: { runs: { name: string; ms: number }[]; onSave(): 
 }
 
 export function BrokenFileDialog(p: { errors: string[]; onSave(): void; onCancel(): void }) {
+  const [all, setAll] = useState(false);
   return (
     <Dialog
       title="The config file on the host is broken"
@@ -158,15 +160,30 @@ export function BrokenFileDialog(p: { errors: string[]; onSave(): void; onCancel
     >
       <p>
         The config file on the host is currently invalid
-        {p.errors.length ? (
+        {p.errors.length && !all ? (
           <>
             {' '}
             (<span data-testid="broken-errors">{p.errors.slice(0, 3).join('; ')}</span>
-            {p.errors.length > 3 ? `; +${p.errors.length - 3} more` : ''})
+            {p.errors.length > 3 && (
+              <>
+                ;{' '}
+                <button type="button" class="ed-link is-inline" data-testid="broken-more" onClick={() => setAll(true)}>
+                  +{p.errors.length - 3} more
+                </button>
+              </>
+            )}
+            )
           </>
         ) : null}
         : maybe someone is editing it by hand right now. The host still runs the previous config.
       </p>
+      {all && (
+        <ul class="ed-errlist" data-testid="broken-errors">
+          {p.errors.map((e, i) => (
+            <li key={i}>{e}</li>
+          ))}
+        </ul>
+      )}
       <p>
         <b>Saving will replace it</b> with your config, and whatever was in it is gone.
       </p>

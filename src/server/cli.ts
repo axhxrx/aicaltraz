@@ -1,15 +1,18 @@
 /** Command line: flags, startup banner with pairing URLs + QR, --ready-json, graceful shutdown. */
 import { readFileSync } from 'node:fs';
-import { constants, networkInterfaces } from 'node:os';
+import { constants, homedir, networkInterfaces } from 'node:os';
+import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import QRCode from 'qrcode';
-import { ConfigLoadError } from './config-store.ts';
+import { configWarnings } from './config-warnings.ts';
+import { errnoText } from './errors.ts';
 import { startHost, VERSION, type Host } from './host.ts';
 
 export const USAGE = `Usage: buttpad [options]
 
   --config PATH     config file (default ./buttpad.config.json, or $BUTTPAD_CONFIG);
-                    a starter config is written there if it doesn't exist
+                    a starter config is written there if it doesn't exist. Paths may
+                    start with ~/ (here and below), even quoted
   --secrets PATH    token file (default: buttpad.secrets.json next to the config)
   --host H          listen address (overrides config server.host)
   --port N          listen port (overrides config server.port; 0 = any free port)
@@ -38,6 +41,16 @@ export interface CliOptions {
   dev: boolean;
   help: boolean;
   version: boolean;
+}
+
+/**
+ * `~` and `~/x` → the home directory, as a shell would have done: `--config=~/x`, a quoted `'~/x'` and
+ * `BUTTPAD_CONFIG='~/x'` reach us unexpanded (and would otherwise create a directory named `~`).
+ */
+export function expandTilde(p: string, home: string = homedir()): string {
+  if (p === '~') return home;
+  if (p.startsWith('~/') || (process.platform === 'win32' && p.startsWith('~\\'))) return join(home, p.slice(2));
+  return p;
 }
 
 export function parseCli(argv: string[], env: Record<string, string | undefined> = process.env): CliOptions {
@@ -74,15 +87,17 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
   const key = values['tls-key'];
   if (!cert !== !key) throw new UsageError('--tls-cert and --tls-key go together');
   if (values.host === '') throw new UsageError('--host must not be empty');
+  const home = env.HOME || env.USERPROFILE || homedir();
+  const path = (p: string) => expandTilde(p, home);
   return {
-    config: values.config || env.BUTTPAD_CONFIG || './buttpad.config.json',
-    secrets: values.secrets,
+    config: path(values.config || env.BUTTPAD_CONFIG || './buttpad.config.json'),
+    secrets: values.secrets === undefined ? undefined : path(values.secrets),
     host: values.host,
     port,
     rotateTokens: !!values['rotate-tokens'],
     qr: !values['no-qr'],
     readyJson: !!values['ready-json'],
-    tls: cert && key ? { cert, key } : undefined,
+    tls: cert && key ? { cert: path(cert), key: path(key) } : undefined,
     dev: !!values.dev,
     help: !!values.help,
     version: !!values.version,
@@ -114,6 +129,7 @@ async function printBanner(host: Host, out: (s: string) => void, qr: boolean) {
   if (host.created.rotatedTokens) out(`Rotated the tokens in ${host.secretsPath}: previously paired devices must pair again.`);
   if (host.created.fixedSecretsMode) out(`Tightened ${host.secretsPath} permissions to 0600.`);
   out(`Listening on ${host.scheme}://${host.hostname}:${host.port}`);
+  for (const w of configWarnings(cfg, host.config.dir)) out(`⚠  ${w}`);
 
   const hosts = pairingHosts(host.hostname);
   const url = (h: string, token: string) => pairingUrl(host.scheme, h, host.port, token);
@@ -221,10 +237,10 @@ export async function main(argv: string[]): Promise<void> {
       log,
     });
   } catch (e) {
-    const err = e as NodeJS.ErrnoException;
-    if (e instanceof ConfigLoadError) process.stderr.write(`buttpad: invalid config ${e.path}:\n  ${e.errors.join('\n  ')}\n`);
-    else if (err.code === 'EADDRINUSE') process.stderr.write(`buttpad: address in use (${err.message}); pick another --port, or --port 0 for any free one\n`);
-    else process.stderr.write(`buttpad: ${err.message ?? String(e)}\n`);
+    // ListenError, WriteError and the like already say what happened in words; a bare errno gets them.
+    const msg = e instanceof Error ? e.message : String(e);
+    const file = /^E[A-Z]+: .*'([^']+)'$/.exec(msg)?.[1];
+    process.stderr.write(`buttpad: ${/^E[A-Z]+: /.test(msg) ? `${errnoText(e)}${file ? `: ${file}` : ''}` : msg}\n`);
     process.exit(1);
   }
   g.__buttpadHost = host;

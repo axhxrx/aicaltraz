@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import type { ConfigInput } from '../src/core/config.ts';
-import type { RunRecord } from '../src/core/protocol.ts';
+import { PROTOCOL_VERSION, type RunRecord } from '../src/core/protocol.ts';
 import { revOf } from '../src/server/config-store.ts';
 import { ADMIN_RESERVED, MAX_CLIENTS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
 import { CANCEL_GRACE_MS } from '../src/server/state-store.ts';
@@ -103,7 +103,7 @@ describe('auth', () => {
     const { api } = await setup();
     const r = await api('/api/health', { token: null });
     expect(r.status).toBe(200);
-    expect(await r.json()).toEqual({ ok: true, protocol: 1, version: expect.any(String) });
+    expect(await r.json()).toEqual({ ok: true, protocol: PROTOCOL_VERSION, version: expect.any(String) });
   });
 
   test('401 for missing, malformed or wrong tokens on every protected route', async () => {
@@ -149,7 +149,8 @@ describe('auth', () => {
   });
 
   test(`at most ${MAX_CLIENTS} WebSocket connections; more are refused with 503`, async () => {
-    const { host, ws, press, admin } = await setup();
+    // All from 127.0.0.1: lift the per-address cap (test/runtime-v2.test.ts has that one).
+    const { host, ws, press, admin } = await setup(baseConfig(), { limits: { clientsPerAddress: MAX_CLIENTS } });
     const open = await Promise.all(Array.from({ length: MAX_CLIENTS }, (_, i) => ws(i % 2 ? press : admin)));
     expect(await rawUpgrade(host.port, `/ws?token=${admin}`)).toStartWith('HTTP/1.1 503');
     await expect(TestClient.connect(`ws://127.0.0.1:${host.port}/ws?token=${press}`)).rejects.toThrow();
@@ -158,7 +159,7 @@ describe('auth', () => {
   });
 
   test(`press tokens can't take the last ${ADMIN_RESERVED} connection slots from admins`, async () => {
-    const { host, ws, press, admin } = await setup();
+    const { host, ws, press, admin } = await setup(baseConfig(), { limits: { clientsPerAddress: MAX_CLIENTS } });
     await Promise.all(Array.from({ length: MAX_CLIENTS - ADMIN_RESERVED }, () => ws(press)));
     expect(await rawUpgrade(host.port, `/ws?token=${press}`)).toStartWith('HTTP/1.1 503');
     expect(await rawUpgrade(host.port, `/ws?token=${admin}`)).toStartWith('HTTP/1.1 101');
@@ -200,7 +201,7 @@ describe('WebSocket', () => {
     const a = await ws(admin);
     const ph = await p.next('hello');
     const ah = await a.next('hello');
-    expect(ph).toMatchObject({ protocol: 1, role: 'press', rev: host.config.rev, host: { name: expect.any(String), version: expect.any(String), platform: process.platform } });
+    expect(ph).toMatchObject({ protocol: PROTOCOL_VERSION, role: 'press', rev: host.config.rev, latched: {}, host: { name: expect.any(String), version: expect.any(String), platform: process.platform } });
     expect(Math.abs(ph.serverNow - Date.now())).toBeLessThan(5000);
     expect(ph.states).toEqual({ 'main/quick': { phase: 'ready', runId: 0 }, 'main/long': { phase: 'ready', runId: 0 }, 'main/secret': { phase: 'ready', runId: 0 } });
     expect(JSON.stringify(ph.config)).not.toContain('SECRET-COMMAND');
@@ -216,7 +217,7 @@ describe('WebSocket', () => {
     await a.next('hello');
     p.send({ t: 'press', id: 'c1', pad: 'main', button: 'quick' });
     const ack = await p.next('ack');
-    expect(ack).toEqual({ t: 'ack', id: 'c1', key: 'main/quick', result: 'started' });
+    expect(ack).toEqual({ t: 'ack', id: 'c1', key: 'main/quick', result: 'started', runId: 1 });
     const running = await p.next('state', (m) => m.state.phase === 'running');
     expect(p.indexOf(ack)).toBeLessThan(p.indexOf(running));
     for (const c of [p, a]) {
@@ -365,7 +366,8 @@ describe('config over HTTP and hand edits', () => {
     next.pads[0].buttons.push({ id: 'new', x: 0, y: 1, action: { type: 'exec', command: 'true', args: [] } });
     const ok = await put({ config: next, baseRev: rev });
     expect(ok.status).toBe(200);
-    const { rev: newRev } = await ok.json();
+    const { rev: newRev, warnings } = await ok.json();
+    expect(warnings).toEqual([]);
     expect(newRev).not.toBe(rev);
     expect(newRev).toBe(revOf(readFileSync(configPath)));
     expect(host.config.rev).toBe(newRev);
@@ -450,7 +452,8 @@ describe('config over HTTP and hand edits', () => {
     cfg.pads[0]!.buttons![1]!.x = 0; // overlap
     writeJson(configPath, cfg);
     const err = await a.next('configError', () => true, 3000);
-    expect(err.errors).toEqual(['pads.0.buttons.1: button "long" overlaps "quick" at cell 0,0']);
+    // Worded for people: by id, with the line in the file.
+    expect(err.errors).toEqual([expect.stringMatching(/^pad "main" › button "long": overlaps "quick" at cell 0,0 \(line \d+\)$/)]);
     writeFileSync(configPath, '{ "version": 1, ');
     const err2 = await a.next('configError', (m) => m.errors[0]!.includes('invalid JSON'), 3000);
     expect(err2.errors.length).toBe(1);

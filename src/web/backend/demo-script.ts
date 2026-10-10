@@ -1,6 +1,6 @@
 /**
  * Demo-mode "runner": simulates an action by interpreting a tiny subset of sh (sleep, echo, printf,
- * exit, true, false, `;` `&&` `||`, `>&2`). Anything else is a pretend command that takes a moment
+ * exit, true, false, `;` `&&` `||`, `>&2`; `@progress`/`@status`/`@result`/`@state` lines are echoes). Anything else is a pretend command that takes a moment
  * and sometimes fails. So the demo config's scripts also work unchanged on a real host.
  */
 import type { Action } from '../../core/config.ts';
@@ -67,6 +67,7 @@ function tokenize(s: string): Stmt {
 }
 
 function actionChain(a: Action): Chain {
+  if (a.type === 'none') return [];
   if (a.type === 'shell') return parseShell(a.script);
   const name = a.command.split(/[\\/]/).pop() ?? a.command;
   return [{ op: ';', stmt: { argv: [name, ...a.args], stderr: false } }];

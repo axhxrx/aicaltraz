@@ -348,7 +348,7 @@ describe('CLI (spawned)', () => {
     const p = spawnCli(['--config', config, '--port', '0']);
     expect(await p.proc.exited).toBe(1);
     expect(p.stderr()).toContain('invalid config');
-    expect(p.stderr()).toContain('pads.0.buttons.0: button "a" extends outside the 2x2 grid');
+    expect(p.stderr()).toContain('pad "p" › button "a": extends outside the 2x2 grid (line 8)');
     expect(readFileSync(config, 'utf8')).toContain('"x": 5');
   }, 15_000);
 
@@ -369,7 +369,7 @@ describe('CLI (spawned)', () => {
     const first = await startReady(['--config', join(dir, 'a.json')]);
     const second = spawnCli(['--config', join(dir, 'a.json'), '--port', String(first.ready.port), '--host', '0.0.0.0']);
     expect(await second.proc.exited).toBe(1);
-    expect(second.stderr()).toContain('address in use');
+    expect(second.stderr()).toContain(`buttpad: can't listen on 0.0.0.0:${first.ready.port}: port ${first.ready.port} is in use (another ButtPad?)`);
   }, 20_000);
 });
 

@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { Button, Config, findButton, parseConfig, type ConfigInput } from '../src/core/config.ts';
 import { atomicWrite, ConfigLoadError, ConfigStore, redactConfig, revOf, serializeConfig } from '../src/server/config-store.ts';
+import { configWarnings } from '../src/server/config-warnings.ts';
 import { starterConfig, starterConfigText } from '../src/server/starter.ts';
 import { cleanupTmp, padConfig, tmpDir, waitFor, writeJson } from './helpers.ts';
 
@@ -38,8 +39,9 @@ describe('schema validation', () => {
       whileRunning: 'ignore',
       confirm: false,
       confirmWindowMs: 3000,
-      timeoutMs: 30000,
+      timeoutMs: 120000,
       resultHoldMs: 2500,
+      cooldownMs: 400,
       action: { type: 'shell', script: 'true' },
     });
     expect(parseConfig({ version: 1, pads: [{ id: 'p', name: 'P' }] })).toMatchObject({ ok: true, config: { pads: [{ buttons: [] }] } });
@@ -157,7 +159,7 @@ describe('serializeConfig / redactConfig / revOf', () => {
     expect(out.pads[0].buttons).toEqual([
       { id: 'a', x: 0, y: 0, action: { type: 'exec', command: 'ls' } },
       { id: 'b', label: 'B', x: 1, y: 0, w: 2, trigger: 'tap', holdMs: 900, key: 'b', action: { type: 'exec', command: 'echo', args: ['x'], env: { A: '1' } } },
-      { id: 'c', x: 0, y: 1, confirm: true, action: { type: 'shell', script: 'true', shell: '/bin/sh', cwd: 'sub' } },
+      { id: 'c', x: 0, y: 1, timeoutMs: 30000, confirm: true, action: { type: 'shell', script: 'true', shell: '/bin/sh', cwd: 'sub' } },
     ]);
     expect(Object.keys(out)).toEqual(['$schema', 'version', 'server', 'pads']);
     expect(out.pads[0]).toMatchObject({ cols: 3, rows: 2 });
@@ -209,7 +211,7 @@ describe('ConfigStore', () => {
       throw new Error('expected a throw');
     } catch (e) {
       expect(e).toBeInstanceOf(ConfigLoadError);
-      expect((e as ConfigLoadError).errors[0]).toStartWith('(root): invalid JSON');
+      expect((e as ConfigLoadError).errors[0]).toBe('invalid JSON at line 1, column 25: expected a value for a list item, found "}"');
     }
     writeJson(join(dir, 'overlap.json'), padConfig([btn('a', 0, 0), btn('b', 0, 0)]));
     expect(() => ConfigStore.open(join(dir, 'overlap.json'))).toThrow(/overlaps/);
@@ -307,7 +309,7 @@ describe('ConfigStore', () => {
     writeFileSync(path, '{ nope');
     expect(store.sync()).toBe('error');
     expect(store.sync()).toBe('error');
-    expect(store.fileErrors?.[0]).toStartWith('(root): invalid JSON');
+    expect(store.fileErrors?.[0]).toStartWith('invalid JSON at line 1, column 3:');
     expect(store.rev).toBe(goodRev);
     expect(store.config.pads[0]!.buttons.length).toBe(2);
 
@@ -328,7 +330,7 @@ describe('ConfigStore', () => {
     const broken = '{ "version": 1, "pads": [ { "id": "p", "name": "Pad", "buttons": [ {"id": "theirs" ';
     writeFileSync(path, broken);
     const r = store.save(padConfig([btn('mine', 0, 0)]), goodRev);
-    expect(r).toEqual({ ok: false, status: 409, rev: revOf(broken), invalid: true, errors: [expect.stringMatching(/^\(root\): invalid JSON/)] });
+    expect(r).toEqual({ ok: false, status: 409, rev: revOf(broken), invalid: true, errors: [expect.stringMatching(/^invalid JSON at line 1, column \d+: /)] });
     expect(readFileSync(path, 'utf8')).toBe(broken);
     expect(store.rev).toBe(goodRev); // still running the last good config
     // Saving with the broken file's own rev means "I've seen it": that replaces it.
@@ -451,8 +453,69 @@ describe('ConfigStore', () => {
   });
 });
 
+/** READY colors that read as SUCCESS (green) or FAILURE (red) at a glance: hue bands, if saturated enough to tell. */
+function confusable(hex: string): 'red' | 'green' | undefined {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255) as [number, number, number];
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d === 0) return undefined;
+  const sat = d / (1 - Math.abs(2 * l - 1));
+  const hue = (max === r ? ((g - b) / d + 6) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4) * 60;
+  if (sat < 0.3 || l < 0.12 || l > 0.9) return undefined;
+  if (hue >= 330 || hue <= 25) return 'red';
+  if (hue >= 75 && hue <= 180) return 'green';
+  return undefined;
+}
+
 describe('examples and starter config', () => {
   const examplePath = join(root, 'examples', 'buttpad.example.json');
+
+  test('no READY color in the example or the starter looks like SUCCESS green or FAILURE red', () => {
+    expect(confusable('#2bd46e')).toBe('green'); // the web app's SUCCESS
+    expect(confusable('#e3262b')).toBe('red'); // and FAILURE
+    expect(confusable('#d62828')).toBe('red'); // the old REC button
+    expect(confusable('#2a9d8f')).toBe('green'); // the old teal
+    const example = Config.parse(JSON.parse(readFileSync(examplePath, 'utf8')));
+    const colors = [...example.pads, ...Config.parse(starterConfig('/x/c.json', 'linux')).pads, ...Config.parse(starterConfig('/x/c.json', 'win32')).pads].flatMap((p) =>
+      p.buttons.map((b) => [`${p.id}/${b.id}`, b.color, confusable(b.color)]),
+    );
+    expect(colors.filter(([, , bad]) => bad)).toEqual([]);
+  });
+
+  test('the example shows the v2 features: a confirmed All off that stops the lights, STOP ALL, a long haze', () => {
+    const cfg = Config.parse(JSON.parse(readFileSync(examplePath, 'utf8')));
+    expect(findButton(cfg, 'lights', 'all-off')).toMatchObject({ confirm: true, stops: ['lights/*'] });
+    expect(findButton(cfg, 'lights', 'stop-all')).toMatchObject({ label: 'STOP ALL', stops: ['*'], action: { type: 'none' } });
+    const haze = findButton(cfg, 'lights', 'haze')!;
+    expect(haze).toMatchObject({ timeoutMs: 120_000, whileRunning: 'cancel', action: { command: './scripts/haze.sh', args: ['45'] } });
+    // Every script is there and runnable: the only warning is the button that shows a missing binary.
+    expect(configWarnings(cfg, dirname(examplePath))).toEqual(['pad "test" › button "spawn-fail": command not found: buttpad-no-such-tool (not on PATH)']);
+  });
+
+  test('the fake devices latch their state with @state', () => {
+    const state = tmpDir();
+    const sh = (...argv: string[]) =>
+      Bun.spawnSync(argv, { cwd: dirname(examplePath), env: { ...process.env, BUTTPAD_FAKE_STATE: state } })
+        .stdout.toString()
+        .split('\n')
+        .filter((l) => l.startsWith('@state'));
+    expect(sh('./scripts/light.sh', 'key', '80')).toEqual(['@state ON 80%']);
+    expect(sh('./scripts/light.sh', 'key', 'off')).toEqual(['@state OFF']);
+    expect(sh('./scripts/light.sh', 'fill', 'toggle')).toEqual(['@state ON 80%']);
+    expect(sh('./scripts/light.sh', 'all', 'off')).toEqual([]);
+    expect(sh('./scripts/camera.sh', 'rec')).toEqual(['@state REC ●']);
+    expect(sh('./scripts/camera.sh', 'rec')).toEqual(['@state']);
+  }, 20_000);
+
+  test('the starter has a stop button that runs nothing, and nothing in it would fail to start', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      const cfg = Config.parse(starterConfig('/x/buttpad.config.json', platform));
+      expect(findButton(cfg, 'host', 'stop')).toMatchObject({ stops: ['*'], action: { type: 'none' } });
+    }
+    if (process.platform !== 'win32') expect(configWarnings(Config.parse(starterConfig('/x/c.json')), tmpDir())).toEqual([]);
+  });
 
   test('the example config is valid and already in canonical (compact) form', () => {
     const text = readFileSync(examplePath, 'utf8');

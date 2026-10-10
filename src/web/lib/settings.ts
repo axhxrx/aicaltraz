@@ -40,9 +40,26 @@ export interface DeviceSettings {
   sound: boolean;
   haptics: boolean;
   keepAwake: boolean;
+  /**
+   * Rough mode (gloves, a vibrating mount): one button at a time per pad, firmer taps (80 ms),
+   * a cooldown of at least 800 ms after each press, and 1.5× the drift tolerance.
+   */
+  rough: boolean;
 }
 
-const DEFAULTS: DeviceSettings = { sound: false, haptics: true, keepAwake: true };
+const DEFAULTS: DeviceSettings = { sound: false, haptics: true, keepAwake: true, rough: false };
+
+/** This browser refuses to store anything (private mode, "block all site data"). */
+export const storageBlocked = ((): boolean => {
+  try {
+    const k = 'buttpad.probe';
+    localStorage.setItem(k, '1');
+    localStorage.removeItem(k);
+    return false;
+  } catch {
+    return true;
+  }
+})();
 
 export const settings = createStore<DeviceSettings>({ ...DEFAULTS, ...lsJSON<Partial<DeviceSettings>>(KEYS.settings) });
 settings.subscribe((s) => lsSet(KEYS.settings, JSON.stringify(s)));

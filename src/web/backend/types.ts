@@ -22,17 +22,27 @@ export interface Snapshot {
   config: WireConfig | null;
   rev: string | null;
   states: StateMap;
-  /** Add to a host timestamp to get a local `Date.now()` timestamp. */
+  /**
+   * Add to a host timestamp to get a local one (lib/clock.ts `wall()`, which is `Date.now()` unless
+   * the device's clock was set meanwhile). Learned from every hello.
+   */
   clockSkew: number;
   host: HostInfo | null;
   /** Hand-edited config file on the host is invalid (admins only). */
   configErrors: string[] | null;
   /** While not online: local time of the next connection attempt. */
   retryAt: number | null;
+  /** Latched device state per button key (`@state` lines), e.g. "REC ●". */
+  latched: Record<string, string>;
+  /** The host turns connections away (503: too many devices connected). */
+  hostFull: boolean;
+  /** While not online: local (wall()) time of the last word from the host, if it ever spoke. */
+  lastSeen: number | null;
 }
 
 export type SaveResult =
-  | { ok: true; rev: string }
+  /** `warnings`: saved, but the host has doubts (e.g. a program it can't find); paths like errors'. */
+  | { ok: true; rev: string; warnings?: string[] }
   | { ok: false; kind: 'invalid'; errors: string[] }
   /** The config on the host isn't `baseRev` any more; `invalid`: its file is broken right now (`errors`). */
   | { ok: false; kind: 'conflict'; rev: string; invalid?: boolean; errors?: string[] }
@@ -42,6 +52,21 @@ export type SaveResult =
 /** Max PUT /api/config body, as the host enforces it. */
 export const MAX_CONFIG_BYTES = 1024 * 1024;
 export const TOO_LARGE = 'config too large (max 1 MB)';
+
+export interface PressOpts {
+  /** The user went through the button's confirm step (the host requires it for `confirm` buttons). */
+  confirm?: boolean;
+  /** Runs when the press is on the wire. */
+  onSent?: () => void;
+  /** The host's whole answer, right before the promise resolves with its `result`. */
+  onAck?: (ack: PressAck) => void;
+}
+
+/** `runId`: for started/queued/cancelling, the run the press started, queued behind or is cancelling. */
+export interface PressAck {
+  result: PressResult;
+  runId?: number;
+}
 
 /**
  * Why a press has no ack. `sent: false`: it never left this device (not connected), so it surely
@@ -62,12 +87,16 @@ export interface Backend {
   readonly snapshot: Store<Snapshot>;
   /**
    * Send a press; resolves with the host's ack, rejects with a PressError. A press is sent right
-   * away or not at all (never queued for later: a press that fires late is worse than none).
-   * `onSent` runs when it is on the wire. It never times out on its own: the UI owns the 2 s
-   * "NO RESPONSE" rule, counted from `onSent`.
+   * away or not at all (never queued for later: a press that fires late is worse than none), and
+   * carries when it was made (`at`, host clock) so the host drops one that took too long to get
+   * there (`expired`). `onSent` runs when it is on the wire. It never times out on its own: the UI
+   * owns the 2 s "NO RESPONSE" rule, counted from `onSent`.
    */
-  press(pad: string, button: string, onSent?: () => void): Promise<PressResult>;
-  /** The link looks dead (e.g. a press went unacknowledged): check it now; reconnect if it is. */
+  press(pad: string, button: string, opts?: PressOpts): Promise<PressResult>;
+  /**
+   * The link looks dead (e.g. a press went unacknowledged): check it now; reconnect if it is.
+   * Offline (someone touched a button): try to connect now, not at the next retry.
+   */
   kick(): void;
   /**
    * Admin: replace the config (PUT /api/config semantics; `force` replaces whatever is there). Gives
@@ -91,5 +120,8 @@ export const emptySnapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   host: null,
   configErrors: null,
   retryAt: null,
+  latched: {},
+  hostFull: false,
+  lastSeen: null,
   ...over,
 });

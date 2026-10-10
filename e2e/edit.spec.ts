@@ -303,7 +303,7 @@ test('validation errors show inline, mark the button and block saving', async ({
   await page.getByTestId('field-id').fill('no spaces');
   await expect(page.getByTestId('error-id')).toHaveText('Letters, digits, _ and - only');
   await page.getByTestId('field-holdMs').fill('50');
-  await expect(page.getByTestId('error-holdMs')).toHaveText('Must be at least 100');
+  await expect(page.getByTestId('error-holdMs')).toHaveText('Must be at least 100 ms');
   await page.getByTestId('edit-save').click();
   const notice = page.getByTestId('notice-problems');
   await expect(notice).toContainText("Can't save yet: 3 problems");
@@ -557,11 +557,239 @@ test('duplicate leaves the key binding behind; changing ids says what breaks; hi
   await page.getByTestId('field-id').fill('alpha2');
   await expect(page.getByTestId('id-warning')).toContainText('POST /api/press/main/alpha');
   await page.getByTestId('editor-tab-action').click();
-  await expect(page.getByTestId('field-shell')).toHaveAttribute('placeholder', '$SHELL (or /bin/sh)');
+  // The host's default shell is /bin/sh, never $SHELL.
+  await expect(page.getByTestId('field-shell')).toHaveAttribute('placeholder', '/bin/sh');
   await page.getByTestId('field-action-type-exec').click();
   await expect(page.getByTestId('button-editor')).toContainText('A relative path (./x.sh) starts in the working folder');
   await expect(page.getByTestId('button-editor')).toContainText("Default: the config file's folder");
   await page.getByTestId('edit-pad-settings').click();
   await page.getByTestId('pad-id').fill('mainx');
   await expect(page.getByTestId('pad-id-warning')).toContainText('?pad=main');
+});
+
+test('the color field keeps every keystroke of a fast-typed hex code', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  const field = page.getByTestId('field-color-text');
+  await field.click();
+  await field.press('ControlOrMeta+a');
+  // As fast as keys come: "#d62" and "#d628" are valid colors on the way (#rgb, #rgba).
+  await page.keyboard.type('#d62828');
+  await expect(field).toHaveValue('#d62828');
+  await page.waitForTimeout(300);
+  await expect(field).toHaveValue('#d62828');
+  await page.getByTestId('field-label').click();
+  await expect(field).toHaveValue('#d62828');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0].color).toBe('#d62828');
+});
+
+test('a new button fails visibly until it is set up; switched to Program it starts blank (no sample -c args)', async ({ page }) => {
+  await p.tap(await center(cell(page, 2, 0)));
+  await page.getByTestId('editor-tab-action').click();
+  await expect(page.getByTestId('field-script')).toHaveValue("echo 'No action set — edit this button' >&2; exit 1");
+  await expect(page.getByTestId('placeholder-note')).toBeVisible();
+  await page.getByTestId('field-action-type-exec').click();
+  await expect(page.getByTestId('field-command')).toHaveValue('');
+  await expect(page.locator('input[data-testid^="field-arg-"]')).toHaveCount(0);
+  // Straight back: the placeholder again.
+  await page.getByTestId('field-action-type-shell').click();
+  await expect(page.getByTestId('field-script')).toHaveValue("echo 'No action set — edit this button' >&2; exit 1");
+  // The flow that saved `haze.sh -c "echo…" 5` before: Program, a command, one argument.
+  await page.getByTestId('field-action-type-exec').click();
+  await page.getByTestId('field-command').fill('./scripts/haze.sh');
+  await page.getByTestId('field-arg-add').click();
+  await page.keyboard.type('5');
+  // A second new button, left as it is.
+  await p.tap(await center(cell(page, 2, 1)));
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  const buttons = (await saved(page)).pads[0].buttons;
+  expect(buttons[3].action).toEqual({ type: 'exec', command: './scripts/haze.sh', args: ['5'] });
+  expect(buttons[4]).toMatchObject({ id: 'button-5', action: { type: 'shell', script: "echo 'No action set — edit this button' >&2; exit 1" } });
+  // Pressed before it's set up: a ✗ that says why, not a ✓ "Done".
+  await p.tap(await center(item(page, 'button-5')));
+  await page.getByTestId('editor-tab-runs').click();
+  await page.getByTestId('run-test').click();
+  await expect(page.getByTestId('run-item').first()).toContainText('Exit 1');
+  await expect(page.getByTestId('run-item').first()).toContainText('No action set — edit this button');
+});
+
+test('a duplicate glows where it landed: no refused red, no shake', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('editor-duplicate').click();
+  const copy = item(page, 'alpha-copy');
+  await expect(copy).toHaveAttribute('data-added', '');
+  await expect(copy).not.toHaveAttribute('data-refused');
+  await expect(copy.locator('.ed-ring')).toHaveCSS('animation-name', 'ed-added');
+  await expect(copy.locator('.bp-face')).not.toHaveCSS('animation-name', 'ed-shake');
+  await expect(copy).not.toHaveAttribute('data-added', { timeout: 2000 });
+});
+
+test('a READY color that reads like success green or failure red gets a (non-blocking) warning', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  const text = page.getByTestId('field-color-text');
+  const warning = page.getByTestId('color-warning');
+  await expect(warning).toHaveCount(0);
+  for (const [color, look] of [
+    ['#d62828', 'failure'],
+    ['#8b0000', 'failure'],
+    ['#22c55e', 'success'],
+    ['#10b981', 'success'],
+  ] as const) {
+    await text.fill(color);
+    await expect(warning).toHaveAttribute('data-look', look);
+  }
+  await expect(warning).toContainText('SUCCESS');
+  // The palette's pink, orange and teal are fine.
+  for (const c of ['db2777', 'f97316', '0d9488']) {
+    await page.getByTestId(`field-color-swatch-${c}`).click();
+    await expect(warning).toHaveCount(0);
+  }
+  await text.fill('#d62828');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0].color).toBe('#d62828');
+});
+
+test('"Nothing (stop others)" and Stops: pick buttons, a pad or everything; renames and deletes keep them in step', async ({ page }) => {
+  await p.tap(await center(item(page, 'beta')));
+  await page.getByTestId('editor-tab-action').click();
+  await page.getByTestId('field-action-type-none').click();
+  await expect(page.getByTestId('field-script')).toHaveCount(0);
+  await expect(page.getByTestId('field-cwd')).toHaveCount(0);
+  await expect(page.getByTestId('output-tips')).toHaveCount(0);
+  await expect(page.getByTestId('none-stops-nothing')).toBeVisible();
+  // Itself isn't offered.
+  await expect(page.getByTestId('stop-main/beta')).toHaveCount(0);
+  await page.getByTestId('stop-main/alpha').click();
+  await page.getByTestId('stop-main/gamma').click();
+  await page.getByTestId('stop-second/*').click();
+  await expect(page.getByTestId('none-stops-nothing')).toHaveCount(0);
+  await expect(page.getByTestId('stop-second/solo')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.getByTestId('stop-second/solo')).toBeDisabled();
+  await expect(page.getByTestId('stops-summary')).toHaveText("Stops 3 buttons when they're running.");
+  await page.getByTestId('stop-all').click();
+  await expect(page.getByTestId('stop-main/alpha')).toBeDisabled();
+  await expect(page.getByTestId('stops-summary')).toHaveText('Stops everything else that runs.');
+  await page.getByTestId('stop-all').click();
+  // Alpha gets a new id: beta still stops it. Gamma goes: so does beta's pattern for it.
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('editor-tab-button').click();
+  await page.getByTestId('field-id').fill('alpha2');
+  await p.tap(await center(item(page, 'gamma')));
+  await page.getByTestId('editor-delete').click();
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  const beta = (await saved(page)).pads[0].buttons.find((b: { id: string }) => b.id === 'beta');
+  expect(beta.action).toEqual({ type: 'none' });
+  expect(beta.stops).toEqual(['main/alpha2', 'second/*']);
+  // The pad's id changes: its pattern follows.
+  await page.getByTestId('edit-tab-second').click();
+  await page.getByTestId('edit-pad-settings').click();
+  await page.getByTestId('pad-id').fill('other');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons.find((b: { id: string }) => b.id === 'beta').stops).toEqual(['main/alpha2', 'other/*']);
+  // Switching straight back from Nothing gives the script it had.
+  await page.getByTestId('edit-tab-main').click();
+  await p.tap(await center(item(page, 'beta')));
+  await page.getByTestId('editor-tab-action').click();
+  await page.getByTestId('field-action-type-shell').click();
+  await expect(page.getByTestId('field-script')).toHaveValue('echo beta');
+});
+
+test('a pattern that names nothing is listed to remove; Stops on a scripted button too', async ({ page }) => {
+  const cfg: ConfigInput = { ...CONFIG, pads: [{ ...CONFIG.pads[0]!, buttons: CONFIG.pads[0]!.buttons!.map((b) => (b.id === 'alpha' ? { ...b, stops: ['gone/*', 'main/beta'] } : b)) }, CONFIG.pads[1]!] };
+  await page.evaluate((c) => localStorage.setItem('buttpad.demo.config', c), JSON.stringify(cfg));
+  await page.reload();
+  await expect(page.getByTestId('conn')).toHaveAttribute('data-status', 'online');
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-edit').click();
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('editor-tab-action').click();
+  await expect(page.getByTestId('field-script')).toHaveValue('echo alpha');
+  await expect(page.getByTestId('stop-main/beta')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.getByTestId('stop-gone')).toContainText('gone/*');
+  await page.getByTestId('stop-gone-remove-gone/*').click();
+  await expect(page.getByTestId('stop-gone')).toHaveCount(0);
+  await page.getByTestId('stop-main/beta').click();
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0]).not.toHaveProperty('stops');
+});
+
+test('cooldown and the time fields: hints say the range, arrows stay inside it, out of range is an error in words', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await expect(page.getByTestId('field-cooldownMs')).toHaveValue('400');
+  await expect(page.getByTestId('button-editor')).toContainText('stops key chatter and bounces');
+  await page.getByTestId('field-cooldownMs').fill('1000');
+  await page.getByTestId('field-confirm').click();
+  await page.getByTestId('field-confirmWindowMs').fill('70000');
+  await expect(page.getByTestId('error-confirmWindowMs')).toHaveText('Must be at most 60000 ms (1 min)');
+  await page.getByTestId('field-confirmWindowMs').fill('59950');
+  await page.getByTestId('field-confirmWindowMs').press('ArrowUp');
+  await expect(page.getByTestId('field-confirmWindowMs')).toHaveValue('60000');
+  await page.getByTestId('field-resultHoldMs').fill('61000');
+  await expect(page.getByTestId('error-resultHoldMs')).toHaveText('Must be at most 60000 ms (1 min)');
+  await page.getByTestId('field-resultHoldMs').fill('3000');
+  await page.getByTestId('field-timeoutMs').fill('90000000');
+  await expect(page.getByTestId('error-timeoutMs')).toHaveText('Must be at most 86400000 ms (24 h)');
+  await page.getByTestId('field-timeoutMs').fill('120000');
+  await expect(page.getByTestId('button-editor')).toContainText('2 min, then it\'s killed');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0]).toMatchObject({ cooldownMs: 1000, confirm: true, confirmWindowMs: 60000, resultHoldMs: 3000, timeoutMs: 120000 });
+});
+
+test('a key also bound on another pad is pointed out (keys work from every pad)', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('field-key').click();
+  await page.keyboard.press('k');
+  await page.getByTestId('edit-tab-second').click();
+  await p.tap(await center(item(page, 'solo')));
+  await expect(page.getByTestId('field-key-conflict')).toHaveCount(0);
+  await page.getByTestId('field-key').click();
+  await page.keyboard.press('K');
+  const note = page.getByTestId('field-key-conflict');
+  await expect(note).toContainText('Also bound to “Alpha” on Main');
+  await expect(note).toContainText('on each of these pads its own button wins');
+  await expect(note).not.toContainText('does nothing');
+  // With a third pad, the key is ambiguous there.
+  await page.getByTestId('edit-add-pad').click();
+  await page.getByTestId('edit-tab-second').click();
+  await p.tap(await center(item(page, 'solo')));
+  await expect(note).toContainText("from any other pad the key does nothing, since it isn’t unique");
+});
+
+test('labels and pad names are saved trimmed (and the draft is clean after), a blank pad name is an error', async ({ page }) => {
+  await page.getByTestId('edit-pad-settings').click();
+  await page.getByTestId('pad-name').fill('   ');
+  await expect(page.getByTestId('error-pad-name')).toHaveText("Can't be empty");
+  await page.getByTestId('pad-name').fill('  Studio  ');
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('field-label').fill('Lamp  ');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0]).toMatchObject({ name: 'Studio', buttons: [{ label: 'Lamp' }, {}, {}] });
+  await expect(page.getByTestId('field-label')).toHaveValue('Lamp');
+  await expect(page.getByTestId('edit-tab-main')).toHaveText('Studio');
+});
+
+test('more than four problems: the rest of the list opens up', async ({ page, hasTouch }) => {
+  test.skip(hasTouch, 'phones step through problems one by one');
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('field-holdMs').fill('1');
+  await page.getByTestId('field-timeoutMs').fill('1');
+  await page.getByTestId('field-resultHoldMs').fill('99999999');
+  await page.getByTestId('field-cooldownMs').fill('99999999');
+  await page.getByTestId('field-id').fill('a b');
+  await page.getByTestId('field-driftPx').fill('-1');
+  await page.getByTestId('edit-save').click();
+  const notice = page.getByTestId('notice-problems');
+  await expect(notice.getByTestId('problem-item')).toHaveCount(4);
+  await notice.getByTestId('problems-more').click();
+  await expect(notice.getByTestId('problem-item')).toHaveCount(6);
+  await notice.getByTestId('problems-more').click();
+  await expect(notice.getByTestId('problem-item')).toHaveCount(4);
 });

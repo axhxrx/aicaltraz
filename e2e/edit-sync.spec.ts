@@ -292,8 +292,8 @@ test('a new button never takes the id of a deleted host button; unsaved ones get
   await expect(page.getByTestId('run-test')).toHaveCount(0);
   await page.getByTestId('run-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
-  await expect(page.getByTestId('run-item').first()).toContainText('OK · exit 0', { timeout: 8000 });
-  // It ran the new button: the deleted "Wipe card" never did.
+  // It ran the new button (whose placeholder action says it isn't set up): the deleted "Wipe card" never did.
+  await expect(page.getByTestId('run-item').first()).toContainText('No action set — edit this button', { timeout: 8000 });
   expect(existsSync(wiped)).toBe(false);
   // A changed (unsaved) button on the host: no "Run now" either, it would run the old version.
   await select(page, hasTouch, 'solo');

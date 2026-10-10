@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Config, type ConfigInput } from '../src/core/config.ts';
 import type { RunState } from '../src/core/machine.ts';
 import { startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec } from '../src/server/runner.ts';
-import { CANCEL_GRACE_MS, HISTORY_SIZE, START_LIMITS, StateStore, type StateStoreOptions } from '../src/server/state-store.ts';
+import { CANCEL_GRACE_MS, HISTORY_SIZE, START_LIMITS, StateStore, type PressOptions, type StateStoreOptions } from '../src/server/state-store.ts';
 import { cleanupTmp, isAlive, padConfig, tmpDir, waitFor, writeExecutable } from './helpers.ts';
 
 afterAll(cleanupTmp);
@@ -85,7 +85,7 @@ function setup(buttons: Buttons, opts: Partial<StateStoreOptions> = {}, pad: Par
     limits: { burst: 1e9, perSec: 0, maxRunning: 1e9 },
     ...opts,
   });
-  const press = (button: string) => store.press('p', button, (r) => events.push(`ack:${r}`)).result;
+  const press = (button: string, o: PressOptions = {}) => store.press('p', button, { onResult: (r) => events.push(`ack:${r.result}`), ...o }).result;
   const advance = (ms: number) => (mono += ms);
   return { store, runs, events, states, logs, press, advance, last: () => states.at(-1)?.[1] };
 }
@@ -120,11 +120,11 @@ describe('StateStore', () => {
     expect(rec).toMatchObject({ runId: 1, pad: 'p', button: 'a', exitCode: 0, reason: 'exit', stdout: 'final stdout' });
     expect(rec!.endedAt).toBeGreaterThan(rec!.startedAt);
     await waitFor(() => store.get('p/a')?.phase === 'ready', 1000, 'reset');
-    expect(store.get('p/a')).toEqual({ phase: 'ready', runId: 1 });
+    expect(store.get('p/a')).toEqual({ phase: 'ready', runId: 1, last: { runId: 1, ok: true, text: 'done', endedAt: rec!.endedAt! } });
   });
 
-  test('a huge resultHoldMs keeps the result up instead of overflowing to an instant reset', async () => {
-    const { store, runs, press } = setup([{ id: 'a', x: 0, y: 0, resultHoldMs: 1e12, action: shell('x') }]);
+  test('the longest resultHoldMs keeps the result up (no timer overflow to an instant reset)', async () => {
+    const { store, runs, press } = setup([{ id: 'a', x: 0, y: 0, resultHoldMs: 60_000, action: shell('x') }]);
     press('a');
     runs[0]!.exit({ exitCode: 0 });
     await Bun.sleep(50);
@@ -175,14 +175,18 @@ describe('StateStore', () => {
     expect(store.runs().map((r) => r.reason)).toEqual(['spawn', 'timeout']);
   });
 
-  test('whileRunning queue runs once more after the current run', () => {
+  test('whileRunning queue runs once more after the current run, once its result has shown', async () => {
     const { store, runs, last, press } = setup([{ id: 'q', x: 0, y: 0, whileRunning: 'queue', action: shell('x') }]);
     press('q');
     expect(press('q')).toBe('queued');
-    expect(press('q')).toBe('queued');
+    expect(press('q')).toBe('ignored'); // already queued
     expect(last()).toMatchObject({ phase: 'running', runId: 1, queued: true });
-    runs[0]!.exit({ exitCode: 0 });
-    expect(runs.length).toBe(2);
+    runs[0]!.exit({ exitCode: 3, text: 'boom' });
+    // The failure shows first (REQUEUE_GAP_MS), then the re-run starts.
+    expect(last()).toMatchObject({ phase: 'failure', runId: 1, text: 'boom', queued: true });
+    expect(runs.length).toBe(1);
+    expect(press('q')).toBe('ignored'); // the re-run is coming
+    await waitFor(() => runs.length === 2, 3000, 'the queued re-run');
     expect(runs[1]!.spec.env!.BUTTPAD_RUN_ID).toBe('2');
     expect(last()).toMatchObject({ phase: 'running', runId: 2 });
     expect(last()).not.toHaveProperty('queued');
@@ -193,7 +197,7 @@ describe('StateStore', () => {
 
   test('unknown buttons', () => {
     const { store, events } = setup([{ id: 'a', x: 0, y: 0, action: shell('x') }]);
-    expect(store.press('p', 'nope', (r, key) => events.push(`${r}:${key}`))).toEqual({ result: 'unknown-button', key: 'p/nope', state: undefined });
+    expect(store.press('p', 'nope', { onResult: (r) => events.push(`${r.result}:${r.key}`) })).toEqual({ result: 'unknown-button', key: 'p/nope', state: undefined });
     expect(store.press('zz', 'a').result).toBe('unknown-button');
     expect(events).toEqual(['unknown-button:p/nope']);
   });
@@ -353,22 +357,28 @@ describe('StateStore', () => {
     expect(runs.length).toBe(2);
   });
 
-  test(`rate limit: ${START_LIMITS.burst} starts at once, then ${START_LIMITS.perSec}/s; refusals are "ignored" and logged once per streak`, () => {
-    const { runs, press, advance, logs } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'queue', action: shell('x') }], { limits: undefined });
+  test(`rate limit: ${START_LIMITS.burst} starts at once over all devices, then ${START_LIMITS.perSec}/s; refusals are "ignored" and logged at most once per 10 s`, () => {
+    const { store, runs, press, advance, logs } = setup([{ id: 'a', x: 0, y: 0, whileRunning: 'queue', action: shell('x') }], { limits: undefined });
     for (let i = 0; i < START_LIMITS.burst; i++) {
       expect(press('a')).toBe('started');
       runs.at(-1)!.exit();
     }
+    const refused = store.press('p', 'a');
+    expect(refused).toMatchObject({ result: 'ignored', refused: 'rate' });
     expect(press('a')).toBe('ignored');
-    expect(press('a')).toBe('ignored');
-    expect(logs).toEqual([`ignoring presses: presses are coming in too fast (max ${START_LIMITS.burst} at once, then ${START_LIMITS.perSec}/s)`]);
+    const why = `refusing presses: too many from all devices together (max ${START_LIMITS.burst} at once, then ${START_LIMITS.perSec}/s)`;
+    expect(logs).toEqual([why]);
     advance(1000 / START_LIMITS.perSec);
     expect(press('a')).toBe('started');
     expect(press('a')).toBe('ignored'); // queueing a re-run takes a token too
     expect(runs.length).toBe(START_LIMITS.burst + 1);
-    expect(logs.length).toBe(2);
+    expect(logs.length).toBe(1); // within 10 s of the first report: counted, not logged
     advance(1000 / START_LIMITS.perSec);
     expect(press('a')).toBe('queued');
+    advance(10_000);
+    runs.at(-1)!.exit({ exitCode: 0 });
+    store.press('p', 'a'); // queued already: ignored, but not refused by a limit
+    expect(logs.length).toBe(1);
   });
 
   test(`at most ${START_LIMITS.maxRunning} runs at once over all buttons`, () => {
@@ -377,7 +387,7 @@ describe('StateStore', () => {
     const { runs, press, logs } = setup(buttons, { limits: { burst: 1e9, perSec: 0, maxRunning: START_LIMITS.maxRunning } }, { cols: 12, rows: 12 });
     for (let i = 0; i < n - 1; i++) expect(press(`b${i}`)).toBe('started');
     expect(press(`b${n - 1}`)).toBe('ignored');
-    expect(logs).toEqual([`ignoring presses: ${START_LIMITS.maxRunning} actions are running (max ${START_LIMITS.maxRunning})`]);
+    expect(logs).toEqual([`refusing presses: ${START_LIMITS.maxRunning} actions are running (max ${START_LIMITS.maxRunning})`]);
     runs[0]!.exit();
     expect(press(`b${n - 1}`)).toBe('started');
     expect(runs.length).toBe(n);

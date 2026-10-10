@@ -1,7 +1,7 @@
 /** Edit-mode draft helpers (src/web/edit/ops.ts): action conversion, new ids, duplicates. */
 import { describe, expect, test } from 'bun:test';
 import { Config, type Action, type Button } from '../src/core/config.ts';
-import { convertAction, copyOf, newButton, newPad, shQuote, simpleWords } from '../src/web/edit/ops.ts';
+import { convertAction, copyOf, newButton, newPad, renamePattern, shQuote, simpleWords, stateLookalike, STARTER_SCRIPT, stopTargets } from '../src/web/edit/ops.ts';
 
 const sh = (script: string, more: Partial<Extract<Action, { type: 'shell' }>> = {}): Action => ({ type: 'shell', script, ...more });
 const exec = (command: string, args: string[] = [], more: Partial<Extract<Action, { type: 'exec' }>> = {}): Action => ({ type: 'exec', command, args, ...more });
@@ -129,5 +129,80 @@ describe('new ids and copies', () => {
     expect(c).not.toHaveProperty('key');
     expect(c.action).not.toBe(b.action);
     expect(b.key).toBe('l');
+  });
+});
+
+describe('new buttons and the none action', () => {
+  const pad = Config.parse({ version: 1, pads: [{ id: 'main', name: 'Main', buttons: [] }] }).pads[0]!;
+
+  test("a new button's action fails, saying it isn't set up (no ✓ for nothing)", () => {
+    expect(newButton(pad, 0, 0).action).toEqual(sh(STARTER_SCRIPT));
+    const out = Bun.spawnSync(['/bin/sh', '-c', STARTER_SCRIPT]);
+    expect(out.exitCode).toBe(1);
+    expect(out.stderr.toString().trim()).toBe('No action set — edit this button');
+  });
+
+  test('switching a placeholder (or nothing) starts the other type blank: no sample `sh -c` args', () => {
+    const blankExec = exec('');
+    expect(convertAction(sh(STARTER_SCRIPT), 'exec')).toEqual(blankExec);
+    expect(convertAction(sh("echo '@status working'; sleep 1; echo 'Done'"), 'exec')).toEqual(blankExec);
+    expect(convertAction({ type: 'none' }, 'exec')).toEqual(blankExec);
+    expect(convertAction({ type: 'none' }, 'shell')).toEqual({ type: 'shell', script: '' });
+    // Set up in any way (a folder, a shell, a changed script): it means something, and is kept.
+    expect(convertAction(sh(STARTER_SCRIPT, { cwd: '/x' }), 'exec')).toEqual(exec('/bin/sh', ['-c', STARTER_SCRIPT], { cwd: '/x' }));
+    expect(convertAction(sh(`${STARTER_SCRIPT} `), 'exec')).toEqual(exec('/bin/sh', ['-c', `${STARTER_SCRIPT} `]));
+  });
+
+  test('to none: nothing is kept', () => {
+    expect(convertAction(sh('echo hi', { cwd: '/tmp', env: { A: '1' } }), 'none')).toEqual({ type: 'none' });
+    expect(convertAction(exec('ls'), 'none')).toEqual({ type: 'none' });
+  });
+});
+
+describe('stop patterns', () => {
+  test('renames carry them along; deletes drop them', () => {
+    expect(renamePattern('main/lamp', 'main/lamp', 'main/desk-lamp')).toBe('main/desk-lamp');
+    expect(renamePattern('main/lamp2', 'main/lamp', 'main/x')).toBe('main/lamp2');
+    expect(renamePattern('main/*', 'main/lamp', 'main/x')).toBe('main/*');
+    expect(renamePattern('main/lamp', 'main/lamp', null)).toBeNull();
+    // A pad: its `pad/…` patterns.
+    expect(renamePattern('main/lamp', 'main', 'studio')).toBe('studio/lamp');
+    expect(renamePattern('main/*', 'main', 'studio')).toBe('studio/*');
+    expect(renamePattern('mainx/*', 'main', 'studio')).toBe('mainx/*');
+    expect(renamePattern('*', 'main', 'studio')).toBe('*');
+    expect(renamePattern('main/*', 'main', null)).toBeNull();
+    expect(renamePattern('*', 'main', null)).toBe('*');
+  });
+
+  test('what a pattern names (itself left out), or null for nothing', () => {
+    const cfg = Config.parse({
+      version: 1,
+      pads: [
+        { id: 'a', name: 'A', buttons: [{ id: 'x', x: 0, y: 0, action: { type: 'none' } }, { id: 'y', x: 1, y: 0, action: { type: 'none' } }] },
+        { id: 'b', name: 'B', buttons: [] },
+      ],
+    });
+    const ids = (p: string, self?: { pad: string; button: string }) => stopTargets(cfg, p, self)?.map((t) => `${t.pad.id}/${t.button.id}`) ?? null;
+    expect(ids('*', { pad: 'a', button: 'x' })).toEqual(['a/y']);
+    expect(ids('a/*')).toEqual(['a/x', 'a/y']);
+    expect(ids('b/*')).toEqual([]);
+    expect(ids('a/y')).toEqual(['a/y']);
+    expect(ids('a/zz')).toBeNull();
+    expect(ids('zz/*')).toBeNull();
+  });
+});
+
+describe('READY colors that read as a result', () => {
+  test('reds read as FAILURE, greens as SUCCESS; the palette and other hues are fine', () => {
+    const hex = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16)) as [number, number, number];
+    /** Each color → what it reads like, so a failure names the color. */
+    const looks = (colors: string[]) => Object.fromEntries(colors.map((c) => [c, stateLookalike(hex(c))]));
+    const all = (colors: string[], v: ReturnType<typeof stateLookalike>) => Object.fromEntries(colors.map((c) => [c, v]));
+    const reds = ['#e3262b', '#d62828', '#ff0000', '#8b0000', '#b91c1c', '#e11d48', '#f87171'];
+    const greens = ['#2bd46e', '#22c55e', '#00ff00', '#008000', '#16a34a', '#10b981', '#84cc16'];
+    const fine = ['#2f6fde', '#facc15', '#db2777', '#7c3aed', '#f97316', '#0891b2', '#4338ca', '#0d9488', '#c026d3', '#f4f4f5', '#ea580c', '#ffb3b3', '#14532d'];
+    expect(looks(reds)).toEqual(all(reds, 'failure'));
+    expect(looks(greens)).toEqual(all(greens, 'success'));
+    expect(looks(fine)).toEqual(all(fine, null));
   });
 });

@@ -5,7 +5,7 @@
  * at once when the page is hidden or the editor closes. Cleared once nothing is unsaved (a save, a
  * discard). The next edit session offers it back, merged with the host's config as it is by then.
  */
-import { parseConfig, type Config } from '../../core/config.ts';
+import { Button, parseConfig, type Config } from '../../core/config.ts';
 import { lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import type { DraftSnapshot, Editor } from './editor.ts';
@@ -25,6 +25,11 @@ export const unsavedEdits = createStore(false);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const NUMS = ['x', 'y', 'w', 'h', 'holdMs', 'driftPx', 'confirmWindowMs', 'timeoutMs', 'resultHoldMs'];
+/** Button fields a draft kept by an older version may lack (cooldownMs…), at their defaults. */
+const BUTTON_DEFAULTS: Record<string, unknown> = (() => {
+  const { id: _i, x: _x, y: _y, action: _a, ...d } = Button.parse({ id: 'x', x: 0, y: 0, action: { type: 'none' } });
+  return d;
+})();
 
 /** Shaped like a config the editor can show (values may still have problems: it's a draft). */
 function draftShaped(c: unknown): c is Config {
@@ -45,14 +50,21 @@ function draftShaped(c: unknown): c is Config {
           typeof b.color === 'string' &&
           NUMS.every((k) => typeof b[k] === 'number') &&
           isObj(b.action) &&
-          (b.action.type === 'exec' ? typeof b.action.command === 'string' && Array.isArray(b.action.args) : b.action.type === 'shell' && typeof b.action.script === 'string'),
+          (b.action.type === 'exec'
+            ? typeof b.action.command === 'string' && Array.isArray(b.action.args)
+            : b.action.type === 'shell'
+              ? typeof b.action.script === 'string'
+              : b.action.type === 'none'),
       ),
   );
 }
 
 export function loadDraft(scope: string): StoredDraft | null {
   const d = lsJSON<StoredDraft>(key(scope));
-  if (!isObj(d) || d.v !== 1 || typeof d.baseRev !== 'string' || typeof d.savedAt !== 'number' || !draftShaped(d.draft)) return null;
+  if (!isObj(d) || d.v !== 1 || typeof d.baseRev !== 'string' || typeof d.savedAt !== 'number') return null;
+  if (isObj(d.draft) && Array.isArray(d.draft.pads))
+    d.draft.pads = d.draft.pads.map((p) => (isObj(p) && Array.isArray(p.buttons) ? { ...p, buttons: p.buttons.map((b) => (isObj(b) ? ({ ...BUTTON_DEFAULTS, ...b } as typeof b) : b)) } : p));
+  if (!draftShaped(d.draft)) return null;
   const base = parseConfig(d.base);
   if (!base.ok) return null;
   const origins = Array.isArray(d.origins) && d.origins.length === d.draft.pads.length ? d.origins : d.draft.pads.map((p) => ({ pad: p.id, buttons: p.buttons.map((b) => b.id) }));

@@ -1,29 +1,24 @@
 /**
  * The config file is the source of truth. This store loads it, watches it for hand edits, and
- * writes UI saves back atomically in a compact form (button fields at their defaults omitted).
+ * writes UI saves back safely (src/server/files.ts) in a compact form (button fields at their
+ * defaults omitted).
  */
-import { createHash, randomBytes } from 'node:crypto';
-import {
-  closeSync,
-  existsSync,
-  fchmodSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  realpathSync,
-  renameSync,
-  rmSync,
-  statSync,
-  watch,
-  writeSync,
-  type FSWatcher,
-} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { Button, parseConfig, type Action, type Config } from '../core/config.ts';
 import type { Role, WireConfig } from '../core/protocol.ts';
+import { describeJsonError, explainConfigErrors } from './config-errors.ts';
+import { errCode, errnoText } from './errors.ts';
+import { atomicWrite, NotRegularFileError, readRegularFile, WriteError } from './files.ts';
 
-const isWindows = process.platform === 'win32';
+/** The one safe write, for every file the host writes (config, secrets, state): see files.ts. */
+export { atomicWrite, WriteError, type AtomicWriteOptions } from './files.ts';
+
+/** How often the watcher also stats the file, for changes fs.watch misses (see `watch`). */
+export const POLL_MS = 2000;
+/** A file that keeps changing is re-read at least this often. */
+const MAX_DEBOUNCE_MS = 1000;
 
 /** sha256 (hex, first 16 chars) of the file's bytes. */
 export const revOf = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex').slice(0, 16);
@@ -62,65 +57,45 @@ export function redactConfig(cfg: Config): WireConfig {
   return { ...cfg, pads: cfg.pads.map((p) => ({ ...p, buttons: p.buttons.map(({ action: _action, ...b }) => b) })) };
 }
 
+/**
+ * `errors` are worded for people (config-errors.ts): `pad "lights" › button "key": holdMs must be ≤ 5000
+ * (line 42)`, `invalid JSON at line 3, column 7: …`. `rev` is missing when the file can't be read.
+ */
 export type ReadResult = { ok: true; config: Config; rev: string } | { ok: false; errors: string[]; rev?: string };
+
+/** Why the file can't be read at all, in words. */
+export function describeReadError(path: string, e: unknown): string {
+  if (e instanceof NotRegularFileError)
+    return `${path} is ${e.kind}, not a regular file${e.kind === 'a directory' ? ` (--config takes the file's path, e.g. ${join(path, 'buttpad.config.json')})` : ''}`;
+  if (errCode(e) === 'EFBIG') return (e as Error).message;
+  return `cannot read ${path}: ${errnoText(e)}`;
+}
 
 export function readConfigFile(path: string): ReadResult {
   let bytes: Buffer;
   try {
-    bytes = readFileSync(path);
+    bytes = readRegularFile(path);
   } catch (e) {
-    const err = e as NodeJS.ErrnoException;
-    return { ok: false, errors: [`(file): cannot read ${path}: ${err.code ?? err.message}`] };
+    return { ok: false, errors: [describeReadError(path, e)] };
   }
   const rev = revOf(bytes);
+  const text = bytes.toString('utf8').replace(/^﻿/, '');
   let raw: unknown;
   try {
-    raw = JSON.parse(bytes.toString('utf8').replace(/^﻿/, ''));
+    raw = JSON.parse(text);
   } catch (e) {
-    return { ok: false, rev, errors: [`(root): invalid JSON: ${(e as Error).message}`] };
+    return { ok: false, rev, errors: [describeJsonError(text, e)] };
   }
   const r = parseConfig(raw);
-  return r.ok ? { ok: true, config: r.config, rev } : { ok: false, rev, errors: r.errors };
+  return r.ok ? { ok: true, config: r.config, rev } : { ok: false, rev, errors: explainConfigErrors(raw, r.errors, text) };
 }
 
-/** Rev of the file's bytes as they are now, valid config or not; undefined if it can't be read. */
+/** Rev of the file's bytes as they are now, valid config or not; undefined if it can't be read (or isn't a regular file). */
 function revOfFile(path: string): string | undefined {
   try {
-    return revOf(readFileSync(path));
+    return revOf(readRegularFile(path));
   } catch {
     return undefined;
-  }
-}
-
-/**
- * Write via a temp file in the same directory + rename. Keeps the existing file's mode; a new file gets
- * 0600, since a config holds commands and their env. `stillOk` gets a last say right before the
- * rename: false leaves the file alone (and returns false).
- */
-export function atomicWrite(path: string, text: string, stillOk?: () => boolean): boolean {
-  let mode = 0o600;
-  try {
-    mode = statSync(path).mode & 0o777;
-  } catch {}
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
-  try {
-    const fd = openSync(tmp, 'wx', mode);
-    try {
-      if (!isWindows) fchmodSync(fd, mode); // exactly that mode, whatever the umask
-      writeSync(fd, text);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    if (stillOk && !stillOk()) {
-      rmSync(tmp, { force: true });
-      return false;
-    }
-    renameSync(tmp, path);
-    return true;
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
   }
 }
 
@@ -133,19 +108,43 @@ function writeTarget(path: string): string {
   }
 }
 
+/**
+ * The directory actions' relative paths resolve against: the config file's, following the path's own
+ * symlink (a config linked from a dotfiles checkout runs the scripts next to the real file) but not
+ * symlinked directories above it, which resolve when an action starts (so a deploy-style
+ * `current -> releases/42` swap takes effect).
+ */
+export function configDir(path: string): string {
+  let p = path;
+  for (let n = 0; n < 40; n++) {
+    let target: string;
+    try {
+      if (!lstatSync(p).isSymbolicLink()) break;
+      target = readlinkSync(p);
+    } catch {
+      break;
+    }
+    p = resolve(dirname(p), target);
+  }
+  return dirname(p);
+}
+
 export class ConfigLoadError extends Error {
   constructor(
     readonly path: string,
     readonly errors: string[],
+    /** The file couldn't be read at all (missing, not a regular file, no permission). */
+    readonly unreadable = false,
   ) {
-    super(`invalid config ${path}:\n  ${errors.join('\n  ')}`);
+    super(unreadable ? `can't use the config file: ${errors.join('; ')}` : `invalid config ${path}:\n  ${errors.join('\n  ')}`);
   }
 }
 
 /**
  * 409: the file isn't the one `baseRev` names. `rev` is the rev of its bytes now; `invalid` (with
  * the file's `errors`) when those bytes aren't a valid config (a hand edit with a typo, or caught
- * mid-write): the host still runs the previous config.
+ * mid-write): the host still runs the previous config. 400 `errors` are parseConfig's (index paths:
+ * the editor maps them onto its fields).
  */
 export type SaveResult =
   | { ok: true; rev: string }
@@ -159,6 +158,26 @@ export interface ConfigListener {
   error?(errors: string[]): void;
 }
 
+/** Identity and content stamp of a path (followed), or why it can't be stat'ed. */
+function stamp(path: string): string {
+  try {
+    const st = statSync(path);
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch (e) {
+    return `!${errCode(e) ?? 'error'}`;
+  }
+}
+
+/** A directory's identity (dev:ino, symlinks followed), or undefined if it isn't there. */
+function dirId(dir: string): string | undefined {
+  try {
+    const st = statSync(dir);
+    return st.isDirectory() ? `${st.dev}:${st.ino}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export class ConfigStore {
   /** Errors of the file on disk while it is broken (the last good config keeps running). */
   fileErrors: string[] | null = null;
@@ -167,16 +186,22 @@ export class ConfigStore {
   private brokenRev: string | undefined;
   private listeners = new Set<ConfigListener>();
   private watching = false;
+  /** By directory identity: a directory replaced under the same path gets a new watcher. */
   private watchers = new Map<string, FSWatcher>();
   /** File names the watchers react to. */
   private watchNames = new Set<string>();
+  private unwatchable = new Set<string>();
   private debounceMs = 200;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private pendingSince: number | undefined;
+  private poller: ReturnType<typeof setInterval> | undefined;
+  /** What the poll saw last (see `signature`). */
+  private seen = '';
 
   private constructor(
     /** The configured path, absolute. It may be a symlink: it's read and watched as such, saves replace its target. */
     readonly path: string,
-    /** Directory of the file the path resolved to at startup; actions' relative paths resolve against it. */
+    /** Where actions' relative paths resolve (see `configDir`). */
     readonly dir: string,
     public config: Config,
     public rev: string,
@@ -186,20 +211,29 @@ export class ConfigStore {
 
   /**
    * Load `path`; if it doesn't exist and `starter` is given, write `starter(absPath)` there first.
-   * Throws ConfigLoadError when the file is invalid.
+   * Throws ConfigLoadError when the file is invalid or unreadable, WriteError when the starter can't be written.
    */
   static open(path: string, starter?: (absPath: string) => string): { store: ConfigStore; created: boolean } {
     const abs = resolve(path);
     let created = false;
-    if (!existsSync(abs)) {
-      if (!starter) throw new ConfigLoadError(abs, [`(file): not found`]);
-      mkdirSync(dirname(abs), { recursive: true });
-      atomicWrite(abs, starter(abs));
+    if (stamp(abs) === '!ENOENT') {
+      if (!starter) throw new ConfigLoadError(abs, [`${abs} not found`], true);
+      try {
+        mkdirSync(dirname(abs), { recursive: true });
+      } catch (e) {
+        throw new WriteError(abs, `could not write a starter config to ${abs}: can't create its folder: ${errnoText(e)}`, errCode(e), { cause: e });
+      }
+      try {
+        atomicWrite(abs, starter(abs));
+      } catch (e) {
+        if (!(e instanceof WriteError)) throw e;
+        throw new WriteError(abs, e.message.replace(`could not write ${abs}`, `could not write a starter config to ${abs}`), e.code, { cause: e });
+      }
       created = true;
     }
     const r = readConfigFile(abs);
-    if (!r.ok) throw new ConfigLoadError(abs, r.errors);
-    return { store: new ConfigStore(abs, dirname(writeTarget(abs)), r.config, r.rev), created };
+    if (!r.ok) throw new ConfigLoadError(abs, r.errors, r.rev === undefined);
+    return { store: new ConfigStore(abs, configDir(abs), r.config, r.rev), created };
   }
 
   subscribe(l: ConfigListener): () => void {
@@ -233,7 +267,8 @@ export class ConfigStore {
   /**
    * A UI save: check `baseRev`, validate, write compactly. `baseRev` must name the file's bytes as
    * they are now, valid or not: a hand edit with a typo, or one caught mid-write, is someone's work
-   * too. `force` skips that check (the user chose to replace whatever is there).
+   * too. `force` skips that check (the user chose to replace whatever is there). A write that fails
+   * throws WriteError, with the file left as it was.
    */
   save(input: unknown, baseRev: string, { force = false }: { force?: boolean } = {}): SaveResult {
     // Pick up a hand edit the watcher hasn't delivered yet, so baseRev is checked against the file.
@@ -250,7 +285,7 @@ export class ConfigStore {
     const rev = revOf(text);
     const checked = this.diskRev;
     // A last look right before the rename: a write that landed since the check stays (409 instead).
-    if (!atomicWrite(writeTarget(this.path), text, () => force || revOfFile(this.path) === checked)) {
+    if (!atomicWrite(writeTarget(this.path), text, { stillOk: () => force || revOfFile(this.path) === checked })) {
       this.sync();
       return this.conflict();
     }
@@ -284,48 +319,86 @@ export class ConfigStore {
   }
 
   /**
-   * Watch for hand edits, debounced. Watches directories, which survives atomic renames by editors
-   * and by us: the configured path's (even a symlink replaced by a file, as `sed -i` does) and, while
-   * it's a symlink, its target's (edits of the target itself).
+   * Watch for hand edits, debounced. fs.watch on the directories (which survives atomic renames by
+   * editors and by us): the configured path's (even a symlink replaced by a file, as `sed -i` does)
+   * and, while it's a symlink, its target's. Plus a stat of the file every `pollMs`, for what
+   * fs.watch can't see: the directory moved away and recreated, a symlinked directory swapped
+   * (deploy-style `ln -sfn`), a bind-mounted file edited from outside, network file systems. When a
+   * watched directory is replaced, its watcher is re-armed.
    */
-  watch(debounceMs = 200) {
+  watch(debounceMs = 200, pollMs = POLL_MS) {
     if (this.watching) return;
     this.watching = true;
     this.debounceMs = debounceMs;
+    this.seen = this.signature();
     this.rewatch();
+    this.poller = setInterval(() => {
+      if (this.signature() !== this.seen) this.schedule();
+    }, pollMs);
+    this.poller.unref?.();
+  }
+
+  /** The file's identity and content stamp, and the identity of each directory it's watched through. */
+  private signature(): string {
+    const target = writeTarget(this.path);
+    return [stamp(this.path), dirId(dirname(this.path)), target === this.path ? '' : dirId(dirname(target))].join('|');
+  }
+
+  private schedule() {
+    const now = performance.now();
+    this.pendingSince ??= now;
+    clearTimeout(this.timer);
+    const wait = Math.max(0, Math.min(this.debounceMs, this.pendingSince + Math.max(MAX_DEBOUNCE_MS, this.debounceMs) - now));
+    this.timer = setTimeout(() => {
+      this.timer = this.pendingSince = undefined;
+      if (!this.watching) return;
+      // Taken before the read: a change after it is seen by the next poll.
+      const sig = this.signature();
+      this.sync();
+      this.rewatch(); // the link may point elsewhere now, be a plain file, or its directory be a new one
+      this.seen = sig;
+    }, wait);
   }
 
   private rewatch() {
     if (!this.watching) return;
     const files = [this.path, writeTarget(this.path)];
-    const dirs = new Set(files.map((f) => dirname(f)));
     this.watchNames = new Set(files.map((f) => basename(f)));
-    for (const [dir, w] of this.watchers)
-      if (!dirs.has(dir)) {
+    const want = new Map<string, string>();
+    for (const f of files) {
+      const id = dirId(dirname(f));
+      if (id) want.set(id, dirname(f));
+    }
+    for (const [id, w] of this.watchers)
+      if (!want.has(id)) {
         w.close();
-        this.watchers.delete(dir);
+        this.watchers.delete(id);
       }
-    for (const dir of dirs) {
-      if (this.watchers.has(dir)) continue;
+    for (const [id, dir] of want) {
+      if (this.watchers.has(id)) continue;
       try {
         const w = watch(dir, { persistent: false }, (_event, file) => {
           if (file != null && !this.watchNames.has(String(file))) return;
-          clearTimeout(this.timer);
-          this.timer = setTimeout(() => {
-            this.sync();
-            this.rewatch(); // the link may point elsewhere now, or be a plain file
-          }, this.debounceMs);
+          this.schedule();
         });
-        w.on('error', () => {});
-        this.watchers.set(dir, w);
+        w.on('error', () => {
+          // The directory went away: the poll notices and re-arms.
+          w.close();
+          if (this.watchers.get(id) === w) this.watchers.delete(id);
+        });
+        this.watchers.set(id, w);
+        this.unwatchable.delete(id);
       } catch (e) {
-        console.error(`buttpad: cannot watch ${dir} for config edits:`, (e as Error).message);
+        if (!this.unwatchable.has(id)) console.error(`buttpad: cannot watch ${dir} for config edits (checking every ${POLL_MS / 1000} s instead):`, (e as Error).message);
+        this.unwatchable.add(id);
       }
     }
   }
 
   close() {
     clearTimeout(this.timer);
+    clearInterval(this.poller);
+    this.timer = this.poller = this.pendingSince = undefined;
     this.watching = false;
     for (const w of this.watchers.values()) w.close();
     this.watchers.clear();

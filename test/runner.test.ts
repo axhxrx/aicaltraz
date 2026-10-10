@@ -84,7 +84,8 @@ describe('pure helpers', () => {
   });
 
   test('shellArgv per platform', () => {
-    expect(shellArgv('echo hi', undefined, 'linux', { SHELL: '/bin/zsh' })).toEqual({ argv: ['/bin/zsh', '-c', 'echo hi'], verbatim: false });
+    // Never $SHELL: a script must behave the same from a terminal and under a service.
+    expect(shellArgv('echo hi', undefined, 'linux', { SHELL: '/bin/zsh' })).toEqual({ argv: ['/bin/sh', '-c', 'echo hi'], verbatim: false });
     expect(shellArgv('echo hi', undefined, 'darwin', {})).toEqual({ argv: ['/bin/sh', '-c', 'echo hi'], verbatim: false });
     expect(shellArgv('echo hi', '/bin/bash', 'linux', { SHELL: '/bin/zsh' }).argv[0]).toBe('/bin/bash');
     expect(shellArgv('echo hi', undefined, 'win32', {})).toEqual({ argv: ['cmd.exe', '/d', '/s', '/c', '"echo hi"'], verbatim: true });
@@ -121,9 +122,17 @@ describe('exec vs shell', () => {
     expect(o).toMatchObject({ exitCode: 0, text: 'bash:' });
   });
 
-  test('default shell is $SHELL, else /bin/sh', async () => {
-    const o = await run({ type: 'shell', script: 'echo "$0"' });
-    expect(o.text).toBe(process.env.SHELL || '/bin/sh');
+  test('default shell is /bin/sh, whatever $SHELL says', async () => {
+    const saved = process.env.SHELL;
+    process.env.SHELL = '/bin/bash';
+    try {
+      const o = await run({ type: 'shell', script: 'echo "$0"' });
+      expect(o.text).toBe('/bin/sh');
+      expect(o.handle.command).toBe(`/bin/sh -c 'echo "$0"'`);
+    } finally {
+      if (saved === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved;
+    }
   });
 
   test('exit codes and signals', async () => {
@@ -381,22 +390,30 @@ describe('spawn errors', () => {
     expect(o).toMatchObject({ exitCode: null, reason: 'spawn', text: 'command not found: buttpad-no-such-command-xyz' });
   });
 
+  // Every client sees the text (no host paths: base names); the admin run log gets `error` in full.
   test('missing path, non-executable file, bad interpreter, missing shell, missing cwd', async () => {
-    expect((await run(exec('./nope.sh'))).text).toBe(`not found: ${join(base, 'nope.sh')}`);
+    expect(await run(exec('./nope.sh'))).toMatchObject({ text: 'command not found: nope.sh', error: `command not found: ${join(base, 'nope.sh')}` });
     writeFileSync(join(base, 'plain.txt'), 'echo hi\n');
-    expect((await run(exec('./plain.txt'))).text).toBe(`permission denied (chmod +x?): ${join(base, 'plain.txt')}`);
+    expect(await run(exec('./plain.txt'))).toMatchObject({ text: 'permission denied (chmod +x?): plain.txt', error: `permission denied (chmod +x?): ${join(base, 'plain.txt')}` });
     writeExecutable(join(base, 'badshebang.sh'), '#!/no/such/interpreter\necho hi\n');
-    expect((await run(exec('./badshebang.sh'))).text).toBe(`interpreter not found (check the #! line): ${join(base, 'badshebang.sh')}`);
-    expect((await run(sh('true', { shell: '/no/such/shell' }))).text).toBe('shell not found: /no/such/shell');
-    expect(await run(sh('true', { cwd: 'missing-dir' }))).toMatchObject({ reason: 'spawn', text: `cwd not found: ${join(base, 'missing-dir')}` });
+    expect(await run(exec('./badshebang.sh'))).toMatchObject({
+      text: 'interpreter not found (check the #! line): badshebang.sh',
+      error: `interpreter not found (check the #! line): ${join(base, 'badshebang.sh')}`,
+    });
+    expect(await run(sh('true', { shell: '/no/such/shell' }))).toMatchObject({ text: 'shell not found: shell', error: 'shell not found: /no/such/shell' });
+    expect(await run(sh('true', { cwd: 'missing-dir' }))).toMatchObject({ reason: 'spawn', text: 'cwd not found: missing-dir', error: `cwd not found: ${join(base, 'missing-dir')}` });
   });
 
   test('a script without #!, a directory', async () => {
     writeExecutable(join(base, 'noshebang.sh'), 'echo hi\n');
-    expect(await run(exec('./noshebang.sh'))).toMatchObject({ reason: 'spawn', text: `not executable as a program (missing #! line?): ${join(base, 'noshebang.sh')}` });
+    expect(await run(exec('./noshebang.sh'))).toMatchObject({
+      reason: 'spawn',
+      text: 'not executable as a program (missing #! line?): noshebang.sh',
+      error: `not executable as a program (missing #! line?): ${join(base, 'noshebang.sh')}`,
+    });
     mkdirSync(join(base, 'adir'), { recursive: true });
-    expect((await run(exec('./adir'))).text).toBe(`is a directory: ${join(base, 'adir')}`);
-    expect((await run(sh('true', { shell: base }))).text).toBe(`is a directory: ${base}`);
+    expect(await run(exec('./adir'))).toMatchObject({ text: 'is a directory: adir', error: `is a directory: ${join(base, 'adir')}` });
+    expect((await run(sh('true', { shell: base }))).error).toBe(`is a directory: ${base}`);
   });
 });
 

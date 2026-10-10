@@ -6,19 +6,26 @@
  *   @progress N   0..100, determinate progress
  *   @status text  status line shown while running
  *   @result text  result text shown after the run
+ *   @state text   the device's latched state ("REC ●", "ON 80%"), kept across runs; `@state` alone clears it
+ *
+ * Text that reaches clients (status, result, latched state) is sanitized: ANSI escape sequences,
+ * control characters and bidi overrides/isolates are removed.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, win32 } from 'node:path';
+import { basename, join, resolve, win32 } from 'node:path';
 import type { Action } from '../core/config.ts';
+import { errCode, hasLiveMember } from './proc.ts';
 
 export const TAIL_BYTES = 16 * 1024;
 export const RESULT_MAX = 200;
+/** Latched device state (`@state`), at most this many characters. */
+export const LATCHED_MAX = 40;
 export const KILL_GRACE_MS = 2000;
 /** While a killed run's process group lingers, how often to check whether it's gone. */
 const KILL_POLL_MS = 50;
-/** After the main process exits, how long to wait for its output pipes to drain. */
-const DRAIN_MS = 250;
+/** After the main process exits, how long to wait for its output pipes to drain; then they're closed. */
+export const DRAIN_MS = 250;
 /** Min interval between progress/status updates (they become WebSocket broadcasts). */
 const UPDATE_INTERVAL_MS = 50;
 const MAX_LINE = 16 * 1024;
@@ -41,6 +48,8 @@ export interface RunSpec {
 export interface RunUpdate {
   progress?: number;
   status?: string;
+  /** `@state text`: the device's latched state; null when `@state` cleared it. */
+  latched?: string | null;
 }
 
 export interface RunOutcome {
@@ -48,8 +57,10 @@ export interface RunOutcome {
   exitCode: number | null;
   signal: string | null;
   reason?: 'timeout' | 'spawn';
-  /** Result text per the output protocol, at most RESULT_MAX chars. */
+  /** Result text per the output protocol, at most RESULT_MAX chars. A spawn failure names files by their base name. */
   text?: string;
+  /** Spawn failure in full (absolute paths), for the admin run log. */
+  error?: string;
   stdout: string;
   stderr: string;
   durationMs: number;
@@ -63,6 +74,10 @@ export interface RunHooks {
 
 export interface RunHandle {
   readonly pid: number | undefined;
+  /** What runs, for the run log: the argv shell-quoted (`<shell> -c <script>` for a shell action). */
+  readonly command?: string;
+  /** The resolved working folder. */
+  readonly cwd?: string;
   readonly done: Promise<RunOutcome>;
   /**
    * SIGTERM the process group; SIGKILL whatever is left after the grace period. Windows: taskkill /T /F.
@@ -119,7 +134,7 @@ export class Tail {
   }
 }
 
-/** Splits a byte stream into UTF-8 lines (\n, \r\n or \r); overlong lines are cut at MAX_LINE. */
+/** Splits a byte stream into UTF-8 lines (\n, \r\n or a bare \r); overlong lines are cut at MAX_LINE. */
 class LineReader {
   private decoder = new TextDecoder();
   private buf = '';
@@ -156,30 +171,49 @@ class LineReader {
   }
 }
 
-const ANSI =/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
+// CSI (ESC [ or the 8-bit CSI … final byte), OSC (ESC ] … BEL or ST, or to the end of the line),
+// DCS/SOS/PM/APC strings (ESC P/X/^/_ … ST), other two-byte escapes, and a stray ESC.
+const ANSI = /(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b[@-Z\\-_]|\x1b/g;
+const SPACING = /[\t\n\v\f\r]/g;
+/** C0 and C1 controls (and DEL), bidi embeddings/overrides U+202A–U+202E, isolates U+2066–U+2069. */
+const CONTROLS = /[\x00-\x08\x0e-\x1f\x7f-\x9f‪-‮⁦-⁩]/g;
+
 export const stripAnsi = (s: string) => s.replace(ANSI, '');
 
-/** Trim and cap a display string to RESULT_MAX characters (code points). */
-export function clip(s: string): string {
+/** Display text from untrusted output: no escape sequences, controls (tabs etc. become spaces) or bidi overrides. */
+export const sanitize = (s: string) => s.replace(ANSI, '').replace(SPACING, ' ').replace(CONTROLS, '');
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Trim and cap a display string to `max` characters (code points), cutting between graphemes, with an ellipsis. */
+export function clip(s: string, max = RESULT_MAX): string {
   const t = s.trim();
-  if (t.length <= RESULT_MAX) return t;
-  const cps = Array.from(t);
-  return cps.length <= RESULT_MAX ? t : cps.slice(0, RESULT_MAX - 1).join('') + '…';
+  if (t.length <= max) return t;
+  if (Array.from(t).length <= max) return t;
+  let out = '';
+  let n = 0;
+  for (const { segment } of graphemes.segment(t)) {
+    const len = Array.from(segment).length;
+    if (n + len > max - 1) break;
+    out += segment;
+    n += len;
+  }
+  return out.trimEnd() + '…';
 }
 
-export type Directive = { kind: 'progress'; value: number } | { kind: 'status'; text: string } | { kind: 'result'; text: string };
+export type Directive = { kind: 'progress'; value: number } | { kind: 'status' | 'result' | 'state'; text: string };
 
 /** Parse one stdout line; `null` for a plain line, `undefined` for an unknown/invalid `@` line. */
 export function parseDirective(line: string): Directive | null | undefined {
   if (!line.startsWith('@')) return null;
-  const m = /^@(progress|status|result)(?:[ \t]+(.*))?$/.exec(line);
+  const m = /^@(progress|status|result|state)(?:[ \t]+(.*))?$/.exec(line);
   if (!m) return undefined;
   const arg = (m[2] ?? '').trim();
   if (m[1] === 'progress') {
     const value = Number.parseFloat(arg);
     return Number.isFinite(value) ? { kind: 'progress', value } : undefined;
   }
-  return { kind: m[1] as 'status' | 'result', text: arg };
+  return { kind: m[1] as 'status' | 'result' | 'state', text: arg };
 }
 
 /**
@@ -188,7 +222,7 @@ export function parseDirective(line: string): Directive | null | undefined {
  */
 export function pickResultText(o: { result?: string; lastOut?: string; lastErr?: string; failed: boolean }): string | undefined {
   const t = o.result ?? o.lastOut ?? (o.failed ? o.lastErr : undefined);
-  return t ? clip(t) : undefined;
+  return t ? clip(t) || undefined : undefined;
 }
 
 const hasSep = (p: string) => p.includes('/') || (isWindows && p.includes('\\'));
@@ -201,14 +235,18 @@ export function expandHome(p: string): string {
 
 export const resolveCwd = (baseDir: string, cwd?: string) => (cwd ? resolve(baseDir, expandHome(cwd)) : baseDir);
 
-/** argv for a shell action. `verbatim`: pass args to Windows unquoted (cmd.exe does its own parsing). */
+/**
+ * argv for a shell action. POSIX: `shell` or /bin/sh — never $SHELL, so a script behaves the same
+ * whether the host was started from a terminal or by a service. Windows: `shell` or %ComSpec% or
+ * cmd.exe. `verbatim`: pass args to Windows unquoted (cmd.exe does its own parsing).
+ */
 export function shellArgv(
   script: string,
   shell: string | undefined,
   platform: NodeJS.Platform = process.platform,
   env: Record<string, string | undefined> = process.env,
 ): { argv: string[]; verbatim: boolean } {
-  if (platform !== 'win32') return { argv: [shell || env.SHELL || '/bin/sh', '-c', script], verbatim: false };
+  if (platform !== 'win32') return { argv: [shell || '/bin/sh', '-c', script], verbatim: false };
   const sh = shell || env.ComSpec || env.COMSPEC || 'cmd.exe';
   const name = win32.basename(sh).toLowerCase();
   if (name === 'cmd' || name === 'cmd.exe') return { argv: [sh, '/d', '/s', '/c', `"${script}"`], verbatim: true };
@@ -216,7 +254,27 @@ export function shellArgv(
   return { argv: [sh, '-c', script], verbatim: false };
 }
 
-class SpawnError extends Error {}
+const SAFE_WORD = /^[\w@%+=:,./-]+$/;
+
+/** argv as a POSIX shell command line (what ran, for the run log). */
+export function shellQuote(argv: readonly string[]): string {
+  return argv.map((a) => (SAFE_WORD.test(a) ? a : `'${a.replaceAll("'", `'\\''`)}'`)).join(' ');
+}
+
+/** A spawn failure: in full for the admin run log (`error`), and as every client sees it (`text`: no host paths). */
+interface SpawnFailure {
+  text: string;
+  error: string;
+}
+
+const fileName = (p: string) => (isWindows ? win32.basename(p) : basename(p)) || p;
+const failure = (what: string, path: string): SpawnFailure => ({ error: `${what}: ${path}`, text: `${what}: ${fileName(path)}` });
+
+class SpawnError extends Error {
+  constructor(readonly failure: SpawnFailure) {
+    super(failure.error);
+  }
+}
 
 const isDir = (p: string) => {
   try {
@@ -226,18 +284,18 @@ const isDir = (p: string) => {
   }
 };
 
-function describeSpawnError(e: unknown, action: Action, cmd0: string): string {
-  if (e instanceof SpawnError) return e.message;
+function describeSpawnError(e: unknown, action: Action, cmd0: string): SpawnFailure {
+  if (e instanceof SpawnError) return e.failure;
   const code = errCode(e);
+  const shell = action.type === 'shell';
   if (code === 'ENOENT') {
-    if (!hasSep(cmd0)) return `${action.type === 'shell' ? 'shell' : 'command'} not found: ${cmd0}`;
-    if (existsSync(cmd0)) return `interpreter not found (check the #! line): ${cmd0}`;
-    return action.type === 'shell' ? `shell not found: ${cmd0}` : `not found: ${cmd0}`;
+    if (hasSep(cmd0) && existsSync(cmd0)) return failure('interpreter not found (check the #! line)', cmd0);
+    return failure(shell ? 'shell not found' : 'command not found', cmd0);
   }
-  if ((code === 'EACCES' || code === 'ENOEXEC' || code === 'EISDIR') && isDir(cmd0)) return `is a directory: ${cmd0}`;
-  if (code === 'EACCES') return `permission denied (chmod +x?): ${cmd0}`;
-  if (code === 'ENOEXEC') return `not executable as a program (missing #! line?): ${cmd0}`;
-  return `spawn failed: ${(e as Error)?.message ?? String(e)}`;
+  if ((code === 'EACCES' || code === 'ENOEXEC' || code === 'EISDIR') && isDir(cmd0)) return failure('is a directory', cmd0);
+  if (code === 'EACCES') return failure('permission denied (chmod +x?)', cmd0);
+  if (code === 'ENOEXEC') return failure('not executable as a program (missing #! line?)', cmd0);
+  return { error: `spawn failed: ${(e as Error)?.message ?? String(e)}`, text: `spawn failed${code ? ` (${code})` : ''}` };
 }
 
 function spawnChild(argv: string[], cwd: string, env: Record<string, string | undefined>, verbatim: boolean) {
@@ -254,33 +312,25 @@ function spawnChild(argv: string[], cwd: string, env: Record<string, string | un
 }
 type Child = ReturnType<typeof spawnChild>;
 
-const errCode = (e: unknown) => (e as NodeJS.ErrnoException)?.code;
-
-/** Linux: whether process group `pgid` has a member that isn't a zombie, from /proc. */
-function hasLiveMember(pgid: number): boolean {
-  let pids: string[];
-  try {
-    pids = readdirSync('/proc');
-  } catch {
-    return true;
-  }
-  for (const pid of pids) {
-    const c = pid.charCodeAt(0);
-    if (c < 48 || c > 57) continue;
-    let stat: string;
-    try {
-      stat = readFileSync(`/proc/${pid}/stat`, 'latin1');
-    } catch {
-      continue;
-    }
-    // "pid (comm) state ppid pgrp …"; comm may contain anything, so split after its last ')'.
-    const [state, , pgrp] = stat.slice(stat.lastIndexOf(')') + 2).split(' ', 3);
-    if (Number(pgrp) === pgid && state !== 'Z' && state !== 'X') return true;
-  }
-  return false;
+/** A run that is over before it starts (action `none`): exit 0, reported asynchronously like any run. */
+export function finishedRun(o: Partial<RunOutcome> = {}, hooks: RunHooks = {}): RunHandle {
+  const outcome: RunOutcome = { exitCode: 0, signal: null, stdout: '', stderr: '', durationMs: 0, ...o };
+  const done = new Promise<RunOutcome>((resolveDone) =>
+    queueMicrotask(() => {
+      try {
+        hooks.onExit?.(outcome);
+      } catch (e) {
+        console.error('buttpad: run exit handler failed:', e);
+      }
+      resolveDone(outcome);
+    }),
+  );
+  return { pid: undefined, done, kill: () => false, forceKill: () => {}, alive: () => false, dying: () => false, stdout: () => '', stderr: () => '' };
 }
 
 export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
+  const action = spec.action;
+  if (action.type === 'none') return finishedRun({}, hooks);
   const t0 = performance.now();
   const grace = spec.killGraceMs ?? KILL_GRACE_MS;
   const outTail = new Tail();
@@ -318,27 +368,28 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
 
   const outLines = new LineReader((raw) => {
     if (finished) return;
-    const line = stripAnsi(raw).trimEnd();
+    const line = sanitize(raw).trimEnd();
     const d = parseDirective(line);
     if (d === null) {
       if (line.trim()) lastOut = line;
     } else if (d?.kind === 'progress') pending = { ...pending, progress: d.value };
     else if (d?.kind === 'status') pending = { ...pending, status: clip(d.text) };
+    else if (d?.kind === 'state') pending = { ...pending, latched: clip(d.text, LATCHED_MAX) || null };
     else if (d?.kind === 'result') result = d.text;
   });
   const errLines = new LineReader((raw) => {
     if (finished) return;
-    const line = stripAnsi(raw).trim();
+    const line = sanitize(raw).trim();
     if (line) lastErr = line;
   });
 
-  const action = spec.action;
   let cmd0 = action.type === 'exec' ? action.command : (action.shell ?? '');
   let child: Child | undefined;
-  let spawnError: string | undefined;
+  let spawnError: SpawnFailure | undefined;
+  let command: string | undefined;
+  let cwd: string | undefined;
   try {
-    const cwd = resolveCwd(spec.baseDir, action.cwd);
-    if (!isDir(cwd)) throw new SpawnError(`cwd not found: ${cwd}`);
+    cwd = resolveCwd(spec.baseDir, action.cwd);
     const env = { ...process.env, ...action.env, ...spec.env };
     let argv: string[];
     let verbatim = false;
@@ -350,13 +401,17 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
       ({ argv, verbatim } = shellArgv(action.script, action.shell));
       cmd0 = argv[0]!;
     }
+    command = verbatim ? argv.join(' ') : shellQuote(argv);
+    if (!isDir(cwd)) throw new SpawnError(failure('cwd not found', cwd));
     child = spawnChild(argv, cwd, env, verbatim);
   } catch (e) {
     spawnError = describeSpawnError(e, action, cmd0);
   }
 
+  const readers: ReadableStreamDefaultReader<Uint8Array>[] = [];
   const pump = async (stream: ReadableStream<Uint8Array>, tail: Tail, lines: LineReader) => {
     const reader = stream.getReader();
+    readers.push(reader);
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -465,11 +520,12 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
         exitCode,
         signal,
         reason,
-        text: spawnError ? clip(spawnError) : pickResultText({ result, lastOut, lastErr, failed }),
+        text: spawnError ? clip(sanitize(spawnError.text)) : pickResultText({ result, lastOut, lastErr, failed }),
         stdout: outTail.text(),
         stderr: errTail.text(),
         durationMs: Math.round(performance.now() - t0),
       };
+      if (spawnError) outcome.error = spawnError.error;
       try {
         hooks.onExit?.(outcome);
       } catch (e) {
@@ -489,11 +545,17 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
       // Background grandchildren may hold the pipes open; don't wait for them.
       await Promise.race([pumps, Bun.sleep(DRAIN_MS)]);
       finish(c.exitCode, c.signalCode);
+      // …and don't keep reading what they write either (`(yes &); echo x` would keep the host busy
+      // forever): close our ends of the pipes. Their next write fails (EPIPE/SIGPIPE). They are not
+      // killed: a finished run may leave a background process behind on purpose.
+      for (const r of readers) r.cancel().catch(() => {});
     });
   });
 
   return {
     pid: child?.pid,
+    command,
+    cwd,
     done,
     kill,
     forceKill: () => {

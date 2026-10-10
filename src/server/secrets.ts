@@ -3,9 +3,11 @@
  * `pressToken` (press buttons) and `adminToken` (also edit config = run arbitrary commands).
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { chmodSync, mkdirSync, realpathSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { Role } from '../core/protocol.ts';
+import { errCode, errnoText } from './errors.ts';
+import { atomicWrite, NotRegularFileError, readRegularFile, WriteError } from './files.ts';
 
 export interface Secrets {
   pressToken: string;
@@ -28,9 +30,10 @@ export const newToken = () => randomBytes(32).toString('base64url');
 export function loadSecrets(path: string, opts: { rotate?: boolean } = {}): LoadedSecrets {
   let existing: string | undefined;
   try {
-    existing = readFileSync(path, 'utf8');
+    existing = readRegularFile(path, 64 * 1024).toString('utf8');
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    if (e instanceof NotRegularFileError) throw new Error(`can't use the secrets file: ${e.message}`);
+    if (errCode(e) !== 'ENOENT') throw new Error(`can't read the secrets file ${path}: ${errnoText(e)}`, { cause: e });
   }
   if (existing !== undefined && !opts.rotate) {
     const secrets = parseSecrets(existing);
@@ -56,19 +59,23 @@ function parseSecrets(text: string): Secrets | undefined {
   return undefined;
 }
 
-/** Atomic write of a file only the owner can read. */
+/** Safe write (files.ts) of a file only the owner can read; through a symlink, to its target. */
 function writePrivate(path: string, text: string) {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
-  const fd = openSync(tmp, 'wx', 0o600);
   try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    mkdirSync(dirname(path), { recursive: true });
+  } catch (e) {
+    throw new WriteError(path, `could not write ${path}: can't create its folder: ${errnoText(e)}`, errCode(e), { cause: e });
   }
-  renameSync(tmp, path);
-  if (!isWindows) chmodSync(path, 0o600);
+  let target = path;
+  try {
+    target = realpathSync(path);
+  } catch {}
+  try {
+    atomicWrite(target, text, { mode: 0o600 });
+  } catch (e) {
+    if (!(e instanceof WriteError)) throw e;
+    throw new WriteError(path, `${e.message} (--secrets PATH keeps the pairing tokens somewhere else)`, e.code, { cause: e });
+  }
 }
 
 const digest = (s: string) => createHash('sha256').update(s).digest();
