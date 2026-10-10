@@ -1,0 +1,606 @@
+/*
+ * Button faces. Every state differs in color AND motion AND shape (see docs/DESIGN.md):
+ *   READY     solid color, huge label, still
+ *   ARMING    ink fill rising bottom→top with a hard leading edge; pop + flash on fire
+ *   CONFIRM   face dimmed, thick amber frame blinking 2 Hz, "… AGAIN TO CONFIRM", amber countdown
+ *   SENDING   dimmed, three pulsing dots
+ *   RUNNING   diagonal stripes scrolling; big elapsed clock; or left→right fill with big %
+ *   SUCCESS   green flood from the center, giant ✓ popping in, then still; drain bar
+ *   FAILURE   red flood, giant ✗ shaking in, slow dark pulse; drain bar
+ *   OFFLINE   grey, dashed border, ⚠, dim label; shakes when pressed
+ * Only transform/opacity animate. Sizes come from container query units of .bp-btn.
+ */
+
+.bp-btn {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  container-type: size;
+  touch-action: none;
+  cursor: pointer;
+  outline: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.bp-face {
+  --pad: max(8px, 6cqmin);
+  --iw: calc(100cqw - 2 * var(--pad));
+  --ih: calc(100cqh - 2 * var(--pad));
+  --radius: clamp(10px, 7cqmin, 30px);
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius);
+  overflow: hidden;
+  isolation: isolate;
+  color: var(--ink);
+  font-family: var(--font);
+  transform: translateZ(0);
+  transition: transform 90ms ease-out;
+}
+.bp-face.is-pressed {
+  transform: scale(0.965);
+}
+
+.bp-base,
+.bp-stripes,
+.bp-prog,
+.bp-pulse,
+.bp-arm,
+.bp-flash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.bp-base {
+  background-color: var(--bg);
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.18) 0%, rgb(255 255 255 / 0) 42%, rgb(0 0 0 / 0) 60%, rgb(0 0 0 / 0.16) 100%);
+  box-shadow:
+    inset 0 1.5px 0 rgb(255 255 255 / 0.28),
+    inset 0 calc(-1 * max(3px, 1.2cqmin)) 0 rgb(0 0 0 / 0.22);
+}
+.is-pressed .bp-base {
+  filter: brightness(0.82);
+}
+
+/* ARMING: full-size layer translated up; the edge stays crisp at any fill level. */
+.bp-arm {
+  transform: translateY(100%);
+  background: color-mix(in srgb, var(--ink) 34%, transparent);
+  will-change: transform;
+}
+.bp-arm::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: max(4px, 2.2cqh);
+  background: var(--ink);
+}
+.bp-flash {
+  background: #fff;
+  opacity: 0;
+}
+
+/* ---- content ------------------------------------------------------------------------------ */
+
+.bp-content {
+  position: absolute;
+  inset: var(--pad);
+  z-index: 2;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2.6cqh;
+  text-align: center;
+  color: var(--ink);
+}
+.bp-label,
+.bp-head {
+  flex: none;
+  width: 100%;
+  font-weight: 900;
+  line-height: 1.04;
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+  --fit-w: var(--iw);
+  --fit-h: calc(var(--ih) * 0.6);
+  --fit-max: 44cqh;
+}
+.bp-num {
+  flex: none;
+  font-weight: 900;
+  line-height: 0.92;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  --line-max: calc(var(--ih) * 0.34);
+}
+/* Status / result text: fit to two lines; below --fit-min it clamps with an ellipsis instead. */
+.bp-sub {
+  flex: none;
+  width: 100%;
+  font-weight: 700;
+  line-height: 1.08;
+  text-wrap: balance;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  --fit-w: var(--iw);
+  --fit-h: calc(var(--ih) * 0.17);
+  --fit-max: min(8cqh, 40px);
+  --fit-min: 10px;
+}
+.bp-title {
+  flex: none;
+  font-weight: 900;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  --line-max: min(13cqh, 72px);
+}
+/* The glyph is the flexible part: it shrinks first when a small button runs out of room. */
+.bp-icon {
+  flex: 0 1 min(44cqh, 62cqw);
+  min-height: 8cqh;
+  width: 100%;
+  margin: -3cqh 0;
+}
+.bp-time {
+  position: absolute;
+  right: 0;
+  bottom: -0.2em;
+  font-weight: 700;
+  font-size: clamp(10px, 4.6cqmin, 22px);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+/* READY hints: trigger + key chips along the bottom edge. */
+.bp-hints {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -0.25em;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 6px;
+  font-weight: 900;
+  font-size: clamp(10px, 5.4cqmin, 24px);
+  letter-spacing: 0.08em;
+  line-height: 1;
+  pointer-events: none;
+}
+.bp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.38em 0.7em 0.38em 0.5em;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--ink) 16%, transparent);
+  white-space: nowrap;
+}
+.bp-chip svg {
+  width: 1.2em;
+  height: 1.2em;
+}
+.bp-chip svg + svg {
+  margin-left: 0.15em;
+}
+.bp-key {
+  padding-left: 0.55em;
+}
+
+/* Small buttons: drop the extras, keep the label. */
+@container (max-height: 130px) or (max-width: 110px) {
+  .bp-hints,
+  .bp-time {
+    display: none;
+  }
+}
+@container (max-height: 170px) {
+  .bp-sub {
+    -webkit-line-clamp: 1;
+  }
+}
+@container (max-height: 95px) {
+  .bp-sub {
+    display: none;
+  }
+}
+
+/* ---- READY / ARMING ------------------------------------------------------------------- */
+
+.bp-btn[data-visual='ready'] .bp-label,
+.bp-btn[data-visual='arming'] .bp-label {
+  animation: bp-settle 0.28s ease-out both;
+}
+.bp-btn[data-visual='ready'] .bp-content,
+.bp-btn[data-visual='arming'] .bp-content {
+  padding-bottom: 1.4em;
+}
+
+/* ---- CONFIRM -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='confirm'] .bp-face {
+  --ink: #fff;
+}
+.bp-btn[data-visual='confirm'] .bp-base {
+  filter: brightness(0.42) saturate(0.85);
+}
+.bp-btn[data-visual='confirm'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.2);
+  --fit-max: 16cqh;
+  opacity: 0.85;
+}
+.bp-btn[data-visual='confirm'] .bp-head {
+  color: var(--amber);
+  --fit-h: calc(var(--ih) * 0.46);
+  --fit-max: 22cqh;
+  animation: bp-nudge 1s ease-in-out infinite;
+}
+.bp-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.bp-btn[data-visual='confirm'] .bp-frame {
+  border: max(6px, 4cqmin) solid var(--amber);
+  animation: bp-blink 0.5s steps(1, end) infinite;
+}
+
+/* ---- SENDING -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='sending'] .bp-base {
+  filter: brightness(0.7);
+}
+.bp-btn[data-visual='sending'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.42);
+}
+.bp-dots {
+  display: flex;
+  gap: 3.4cqmin;
+}
+.bp-dots i {
+  width: 6cqmin;
+  height: 6cqmin;
+  border-radius: 50%;
+  background: currentColor;
+  animation: bp-dot 0.8s ease-in-out infinite;
+}
+.bp-dots i:nth-child(2) {
+  animation-delay: 0.13s;
+}
+.bp-dots i:nth-child(3) {
+  animation-delay: 0.26s;
+}
+
+/* ---- RUNNING -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='running'] .bp-base {
+  filter: brightness(0.86);
+}
+.bp-btn[data-visual='running'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.19);
+  --fit-max: 15cqh;
+}
+.bp-btn[data-visual='success'] .bp-label,
+.bp-btn[data-visual='failure'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.16);
+  --fit-max: 13cqh;
+}
+.bp-stripes {
+  --sw: clamp(10px, 8cqmin, 48px);
+  --sp: calc(var(--sw) * 2.8284);
+  left: calc(-1 * var(--sp));
+  right: auto;
+  width: calc(100% + 2 * var(--sp));
+  background: repeating-linear-gradient(-45deg, transparent 0 var(--sw), color-mix(in srgb, var(--ink) 26%, transparent) var(--sw) calc(var(--sw) * 2));
+  animation:
+    bp-stripes 0.75s linear infinite,
+    bp-fade 0.3s ease-out;
+  will-change: transform;
+}
+.bp-prog {
+  --p: 0;
+  transform: translateX(calc((var(--p) - 1) * 100%));
+  background: color-mix(in srgb, var(--ink) 30%, transparent);
+  transition: transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.bp-prog::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: max(3px, 1.3cqw);
+  background: var(--ink);
+  opacity: 0.55;
+}
+.bp-pill {
+  flex: none;
+  max-width: 100%;
+  --line-max: min(6.6cqh, 30px);
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  line-height: 1;
+  padding: 0.5em 0.95em;
+  border-radius: 99px;
+  background: var(--ink);
+  color: var(--bg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bp-pill.is-cancelling {
+  animation: bp-blink 0.6s steps(1, end) infinite;
+}
+.bp-btn[data-visual='running'] .bp-dots {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+.bp-btn[data-visual='running'] .bp-dots i {
+  width: 3.6cqmin;
+  height: 3.6cqmin;
+}
+
+/* ---- SUCCESS / FAILURE ---------------------------------------------------------------- */
+
+.bp-btn[data-visual='success'] .bp-face {
+  --ink: var(--ok-ink);
+  --flood: var(--ok);
+}
+.bp-btn[data-visual='failure'] .bp-face {
+  --ink: var(--bad-ink);
+  --flood: var(--bad);
+}
+.bp-btn[data-visual='success'] .bp-base,
+.bp-btn[data-visual='failure'] .bp-base {
+  background: var(--flood);
+  box-shadow: none;
+}
+.bp-flood {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 150cqmax;
+  height: 150cqmax;
+  margin: -75cqmax 0 0 -75cqmax;
+  border-radius: 50%;
+  background: var(--flood);
+  pointer-events: none;
+  animation: bp-flood 0.42s cubic-bezier(0.15, 0.85, 0.3, 1) both;
+}
+.bp-btn[data-visual='success'] .bp-icon {
+  animation: bp-pop-in 0.5s cubic-bezier(0.2, 1.5, 0.4, 1) 0.1s both;
+}
+.bp-btn[data-visual='failure'] .bp-icon {
+  animation: bp-shake-in 0.55s ease-out 0.08s both;
+}
+.bp-pulse {
+  background: #000;
+  opacity: 0;
+  animation: bp-pulse 1.6s ease-in-out 0.5s infinite;
+}
+.bp-drain {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  height: max(5px, 2.6cqmin);
+  background: var(--ink);
+  opacity: 0.6;
+  transform-origin: 0 50%;
+  animation-name: bp-drain;
+  animation-timing-function: linear;
+  animation-fill-mode: both;
+  pointer-events: none;
+}
+.bp-drain-confirm {
+  background: var(--amber);
+  opacity: 1;
+  height: max(6px, 3cqmin);
+}
+
+/* ---- OFFLINE -------------------------------------------------------------------------- */
+
+.bp-btn[data-visual='offline'] .bp-face {
+  --ink: var(--off-ink);
+}
+.bp-btn[data-visual='offline'] .bp-base {
+  background: var(--off-bg);
+  box-shadow: none;
+}
+.bp-btn[data-visual='offline'] .bp-frame {
+  border: max(3px, 1.6cqmin) dashed var(--off-line);
+}
+.bp-btn[data-visual='offline'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.3);
+  --fit-max: 22cqh;
+  opacity: 0.6;
+}
+.bp-btn[data-visual='offline'] .bp-icon {
+  flex-basis: min(24cqh, 28cqw);
+  margin: 0;
+  color: var(--amber);
+}
+.bp-offline-tag {
+  font-size: clamp(10px, min(6cqh, 5.4cqw), 26px);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  opacity: 0.85;
+}
+
+/* ---- double-tap pips, flash badges ----------------------------------------------------- */
+
+.bp-pips {
+  position: absolute;
+  top: var(--pad);
+  left: 50%;
+  z-index: 4;
+  display: flex;
+  gap: 2.6cqmin;
+  transform: translateX(-50%);
+}
+.bp-pips i {
+  width: 6cqmin;
+  height: 6cqmin;
+  border-radius: 50%;
+  border: max(2px, 1cqmin) solid var(--ink);
+}
+.bp-pips i:first-child {
+  background: var(--ink);
+}
+.bp-badge {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 5;
+  translate: -50% -50%;
+  padding: 0.22em 0.55em;
+  border-radius: 0.3em;
+  background: #0b0c0e;
+  color: #fff;
+  box-shadow: 0 0 0 0.07em #fff;
+  font-weight: 900;
+  font-size: clamp(16px, min(17cqh, 15cqw), 110px);
+  letter-spacing: 0.04em;
+  line-height: 1;
+  white-space: nowrap;
+  animation: bp-badge 1.2s ease-out both;
+  pointer-events: none;
+}
+
+/* Grid while connecting: no interaction affordances. */
+.bp-grid[data-link='connecting'] .bp-btn {
+  cursor: default;
+}
+
+/* ---- keyframes ------------------------------------------------------------------------ */
+
+@keyframes bp-stripes {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(var(--sp));
+  }
+}
+@keyframes bp-flood {
+  from {
+    transform: scale(0.04);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+@keyframes bp-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.3) rotate(-12deg);
+  }
+}
+@keyframes bp-shake-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  30% {
+    opacity: 1;
+    transform: scale(1.08) translateX(0);
+  }
+  45% {
+    transform: translateX(-9%);
+  }
+  60% {
+    transform: translateX(8%);
+  }
+  75% {
+    transform: translateX(-4%);
+  }
+  100% {
+    transform: none;
+  }
+}
+@keyframes bp-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+@keyframes bp-drain {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+@keyframes bp-dot {
+  0%,
+  100% {
+    transform: scale(0.45);
+    opacity: 0.45;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes bp-settle {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+}
+@keyframes bp-nudge {
+  50% {
+    transform: scale(1.04);
+  }
+}
+@keyframes bp-badge {
+  0% {
+    opacity: 0;
+    transform: scale(0.55);
+  }
+  12% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+  22% {
+    transform: scale(1);
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+/* Reduced motion: keep every shape cue, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .bp-stripes,
+  .bp-pulse,
+  .bp-head,
+  .bp-icon,
+  .bp-flood,
+  .bp-label {
+    animation: none !important;
+  }
+  .bp-btn[data-visual='confirm'] .bp-frame {
+    animation: none;
+  }
+}
