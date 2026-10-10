@@ -53,7 +53,33 @@ items is in that commit's message.
 
 ## Round 2 (frozen build 2c036fe)
 
-In progress: a regression verifier re-running round-1 repro scripts, two new personas (a Tokyo
-stage manager calling cues with JP/EN labels and `stops`; a hobbyist on a Pi host and a slow,
-throttled phone doing everything from the phone), and adversarial security + correctness
-reviews of the round-2 code.
+Five agents: a regression verifier re-running the round-1 repro scripts, two new personas, and
+adversarial security + correctness reviews of the round-2 code.
+
+| Persona / review | Scale |
+|---|---|
+| Regression verifier | every round-1 HIGH item re-run with the original scripts |
+| Kenji, Tokyo stage manager | 2 shows × 18 cues, JP/EN labels, kiosk tablet + phone, Wi-Fi blips, host crash mid-cue |
+| Pat, hobbyist | Pi-class host, 360×640 phone at 5–6× CPU throttle, flaky Wi-Fi, set up entirely from the phone |
+| Security review | state file, confirm/`at` abuse, rate-limit spoofing, sanitizing, temp-file attacks |
+| Correctness review | interactions of requeue × stops × persistence × clock offsets × attribution |
+
+What held up: all 9 HIGH round-1 bugs verified fixed with their original repros (late presses
+dropped at 3.4–45 s, confirm bypasses refused, chatter/bounce sent 0 extra, kiosk shows "pad no
+longer exists", orphans killed after kill -9, disk-full leaves the file intact); exactly-once still
+holds under contention; 59/59 hobbyist runs exactly once at 6× throttle; touch-to-feedback 18–34 ms.
+
+| Finding | Reported by | Status |
+|---|---|---|
+| Slow/large hello skewed the clock offset → every press expired, reconnect loop | correctness, regression | fixed (d0df424) |
+| State-file fingerprint is computable → a writable state file could aim the startup kill | security | fixed: trust only a private, host-owned file (d0df424) |
+| NO RESPONSE never resolved after a dead zone (expired ack went to the dead socket) | stage, hobbyist | fixed: resolves to DIDN'T RUN (d0df424) |
+| Kept failures swallowed the next tap/key (a remote can't "hold to retry") | regression, stage | fixed: press retries, ✕ clears (d0df424) |
+| Run attribution: stale queue claims, 30 s claim window, restarted run ids | correctness | fixed (d0df424) |
+| "All off" refusable by run/rate limits | correctness | fixed (d0df424) |
+| Rough mode disabled palm rejection; ?lock didn't confine keys; ghost runs after edits | correctness, regression | fixed (d0df424) |
+| Raising a running cue's time limit mid-show didn't apply | stage | round 4 |
+| No phone-only way to become admin | hobbyist | round 4 (pairing codes) |
+| Results flood the screen bright in a dark house | stage | round 4 (show mode) |
+| Two one-sided fades fight; no exclusive groups | stage | round 4 (`group`) |
+| Trailing space in a program path broke a button invisibly | hobbyist | round 4 (trimmed paths) |
