@@ -1,4 +1,5 @@
 /** The important flows against a real host (one per spec file and project), real shell scripts. */
+import { readFileSync, writeFileSync } from 'node:fs';
 import { expect, test, type Page } from '@playwright/test';
 import { btn, expectVisual, FLOW_CONFIG, Fingers } from './helpers.ts';
 import { startHost, type Host } from './host.ts';
@@ -144,6 +145,30 @@ test('a reload mid-run still shows the run (state comes from the host)', async (
   await expect(page.getByTestId('conn')).toHaveAttribute('data-status', 'online');
   await expectVisual(page, 'slow', 'running');
   await expectVisual(page, 'slow', 'success', 6000);
+});
+
+test('hand edits to the config file show up live; a broken file warns admins', async ({ page }) => {
+  await open(page, host.adminToken);
+  const original = readFileSync(host.configPath, 'utf8');
+  const cfg = JSON.parse(original) as typeof FLOW_CONFIG;
+  cfg.pads[0]!.buttons[0]!.label = 'Renamed live';
+  writeFileSync(host.configPath, JSON.stringify(cfg, null, 2));
+  await expect(btn(page, 'hold')).toContainText('Renamed live', { timeout: 5000 });
+
+  writeFileSync(host.configPath, '{ "version": 1, "pads": [ oops');
+  await expect(page.getByTestId('config-errors')).toBeVisible({ timeout: 5000 });
+  await expect(btn(page, 'hold')).toContainText('Renamed live');
+
+  writeFileSync(host.configPath, `${original}\n`);
+  await expect(page.getByTestId('config-errors')).toHaveCount(0, { timeout: 5000 });
+  await expect(btn(page, 'hold')).toContainText('Hold me');
+});
+
+test('admin backend can read run logs', async ({ page }) => {
+  await open(page, host.adminToken);
+  const runs = await page.evaluate(() => window.__buttpad!.backend.runs({ pad: 'main', button: 'fail' }));
+  expect(runs.length).toBeGreaterThan(0);
+  expect(runs[0]!.stderr).toContain('disk full');
 });
 
 test('host goes away: offline display; comes back: reconnects by itself', async ({ page, hasTouch }) => {
