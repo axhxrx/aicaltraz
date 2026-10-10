@@ -117,7 +117,7 @@ test('edit a label and the action, add a button, save: the config file has it', 
   await expect(btn(page, 'fan')).toBeVisible();
 });
 
-test('host config changes: adopted silently while clean, a notice while dirty', async ({ page, hasTouch }) => {
+test('host config changes: adopted silently while clean, merged into a dirty draft (undoable)', async ({ page, hasTouch }) => {
   await edit(page);
   handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Boom!'));
   await expect(item(page, 'boom')).toContainText('Boom!');
@@ -126,45 +126,67 @@ test('host config changes: adopted silently while clean, a notice while dirty', 
 
   await select(page, hasTouch, 'lamp');
   await page.getByTestId('field-label').fill('Mine');
+  // Another button changed by hand: merged in at once, the draft keeps its own change.
   handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Boom again'));
-  await expect(page.getByTestId('notice-host-changed')).toBeVisible();
-  // The draft is left alone.
+  await expect(item(page, 'boom')).toContainText('Boom again');
+  await expect(page.getByTestId('toast')).toContainText('Merged 1 change from the host');
+  await expect(page.getByTestId('field-label')).toHaveValue('Mine');
+  await expect(page.getByTestId('notice-host-changed')).toHaveCount(0);
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  // Undo takes the merge back (and the draft is behind the host again)…
+  await page.getByTestId('toast-action').click();
   await expect(item(page, 'boom')).toContainText('Boom!');
   await expect(page.getByTestId('field-label')).toHaveValue('Mine');
-  await page.getByTestId('host-changed-load').click();
+  await expect(page.getByTestId('notice-host-changed')).toBeVisible();
+  // …and merging again is one tap; saving keeps both.
+  await page.getByTestId('host-changed-merge').click();
   await expect(item(page, 'boom')).toContainText('Boom again');
-  await expect(item(page, 'lamp')).toContainText('Lamp');
+  await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect(disk().pads[0]!.buttons.map((b) => b.label)).toEqual(['Mine', 'Boom again']);
 });
 
-test('409 conflict: the file changed under a dirty draft → load theirs, or overwrite with mine', async ({ page, hasTouch }) => {
+test('409 conflict: the same button changed on both sides → merge (pick a side), or overwrite with mine', async ({ page, hasTouch }) => {
   await edit(page);
   await select(page, hasTouch, 'lamp');
   await page.getByTestId('field-label').fill('Mine');
-  handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Theirs'));
-  await expect(page.getByTestId('notice-host-changed')).toBeVisible();
+  // A new button too: it must survive whatever is picked for the conflict.
+  const empty = page.getByTestId('cell-2-1');
+  if (hasTouch) await empty.tap();
+  else await empty.click();
+  await page.getByTestId('field-label').fill('Fan');
+  handEdit((c) => (c.pads[0]!.buttons[0]!.label = 'Theirs'));
+  await expect(page.getByTestId('notice-host-changed')).toContainText('1 of its changes is also changed in your draft');
   await page.getByTestId('edit-save').click();
   const dialog = page.getByTestId('dialog-conflict');
   await expect(dialog).toContainText('hand');
-  await page.getByTestId('conflict-theirs').click();
-  await expect(dialog).toHaveCount(0);
-  await expect(item(page, 'boom')).toContainText('Theirs');
-  await expect(item(page, 'lamp')).toContainText('Lamp');
+  // The safe way out has the focus: Enter can't throw anything away.
+  await expect(page.getByTestId('conflict-cancel')).toBeFocused();
+  await page.getByTestId('conflict-merge').click();
+  const merge = page.getByTestId('dialog-merge');
+  await expect(merge.getByTestId('merge-item')).toHaveCount(1);
+  await expect(merge.getByTestId('merge-item')).toContainText('You changed label; the host changed label.');
+  await expect(page.getByTestId('merge-cancel')).toBeFocused();
+  await page.getByTestId('merge-0-theirs').click();
+  await page.getByTestId('merge-apply').click();
+  await expect(merge).toHaveCount(0);
+  await expect(item(page, 'lamp')).toContainText('Theirs');
+  await expect(item(page, 'fan')).toBeVisible();
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
-  expect(disk().pads[0]!.buttons[0]!.label).toBe('Lamp');
+  expect(disk().pads[0]!.buttons.map((b) => b.label)).toEqual(['Theirs', 'Boom', 'Fan']);
 
-  // Again, and this time keep mine.
+  // Again, and this time keep mine by overwriting.
   await select(page, hasTouch, 'lamp');
   await page.getByTestId('field-label').fill('Mine again');
-  handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Theirs again'));
+  handEdit((c) => (c.pads[0]!.buttons[0]!.label = 'Theirs again'));
   await expect(page.getByTestId('notice-host-changed')).toBeVisible();
   await page.getByTestId('edit-save').click();
   await page.getByTestId('conflict-mine').click();
   await expect(dialog).toHaveCount(0);
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
-  const [lamp, boom] = disk().pads[0]!.buttons;
-  expect(lamp!.label).toBe('Mine again');
-  expect(boom!.label).toBe('Theirs');
+  expect(disk().pads[0]!.buttons[0]!.label).toBe('Mine again');
 });
 
 test('validation errors from the host point at the offending button and field', async ({ page, hasTouch }) => {
@@ -222,7 +244,7 @@ test("recent runs show a failed run's exit code and stderr", async ({ page, hasT
   await expect(run).toContainText('boom: disk on fire');
   await expect(page.getByTestId('run-stderr').first()).toHaveText('boom: disk on fire');
   await expect(page.getByTestId('run-stdout').first()).toHaveText('@status trying');
-  // A button that isn't on the host yet has no runs to show.
+  // A button that isn't on the host yet has no runs to show, and no "Run now": "Save & run".
   const empty = page.getByTestId('cell-2-0');
   if (hasTouch) await empty.tap();
   else await empty.click();
@@ -230,5 +252,6 @@ test("recent runs show a failed run's exit code and stderr", async ({ page, hasT
   await expect(page.getByTestId('field-label')).toHaveValue('Button 3');
   await page.getByTestId('editor-tab-runs').click();
   await expect(log).toContainText('The host has no button “main/button-3” yet');
-  await expect(page.getByTestId('run-test')).toBeDisabled();
+  await expect(page.getByTestId('run-test')).toHaveCount(0);
+  await expect(page.getByTestId('run-save')).toBeEnabled();
 });

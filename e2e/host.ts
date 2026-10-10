@@ -22,8 +22,8 @@ export interface Host {
   readonly pressToken: string;
   readonly adminToken: string;
   readonly configPath: string;
-  /** (Re)start on the same port, same tokens. */
-  start(): Promise<void>;
+  /** (Re)start on the same port, same tokens (new ones with `rotateTokens`). */
+  start(opts?: { rotateTokens?: boolean }): Promise<void>;
   stop(): Promise<void>;
   /** Stop and delete the temp dir. */
   dispose(): Promise<void>;
@@ -39,9 +39,9 @@ export async function startHost(config: ConfigInput): Promise<Host> {
   let ready: Ready | null = null;
   let output = '';
 
-  const start = () =>
+  const start = (o: { rotateTokens?: boolean } = {}) =>
     new Promise<void>((resolve, reject) => {
-      const args = ['src/server/main.ts', '--config', configPath, '--host', '127.0.0.1', '--port', String(ready?.port ?? 0), '--ready-json', '--no-qr'];
+      const args = ['src/server/main.ts', '--config', configPath, '--host', '127.0.0.1', '--port', String(ready?.port ?? 0), '--ready-json', '--no-qr', ...(o.rotateTokens ? ['--rotate-tokens'] : [])];
       const p = spawn('bun', args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, NODE_ENV: 'production' } });
       proc = p;
       let buf = '';

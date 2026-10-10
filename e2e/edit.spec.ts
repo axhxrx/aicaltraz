@@ -438,3 +438,130 @@ test('duplicate and delete, with undo from the toast', async ({ page }) => {
   await page.getByTestId('editor-duplicate').click();
   await expect(page.getByTestId('toast')).toContainText('No room for a copy');
 });
+
+test('dialogs that could throw work away focus their safe way out (Enter keeps editing)', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('field-label').fill('Changed');
+  await page.getByTestId('edit-discard').click();
+  await expect(page.getByTestId('discard-cancel')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('dialog-discard')).toHaveCount(0);
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  await page.getByTestId('edit-close').click();
+  await expect(page.getByTestId('leave-cancel')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('dialog-leave')).toHaveCount(0);
+  await page.getByTestId('edit-pad-settings').click();
+  await page.getByTestId('pad-delete').click();
+  await expect(page.getByTestId('delete-pad-cancel')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('dialog-delete-pad')).toHaveCount(0);
+  await expect(page.locator('.ed-padtab')).toHaveCount(2);
+  await expect(item(page, 'alpha')).toContainText('Changed');
+});
+
+test('Discard is one tap away on phones too (not only in the status chip), and undoable', async ({ page }) => {
+  await p.tap(await center(cell(page, 2, 1)));
+  await expect(item(page, 'button-4')).toBeVisible();
+  await expect(page.getByTestId('edit-discard')).toBeVisible();
+  await page.getByTestId('edit-discard').click();
+  await page.getByTestId('discard-confirm').click();
+  await expect(item(page, 'button-4')).toHaveCount(0);
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  await expect(page.getByTestId('edit-discard')).toHaveCount(0);
+  await page.getByTestId('toast-action').click();
+  await expect(item(page, 'button-4')).toBeVisible();
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+});
+
+test('⌘S while binding a key saves (it does not bind "s"); Backspace on a notice link leaves the button alone', async ({ page, hasTouch }) => {
+  test.skip(hasTouch, 'desktop keyboard shortcuts');
+  await item(page, 'alpha').click();
+  await page.getByTestId('field-label').fill('Key light');
+  await page.getByTestId('field-key').click();
+  await expect(page.getByTestId('field-key')).toContainText('Press a key');
+  await page.keyboard.press('ControlOrMeta+s');
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0]).toMatchObject({ label: 'Key light' });
+  expect((await saved(page)).pads[0].buttons[0].key).toBeUndefined();
+  // Still listening: the remote's key binds.
+  await page.keyboard.press('k');
+  await expect(page.getByTestId('field-key')).toContainText('Key “k”');
+
+  await page.getByTestId('field-id').fill('bad id!');
+  await page.getByTestId('edit-save').click();
+  await page.getByTestId('problem-item').first().click();
+  await expect(page.getByTestId('problem-item').first()).toBeFocused();
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Delete');
+  await expect(page.locator('.ed-item')).toHaveCount(3);
+});
+
+test('Shell ⇄ Program keeps what a command means: ~ and NAME=value stay a script (sh -c), and come back as they were', async ({ page }) => {
+  await p.tap(await center(item(page, 'beta')));
+  await page.getByTestId('editor-tab-action').click();
+  for (const script of ['ls -d ~', 'LC_ALL=C date']) {
+    await page.getByTestId('field-script').fill(script);
+    await page.getByTestId('field-action-type-exec').click();
+    await expect(page.getByTestId('field-command')).toHaveValue('/bin/sh');
+    await expect(page.getByTestId('field-arg-0')).toHaveValue('-c');
+    await expect(page.getByTestId('field-arg-1')).toHaveValue(script);
+    await page.getByTestId('field-action-type-shell').click();
+    await expect(page.getByTestId('field-script')).toHaveValue(script);
+    await expect(page.getByTestId('field-shell')).toHaveValue('');
+  }
+  // A plain word list does become argv, and an edited argv comes back properly quoted.
+  await page.getByTestId('field-script').fill('echo hello');
+  await page.getByTestId('field-action-type-exec').click();
+  await expect(page.getByTestId('field-command')).toHaveValue('echo');
+  await expect(page.getByTestId('field-arg-0')).toHaveValue('hello');
+  await page.getByTestId('field-arg-0').fill("it's ~ here");
+  await page.getByTestId('field-action-type-shell').click();
+  await expect(page.getByTestId('field-script')).toHaveValue(`echo 'it'\\''s ~ here'`);
+});
+
+test('an empty argument is flagged but allowed; a bad env name is an inline error that blocks saving', async ({ page }) => {
+  await p.tap(await center(item(page, 'gamma')));
+  await page.getByTestId('editor-tab-action').click();
+  await page.getByTestId('field-arg-add').click();
+  await expect(page.getByTestId('field-arg-1')).toBeFocused();
+  await expect(page.getByTestId('field-arg-1-empty')).toHaveCount(0);
+  await page.getByTestId('field-cwd').click();
+  await expect(page.getByTestId('field-arg-1-empty')).toContainText('Empty');
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  await page.getByTestId('env-add').click();
+  await page.getByTestId('env-key-0').fill('FOO ');
+  await expect(page.getByTestId('env-error-0')).toHaveText('Letters, digits and _ only, not starting with a digit');
+  await expect(status(page)).toHaveText('1 problem');
+  await page.getByTestId('edit-save').click();
+  await expect(page.getByTestId('notice-problems')).toContainText('Variable FOO');
+  await page.getByTestId('env-key-0').fill('FOO');
+  await expect(page.getByTestId('env-error-0')).toHaveCount(0);
+  await page.getByTestId('env-value-0').fill('bar');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[2].action).toEqual({ type: 'exec', command: 'echo', args: ['gamma', ''], env: { FOO: 'bar' } });
+});
+
+test('duplicate leaves the key binding behind; changing ids says what breaks; hints say where paths start', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('field-key').click();
+  await page.keyboard.press('k');
+  await expect(page.getByTestId('field-key')).toContainText('Key “k”');
+  await page.getByTestId('editor-duplicate').click();
+  await expect(page.getByTestId('field-label')).toHaveValue('Alpha copy');
+  await expect(page.getByTestId('field-key')).toContainText('Press to bind a key');
+  // The original's id is on the host: changing it says what that breaks.
+  await p.tap(await center(item(page, 'alpha')));
+  await expect(page.getByTestId('id-warning')).toHaveCount(0);
+  await page.getByTestId('field-id').fill('alpha2');
+  await expect(page.getByTestId('id-warning')).toContainText('POST /api/press/main/alpha');
+  await page.getByTestId('editor-tab-action').click();
+  await expect(page.getByTestId('field-shell')).toHaveAttribute('placeholder', '$SHELL (or /bin/sh)');
+  await page.getByTestId('field-action-type-exec').click();
+  await expect(page.getByTestId('button-editor')).toContainText('A relative path (./x.sh) starts in the working folder');
+  await expect(page.getByTestId('button-editor')).toContainText("Default: the config file's folder");
+  await page.getByTestId('edit-pad-settings').click();
+  await page.getByTestId('pad-id').fill('mainx');
+  await expect(page.getByTestId('pad-id-warning')).toContainText('?pad=main');
+});
