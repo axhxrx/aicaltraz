@@ -137,11 +137,9 @@ export function ButtonPanel(
                     <NumberInput id={id('hold')} value={b.holdMs} unit="ms" step={50} onValue={(n) => ed.patchButton({ holdMs: n }, 'holdMs')} testid="field-holdMs" invalid={!!err('holdMs')} />
                   </Field>
                 )}
-                {b.trigger !== 'double' && (
-                  <Field label="Finger may slide" for={id('drift')} error={err('driftPx')} hint="before the press cancels" testid="driftPx">
-                    <NumberInput id={id('drift')} value={b.driftPx} unit="px" step={5} onValue={(n) => ed.patchButton({ driftPx: n }, 'driftPx')} testid="field-driftPx" invalid={!!err('driftPx')} />
-                  </Field>
-                )}
+                <Field label="Finger may slide" for={id('drift')} error={err('driftPx')} hint="before the press cancels" testid="driftPx">
+                  <NumberInput id={id('drift')} value={b.driftPx} unit="px" step={5} onValue={(n) => ed.patchButton({ driftPx: n }, 'driftPx')} testid="field-driftPx" invalid={!!err('driftPx')} />
+                </Field>
               </div>
               <SwitchRow title="Ask to confirm" note="Needs a second press: for things you can't take back." on={b.confirm} onChange={(v) => ed.patchButton({ confirm: v })} testid="field-confirm" />
               {b.confirm && (

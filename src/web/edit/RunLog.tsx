@@ -157,7 +157,7 @@ export function RunLog(p: { backend: Backend; padId: string; buttonId: string; o
       </div>
       <p class="ed-hint">
         {!p.onHost
-          ? "This button isn't on the host yet: save, then runs show up here."
+          ? `The host has no button “${p.padId}/${p.buttonId}” yet: save first (a new or renamed button starts a fresh history).`
           : p.changed
             ? 'Run now uses the saved version on the host, not your unsaved changes.'
             : 'Run now runs the action on the host right away (no hold or confirm).'}

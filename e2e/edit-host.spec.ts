@@ -229,6 +229,6 @@ test("recent runs show a failed run's exit code and stderr", async ({ page, hasT
   // New buttons open on their Button tab.
   await expect(page.getByTestId('field-label')).toHaveValue('Button 3');
   await page.getByTestId('editor-tab-runs').click();
-  await expect(log).toContainText("isn't on the host yet");
+  await expect(log).toContainText('The host has no button “main/button-3” yet');
   await expect(page.getByTestId('run-test')).toBeDisabled();
 });
