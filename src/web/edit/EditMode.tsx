@@ -56,11 +56,18 @@ const hasActions = (c: WireConfig): c is Config => c.pads.every((p) => p.buttons
 
 /** Compares configs as the host keeps them ($schema is the host's business). */
 const keyOf = ({ $schema: _s, ...c }: WireConfig) => stable(c);
+const problemCount = (c: Config) => {
+  const r = parseConfig(c);
+  return r.ok ? 0 : r.errors.length;
+};
 
-/** Revs remembered as old news (own saves, merged, seen). */
-const KNOWN_MAX = 64;
-/** A config fetched over HTTP is ahead of a lagging socket: what the socket says until it catches up is older. */
-const AHEAD_MS = 15_000;
+/** This session's own saves remembered (their echoes over the socket are not news). */
+const OWN_MAX = 32;
+/**
+ * The host's state learned over HTTP (a save's answer, a fetch) the socket hasn't delivered yet:
+ * what a lagging socket says until it gets there is older news. Waited for at most this long.
+ */
+const CATCH_UP_MS = 15_000;
 
 export function EditMode(p: EditModeProps) {
   const role = useStore(p.backend.snapshot, (s) => s.role);
@@ -140,17 +147,44 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const inFlight = useRef(false);
   /** Last snapshot rev looked at: only *changes* of the host config matter. */
   const seen = useRef(backend.snapshot.get().rev);
-  /** Revs that are old news: this session's saves (their echoes), configs merged or adopted. */
-  const known = useRef(new Set<string>(backend.snapshot.get().rev ? [backend.snapshot.get().rev!] : []));
+  /** Revs of this session's saves, oldest first: their echoes over the socket (late, or several) are not news. */
+  const own = useRef(new Set<string>());
+  const addOwn = (rev: string) => {
+    const o = own.current;
+    o.delete(rev);
+    o.add(rev);
+    while (o.size > OWN_MAX) o.delete(o.values().next().value!);
+  };
   /** Saves with no answer (timeout, dropped link): they may still turn up on the host. */
   const unsure = useRef<{ config: Config; key: string }[]>([]);
-  /** A rev fetched over HTTP the socket hasn't delivered yet (see AHEAD_MS). */
-  const ahead = useRef<{ rev: string; timer: ReturnType<typeof setTimeout> } | null>(null);
-  const noteRev = (rev: string) => {
-    const k = known.current;
-    k.delete(rev);
-    k.add(rev);
-    while (k.size > KNOWN_MAX) k.delete(k.values().next().value!);
+  /** Revs the socket delivered lately, newest last (seen as they come: renders may skip some). */
+  const recent = useRef<string[]>(backend.snapshot.get().rev ? [backend.snapshot.get().rev!] : []);
+  /** A rev learned over HTTP the socket hasn't delivered yet (see CATCH_UP_MS). */
+  const catchUp = useRef<{ rev: string; reached: boolean; timer: ReturnType<typeof setTimeout> } | null>(null);
+  useEffect(
+    () =>
+      backend.snapshot.subscribe((s) => {
+        const r = recent.current;
+        if (!s.rev || r.at(-1) === s.rev) return;
+        r.push(s.rev);
+        if (r.length > 32) r.shift();
+        if (catchUp.current?.rev === s.rev) catchUp.current.reached = true;
+      }),
+    [],
+  );
+  /** The host is at `rev` (we know it over HTTP): until the socket gets there, what it says is older. */
+  const awaitSocket = (rev: string) => {
+    clearTimeout(catchUp.current?.timer);
+    catchUp.current = null;
+    if (backend.snapshot.get().rev === rev || recent.current.includes(rev)) return;
+    catchUp.current = {
+      rev,
+      reached: false,
+      timer: setTimeout(() => {
+        catchUp.current = null;
+        syncHost();
+      }, CATCH_UP_MS),
+    };
   };
 
   // ---- the draft kept on this device ------------------------------------------------------
@@ -165,7 +199,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const keeping = useRef(!stored);
   useEffect(() => {
     const off = ed.store.subscribe(() => keeping.current && keeper.update(ed));
-    return () => (off(), keeper.dispose(), clearTimeout(ahead.current?.timer));
+    return () => (off(), keeper.dispose(), clearTimeout(catchUp.current?.timer));
   }, []);
 
   const draft = st.draft;
@@ -211,7 +245,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
 
   /** Our save is on the host as `rev` (its answer, or found there). */
   const landed = (sent: Config, rev: string) => {
-    noteRev(rev);
+    addOwn(rev);
+    awaitSocket(rev);
     unsure.current = [];
     setHostNow({ rev, config: sent });
     ed.saved(sent, rev);
@@ -220,29 +255,34 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setShowProblems(false);
   };
 
-  /** Fresh news from HTTP (the socket may be behind it). */
+  /** Fresh news over HTTP (the socket may be behind it). */
   const learn = (config: Config, rev: string) => {
-    noteRev(rev);
+    awaitSocket(rev);
     setHostNow({ rev, config });
-    clearTimeout(ahead.current?.timer);
-    ahead.current = null;
-    if (backend.snapshot.get().rev !== rev)
-      ahead.current = {
-        rev,
-        timer: setTimeout(() => {
-          ahead.current = null;
-          syncHost();
-        }, AHEAD_MS),
-      };
+  };
+
+  /** The host's config now, over HTTP. If the socket brought news meanwhile, ask once more: which is newer can't be told. */
+  const fetchHost = async () => {
+    for (let i = 0; ; i++) {
+      const before = backend.snapshot.get().rev;
+      const got = await backend.getConfig();
+      const after = backend.snapshot.get().rev;
+      if (i > 0 || after === before || after === got.rev) return got;
+    }
   };
 
   const applyMerge = (res: MergeResult, theirs: Config, rev: string) => {
-    noteRev(rev);
+    const before = problemCount(ed.state.draft);
     ed.applyMerge(res, theirs, rev);
     setMerging(null);
     setDismissed(null);
     const n = res.taken;
-    undoable(n ? `Merged ${n} change${n === 1 ? '' : 's'} from the host` : "Your draft is now based on the host's latest config");
+    // Both sides fine on their own can still clash (two new buttons on one square): say so.
+    const added = problemCount(res.config) - before;
+    undoable(
+      (n ? `Merged ${n} change${n === 1 ? '' : 's'} from the host` : "Your draft is now based on the host's latest config") +
+        (added > 0 ? `: ${added} problem${added === 1 ? '' : 's'} to fix` : ''),
+    );
   };
 
   /** The host's config is `theirs` now, and it's news: follow it, or merge it into unsaved changes. */
@@ -263,19 +303,23 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     return unsure.current.find((u) => u.key === k);
   };
 
-  const busy = () => inFlight.current || !!merging || !!conflict || !!ask || !!stored;
+  /** A dialog is up: host changes wait until it's closed. A ref: timers and async steps call syncHost too. */
+  const dialogUp = useRef(false);
+  dialogUp.current = !!(merging || conflict || ask || stored);
+  const busy = () => inFlight.current || dialogUp.current;
   const syncHost = () => {
     if (busy()) return; // decided once that is over
     const s = backend.snapshot.get();
     if (!s.rev || !s.config || !hasActions(s.config) || s.rev === seen.current) return;
-    if (ahead.current) {
-      if (s.rev !== ahead.current.rev) return; // the socket still catching up: older than what we have
-      clearTimeout(ahead.current.timer);
-      ahead.current = null;
+    const c = catchUp.current;
+    if (c) {
+      if (!c.reached) return; // the socket hasn't got to what we know over HTTP yet: what it says is older
+      clearTimeout(c.timer);
+      catchUp.current = null;
     }
     seen.current = s.rev;
-    if (known.current.has(s.rev)) return; // our own save coming back, or already merged
-    noteRev(s.rev);
+    // In step, or our own save coming back (late, or one of several).
+    if (s.rev === ed.state.baseRev || own.current.has(s.rev)) return;
     const mine = ours(s.config);
     if (mine) {
       landed(mine.config, s.rev);
@@ -291,7 +335,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const startMerge = async () => {
     let got: { config: WireConfig; rev: string };
     try {
-      got = await backend.getConfig();
+      got = await fetchHost();
     } catch (e) {
       say(`Couldn't get the host's config: ${e instanceof Error ? e.message : String(e)}`, { tone: 'bad' });
       return;
@@ -351,7 +395,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const check = async (sent: Config): Promise<'sent' | 'older' | null> => {
     let got: { config: WireConfig; rev: string };
     try {
-      got = await backend.getConfig();
+      got = await fetchHost();
     } catch {
       return null;
     }
@@ -424,8 +468,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const overwrite = async (c: { rev: string; opts: SaveOpts }) => {
     setConflict(null);
     try {
-      const now = await backend.getConfig();
-      if (now.rev !== c.rev && !known.current.has(now.rev)) return setConflict({ rev: now.rev, again: true, opts: c.opts });
+      const now = await fetchHost();
+      if (now.rev !== c.rev && !own.current.has(now.rev)) return setConflict({ rev: now.rev, again: true, opts: c.opts });
     } catch {
       /* can't tell: the save says */
     }
@@ -436,12 +480,14 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setModal(null);
     let to = { config: hostNowRef.current.config, rev: hostNowRef.current.rev };
     try {
-      const got = await backend.getConfig();
+      const got = await fetchHost();
       if (hasActions(got.config)) (learn(got.config, got.rev), (to = { config: got.config, rev: got.rev }));
     } catch {
       /* offline: back to the last known host config */
     }
     ed.discard(to.config, to.rev);
+    // A save of the thrown-away draft turning up later is news then, not "saved".
+    unsure.current = [];
     setHostErrors(null);
     setSaveError(null);
     deselect();

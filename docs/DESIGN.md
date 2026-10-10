@@ -80,7 +80,7 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 | GET | `/` | none | the web app (Bun HTML import of `src/web/index.html`) |
 | GET | `/api/health` | none | `{ok:true, version, protocol}`; no host name (anyone can ask, even a DNS-rebinding page; `hello` has it) |
 | GET | `/api/config` | any | `{config: WireConfig, rev}` (redacted for press) |
-| PUT | `/api/config` | admin | body `{config, baseRev}` → 200 `{rev}`; 400 `{errors:string[]}`; 409 `{rev}` if `baseRev` ≠ current |
+| PUT | `/api/config` | admin | body `{config, baseRev, force?}` → 200 `{rev}`; 400 `{errors:string[]}`; 409 `{rev, invalid?, errors?}` if `baseRev` ≠ the rev of the file's bytes now, valid or not (`invalid: true` + the file's `errors` when they aren't a valid config). `force: true` skips the check (replace whatever is there) |
 | GET | `/api/state` | any | `{states: StateMap, serverNow}` |
 | POST | `/api/press/:pad/:button` | any | → `{result: PressResult, state}`; 404 unknown button. For curl/Stream Deck/etc. |
 | GET | `/api/runs?pad=&button=` | admin | `RunRecord[]`, newest first, last 20 per button (both params optional) |
@@ -107,6 +107,11 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 - UI saves: validate with `parseConfig`, write atomically (temp file + rename), compact output
   (omit button fields equal to their schema defaults; 2-space JSON). A new file is created 0600 (it
   holds commands and their env); a rewrite keeps the file's mode.
+- A save's `baseRev` must name the file's bytes as they are at that moment, valid config or not: a
+  hand edit with a typo, or one caught mid-write by a non-atomic editor, is someone's work too, so
+  it gets a 409 (`invalid: true`), never a silent overwrite. The file is read again right before
+  the rename; a write that landed meanwhile stays and the save gets a 409. `force: true` (the user
+  chose to overwrite) skips both checks.
 - A symlinked config is read and watched through its path: saves replace the link's current
   target; edits of the target and replacing the link itself (`sed -i`) are both picked up. Relative
   paths (actions, secrets) resolve against the directory of the file it pointed to at startup.
@@ -118,7 +123,8 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 - `exec`: `Bun.spawn([command, ...args])`. `shell`: POSIX `[shell ?? $SHELL ?? '/bin/sh', '-c', script]`;
   Windows `[shell ?? %ComSpec% ?? 'cmd.exe', '/d', '/s', '/c', script]`.
 - `cwd` defaults to the config file's directory; relative `cwd` resolves against it too.
-- env = host env + action `env` + `BUTTPAD_PAD`, `BUTTPAD_BUTTON`, `BUTTPAD_RUN_ID`, `BUTTPAD_LABEL`.
+- env = host env + action `env` (names `[A-Za-z_][A-Za-z0-9_]*`) + `BUTTPAD_PAD`, `BUTTPAD_BUTTON`,
+  `BUTTPAD_RUN_ID`, `BUTTPAD_LABEL`.
 - stdin ignored. Spawn detached (POSIX: own process group) so kill hits the whole tree:
   SIGTERM to `-pid`, then SIGKILL after 2 s. Windows: `taskkill /T /F /PID`. A killed run is
   *dying* until its group is seen empty (on Linux, zombies awaiting their reaper don't count) or got
@@ -265,9 +271,39 @@ the handler.
   Duplicate, delete.
 - Pad management: add, rename, delete, reorder, cols/rows (shrinking that would clip buttons is
   refused with an explanation).
-- Edits are a local draft until **Save** (PUT with `baseRev`). Unsaved indicator. Validation
-  errors from the host are shown. 409 → offer reload/overwrite. Discard reverts.
-- Admin extra: per-button run log (from `/api/runs`) to see why something failed.
+- Edits are a local draft until **Save** (PUT with `baseRev`). Unsaved indicator; **Discard**
+  (undoable) in plain sight on every layout. Validation errors from the host are shown. Dialogs that
+  could destroy work focus their safe way out (Cancel / Keep editing).
+- The draft is kept on the device (localStorage, per host origin; written right after each change
+  and when the page is hidden) until saved or discarded: a reload, an evicted tab, a rotated token
+  (401) or a pairing link opened in the tab don't lose it (a pairing link opened while the draft is
+  dirty asks first). The next edit session, and run mode for an admin, offers it back ("Restore
+  unsaved changes from 10:42?"), merged with the host's config as it is by then.
+- The host config changing under the draft (hand edit, another admin): with nothing unsaved it is
+  simply taken. Under unsaved changes it is merged: a three-way merge (`src/web/edit/merge.ts`;
+  base = the config the draft started from, mine = the draft, theirs = the host's now) at pad and
+  button granularity. What changed on one side only merges on its own, as one undoable step
+  ("Merged 2 changes from the host"). The same pad or button changed on both sides, or deleted on
+  one and changed on the other, is listed, and the user picks mine or theirs per item. Identity
+  follows the draft's renames (a pad or button id changed in the draft still gets their changes).
+- This session's own saves coming back over the socket (late, or several in a row) are not news;
+  neither is what a lagging socket says before it gets to a state already learned over HTTP.
+- A save with no answer within 10 s, or whose link dropped, is checked with `GET /api/config`: if
+  the host has exactly what was sent, it saved (also when the socket's echo shows it later). A 409
+  gets the same check, then offers: merge their changes (fetched fresh), overwrite with mine
+  (`force`), or cancel. A config file on the host that is currently invalid is replaced only after
+  the user confirms (`force`).
+- Saving asks first when it would stop running actions (a running button deleted, or its or its
+  pad's id changed): "This will stop: “Record” (running 2 min)". The canvas marks running buttons;
+  the id fields say what an id change breaks (`?pad=` links, `/api/press/…`, run histories).
+- New buttons never take an id the host has on that pad (e.g. one deleted in the draft): until the
+  save, that id still names the host's button. Duplicates don't copy the key binding.
+- Shell ⇄ Program switching keeps the meaning: only a plain word list becomes argv (no quotes, `~`,
+  `NAME=value`, globs, `$`, shell syntax or builtins); anything else becomes `sh -c SCRIPT`, which
+  switches back unwrapped. argv becomes a properly quoted command line. Empty arguments get a
+  warning (allowed); env names are checked as typed.
+- Admin extra: per-button run log (from `/api/runs`) to see why something failed. **Run now** for a
+  saved, unchanged button; otherwise **Save & run** (saves the draft, then runs the saved version).
 
 ## Testing
 

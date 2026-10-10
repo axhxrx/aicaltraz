@@ -169,9 +169,9 @@ export function RunLog(p: { backend: Backend; padId: string; buttonId: string; o
       </div>
       <p class="ed-hint">
         {!p.onHost
-          ? `The host has no button “${p.padId}/${p.buttonId}” yet: Save & run saves your draft, then runs it (a new or renamed button starts a fresh history).`
+          ? `The host has no button “${p.padId}/${p.buttonId}” yet: save first. Save & run does both: it saves your draft, then runs this button (a new or renamed button starts a fresh history).`
           : p.changed
-            ? 'Unsaved changes: Save & run saves your draft (all of it), then runs the saved version. Run now would run the old one.'
+            ? 'Unsaved changes: save first, or Run now would run the old version on the host. Save & run saves your draft (all of it), then runs the saved version.'
             : 'Run now runs the action on the host right away (no hold or confirm).'}
       </p>
       {note && <div class="ed-callout">{note}</div>}

@@ -169,6 +169,35 @@ test("two quick saves on a lagging socket: their late echoes aren't news (no rev
   expect(labels()).toEqual(['Lamp v3', 'Boom v2', 'Record']);
 });
 
+test('a hand edit undone again (the file back to the very same bytes) is followed too, with or without unsaved changes', async ({ page, hasTouch }) => {
+  await edit(page);
+  const before = readFileSync(host.configPath, 'utf8');
+  handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Boom (typo)'));
+  await expect(item(page, 'boom')).toContainText('Boom (typo)');
+  writeFileSync(host.configPath, before);
+  await expect(item(page, 'boom')).not.toContainText('typo');
+  await relabel(page, hasTouch, 'lamp', 'Mine');
+  handEdit((c) => (c.pads[0]!.buttons[1]!.label = 'Boom (typo)'));
+  await expect(item(page, 'boom')).toContainText('Boom (typo)');
+  writeFileSync(host.configPath, before);
+  await expect(item(page, 'boom')).not.toContainText('typo');
+  await expect(page.getByTestId('field-label')).toHaveValue('Mine');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect(labels()).toEqual(['Mine', 'Boom', 'Record']);
+});
+
+test('two new buttons on one square (mine, and one added by hand) merge, and the clash is pointed out', async ({ page, hasTouch }) => {
+  await edit(page);
+  await tap(page, hasTouch, 'cell-0-1');
+  await page.getByTestId('field-label').fill('Mine');
+  handEdit((c) => c.pads[0]!.buttons.push({ id: 'theirs', label: 'Theirs', x: 0, y: 1, action: { type: 'shell', script: 'echo theirs' } }));
+  await expect(page.getByTestId('toast')).toContainText('Merged 1 change from the host: 1 problem to fix');
+  await expect(item(page, 'theirs')).toBeVisible();
+  await expect(item(page, 'mine')).toBeVisible();
+  await expect(status(page)).toHaveText('1 problem');
+});
+
 test('a save that never gets an answer gives up after 10 s, asks the host whether it landed, and the editor works again', async ({ page, hasTouch }) => {
   test.setTimeout(75_000);
   await edit(page);
@@ -272,7 +301,7 @@ test('a new button never takes the id of a deleted host button; unsaved ones get
   await page.getByTestId('field-script').fill('echo solo v2');
   await page.getByTestId('editor-tab-runs').click();
   await expect(page.getByTestId('run-test')).toHaveCount(0);
-  await expect(page.getByTestId('run-log')).toContainText('Run now would run the old one');
+  await expect(page.getByTestId('run-log')).toContainText('save first, or Run now would run the old version');
   await page.getByTestId('run-save').click();
   await expect(page.getByTestId('run-item').first()).toContainText('solo v2', { timeout: 8000 });
   await expect(page.getByTestId('run-test')).toBeVisible();

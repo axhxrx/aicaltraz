@@ -2,7 +2,7 @@
  * Validation errors ("pads.0.buttons.2.action.command: …", from parseConfig or the host's 400)
  * mapped onto the draft: which pad, which button, which field, in plain words.
  */
-import type { Config } from '../../core/config.ts';
+import { ENV_NAME_MESSAGE, type Config } from '../../core/config.ts';
 
 export interface Problem {
   pad: number | null;
@@ -57,6 +57,7 @@ export function pretty(msg: string): string {
   if (/^duplicate button id/.test(msg)) return 'Another button on this pad has this id';
   if (/^duplicate pad id/.test(msg)) return 'Another pad has this id';
   if (msg === 'letters, digits, _ and - only') return 'Letters, digits, _ and - only';
+  if (msg === ENV_NAME_MESSAGE) return `${msg.charAt(0).toUpperCase()}${msg.slice(1)}`;
   return msg;
 }
 
