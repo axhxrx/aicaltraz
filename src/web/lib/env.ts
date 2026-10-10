@@ -31,10 +31,16 @@ export function parseToken(input: string): string | null {
 
 /** Moves `#token=` from the URL into storage and strips it from the address bar. */
 export function takeHashToken(): void {
-  if (!location.hash.includes('token=')) return;
-  const t = parseToken(location.hash);
+  const t = readHashToken();
   if (t) lsSet(KEYS.token, t);
+}
+
+/** The `#token=` in the URL, stripped from the address bar (not stored). */
+export function readHashToken(): string | null {
+  if (!location.hash.includes('token=')) return null;
+  const t = parseToken(location.hash);
   history.replaceState(null, '', location.pathname + location.search);
+  return t;
 }
 
 export const loadToken = () => lsGet(KEYS.token);

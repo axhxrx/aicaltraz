@@ -13,6 +13,24 @@ export function shrinkRefusal(cols: number, rows: number, blockers: Button[]): s
   return `Can't shrink to ${cols} × ${rows}: ${names(blockers)} ${one ? 'is' : 'are'} in the way. Move or resize ${one ? 'it' : 'them'} first.`;
 }
 
+/** What the pad id is for, and what changing it breaks (the host knows the pad by its saved id). */
+function PadIdHint({ ed, pad }: { ed: Editor; pad: Pad }) {
+  if (ed.isFresh(pad)) return <>Follows the name until you type one.</>;
+  const was = ed.baseOf(pad)?.id;
+  if (was !== undefined && was !== pad.id)
+    return (
+      <span class="ed-warn-note" data-testid="pad-id-warning">
+        Saved as <code>{was}</code>: changing it breaks <code>?pad={was}</code> links and <code>/api/press/{was}/…</code> URLs, starts its buttons' run histories over, and
+        stops their runs in progress when you save.
+      </span>
+    );
+  return (
+    <>
+      Open this pad directly with <code>?pad={pad.id}</code>. Also in <code>/api/press/{pad.id}/…</code> URLs and run histories: changing it breaks those.
+    </>
+  );
+}
+
 export function PadPanel(
   p: PanelChrome & {
     ed: Editor;
@@ -88,7 +106,7 @@ export function PadPanel(
             for={`${uid}-id`}
             error={p.errors.get('id')}
             testid="pad-id"
-            hint={ed.isFresh(pad) ? 'Follows the name until you type one.' : <>Open this pad directly with <code>?pad={pad.id}</code></>}
+            hint={<PadIdHint ed={ed} pad={pad} />}
           >
             <TextInput id={`${uid}-id`} value={pad.id} mono onValue={(v) => ed.patchPad({ id: v }, 'id')} testid="pad-id" invalid={!!p.errors.get('id')} />
           </Field>

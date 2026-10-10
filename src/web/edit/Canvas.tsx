@@ -80,6 +80,8 @@ export interface CanvasProps {
   sel: number | null;
   /** Indices of buttons with validation problems. */
   bad: ReadonlySet<number>;
+  /** Indices of buttons running on the host right now (a save may stop them). */
+  running: ReadonlySet<number>;
   /** Refused keyboard move/resize, blocked pad shrink: flash these buttons. */
   flash: { ixs: number[]; at: number } | null;
   /** A tap (no drag) on a button, or a button was just added (`added`). */
@@ -90,7 +92,7 @@ export interface CanvasProps {
   emptyHint: string;
 }
 
-export function Canvas({ ed, pad, sel, bad, flash, onOpen, onDeselect, onRefuse, emptyHint }: CanvasProps) {
+export function Canvas({ ed, pad, sel, bad, running, flash, onOpen, onDeselect, onRefuse, emptyHint }: CanvasProps) {
   const root = useRef<HTMLDivElement>(null);
   const g = useRef<Gesture | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -219,10 +221,11 @@ export function Canvas({ ed, pad, sel, bad, flash, onOpen, onDeselect, onRefuse,
         data-h={r.h}
         data-drag={d && !d.settling ? d.kind : undefined}
         data-refused={refused}
+        data-running={running.has(i) ? '' : undefined}
         tabIndex={0}
         role="button"
         aria-pressed={sel === i}
-        aria-label={`${b.label || b.id}: ${b.w}×${b.h} at column ${b.x + 1}, row ${b.y + 1}`}
+        aria-label={`${b.label || b.id}: ${b.w}×${b.h} at column ${b.x + 1}, row ${b.y + 1}${running.has(i) ? ', running on the host' : ''}`}
         onFocus={() => sel !== i && !g.current && ed.select(i)}
         onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), onOpen(i))}
       >
@@ -231,6 +234,12 @@ export function Canvas({ ed, pad, sel, bad, flash, onOpen, onDeselect, onRefuse,
         {bad.has(i) && (
           <div class="ed-bad" aria-label="has problems">
             !
+          </div>
+        )}
+        {running.has(i) && (
+          <div class="ed-running" data-testid="running-badge" aria-hidden="true">
+            <i />
+            Running
           </div>
         )}
         {d && !d.settling && !d.fit.ok && <div class="ed-refuse">{cap(refusal(d.fit, pad))}</div>}

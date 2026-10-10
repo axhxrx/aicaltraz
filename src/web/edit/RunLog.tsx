@@ -97,7 +97,12 @@ function Out({ name, text, bad }: { name: string; text: string; bad?: boolean })
   );
 }
 
-export function RunLog(p: { backend: Backend; padId: string; buttonId: string; onHost: boolean; changed: boolean }) {
+/**
+ * `onHost`: the host has a button with this pad/button id. `changed`: the draft's differs from it
+ * (or it's new): then "Run now" would run something else than what's on screen (the host's
+ * version, maybe a deleted button whose id this one reuses), so it's "Save & run" instead.
+ */
+export function RunLog(p: { backend: Backend; padId: string; buttonId: string; onHost: boolean; changed: boolean; saving: boolean; onSaveAndRun(run: () => void): void }) {
   const key = buttonKey(p.padId, p.buttonId);
   const st = useStore(p.backend.snapshot, (s) => s.states[key]);
   const skew = useStore(p.backend.snapshot, (s) => s.clockSkew);
@@ -145,21 +150,28 @@ export function RunLog(p: { backend: Backend; padId: string; buttonId: string; o
 
   const shown = open ?? runs?.[0]?.runId ?? null;
   const running = st?.phase === 'running';
+  const saved = p.onHost && !p.changed;
   return (
     <div class="ed-runs" data-testid="run-log">
       <div class="ed-runs-bar">
-        <button type="button" class="ed-btn is-primary" data-testid="run-test" disabled={!p.onHost || pressing} onClick={run}>
-          <Play /> {running ? 'Press now' : 'Run now'}
-        </button>
+        {saved ? (
+          <button type="button" class="ed-btn is-primary" data-testid="run-test" disabled={pressing} onClick={run}>
+            <Play /> {running ? 'Press now' : 'Run now'}
+          </button>
+        ) : (
+          <button type="button" class="ed-btn is-primary" data-testid="run-save" disabled={pressing || p.saving} onClick={() => p.onSaveAndRun(() => void run())}>
+            <Play /> {p.saving ? 'Saving…' : 'Save & run'}
+          </button>
+        )}
         <button type="button" class="ed-btn" data-testid="run-refresh" disabled={!p.onHost} onClick={() => void load()}>
           <Refresh /> Refresh
         </button>
       </div>
       <p class="ed-hint">
         {!p.onHost
-          ? `The host has no button “${p.padId}/${p.buttonId}” yet: save first (a new or renamed button starts a fresh history).`
+          ? `The host has no button “${p.padId}/${p.buttonId}” yet: Save & run saves your draft, then runs it (a new or renamed button starts a fresh history).`
           : p.changed
-            ? 'Run now uses the saved version on the host, not your unsaved changes.'
+            ? 'Unsaved changes: Save & run saves your draft (all of it), then runs the saved version. Run now would run the old one.'
             : 'Run now runs the action on the host right away (no hold or confirm).'}
       </p>
       {note && <div class="ed-callout">{note}</div>}

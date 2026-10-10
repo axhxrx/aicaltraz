@@ -54,6 +54,11 @@ export function ButtonPanel(
     /** The same pad/button as currently on the host. */
     hostButton: Button | undefined;
     changed: boolean;
+    /** Running on the host now. */
+    running: boolean;
+    saving: boolean;
+    /** Save the draft, then `run` (Recent runs: "Save & run"). */
+    onSaveAndRun(run: () => void): void;
     onClose(): void;
     onDuplicate(): void;
     onDelete(): void;
@@ -103,6 +108,11 @@ export function ButtonPanel(
         {tabBtn('runs', 'Recent runs', false)}
       </div>
       <div class="ed-panel-body" data-scroll key={p.tab}>
+        {p.running && p.tab !== 'runs' && (
+          <div class="ed-callout is-running" data-testid="running-note">
+            Running on the host now. Changing it doesn't touch this run; deleting it or changing its id (or the pad's) and saving stops it.
+          </div>
+        )}
         {err('') && (
           <div class="ed-callout is-bad" role="alert" data-testid="error-button">
             {err('')}
@@ -174,31 +184,45 @@ export function ButtonPanel(
               </div>
             </Section>
             <Section title="Id">
-              <Field
-                label="Button id"
-                for={id('id')}
-                error={err('id')}
-                testid="id"
-                hint={ed.isFresh(b) ? 'Follows the label until you type one.' : <>Used by the HTTP API: <code>POST /api/press/{p.pad.id}/{b.id}</code></>}
-              >
+              <Field label="Button id" for={id('id')} error={err('id')} testid="id" hint={<IdHint ed={ed} pad={p.pad} b={b} running={p.running} />}>
                 <TextInput id={id('id')} value={b.id} mono onValue={(v) => ed.patchButton({ id: v }, 'id')} testid="field-id" invalid={!!err('id')} />
               </Field>
             </Section>
           </>
         )}
         {p.tab === 'action' && <ActionFields ed={ed} a={b.action} errors={errors} id={id} />}
-        {p.tab === 'runs' && <RunLog backend={p.backend} padId={p.pad.id} buttonId={b.id} onHost={!!p.hostButton} changed={p.changed} />}
+        {p.tab === 'runs' && <RunLog backend={p.backend} padId={p.pad.id} buttonId={b.id} onHost={!!p.hostButton} changed={p.changed} saving={p.saving} onSaveAndRun={p.onSaveAndRun} />}
       </div>
     </>
   );
 }
 
 
+/** What the id is for, and what changing it breaks (the host still knows the button by its saved id). */
+function IdHint({ ed, pad, b, running }: { ed: Editor; pad: Pad; b: Button; running: boolean }) {
+  if (ed.isFresh(b)) return <>Follows the label until you type one.</>;
+  const bp = ed.baseOf(pad);
+  const bb = bp && ed.baseOf(b, pad);
+  if (bp && bb && (bb.id !== b.id || bp.id !== pad.id))
+    return (
+      <span class="ed-warn-note" data-testid="id-warning">
+        Saved as <code>{bp.id}/{bb.id}</code>: changing it breaks <code>POST /api/press/{bp.id}/{bb.id}</code> links, starts its run history over
+        {running ? ', and stops its current run' : ''}.
+      </span>
+    );
+  return (
+    <>
+      Used by the HTTP API (<code>POST /api/press/{pad.id}/{b.id}</code>) and its run history: changing it breaks links to it.
+    </>
+  );
+}
+
 function ActionFields({ ed, a, errors, id }: { ed: Editor; a: Action; errors: Map<string, string>; id(k: string): string }) {
   const err = (k: string) => errors.get(k);
   const patch = (x: Partial<Action>, field?: string) => ed.patchButton({ action: { ...a, ...x } as Action }, field && `action.${field}`);
   const argErr = [...errors].find(([k]) => k.startsWith('action.args'))?.[1];
-  const envErr = [...errors].find(([k]) => k.startsWith('action.env'))?.[1];
+  // Errors of one variable show on its row.
+  const envErr = errors.get('action.env');
   return (
     <>
       <Section title="Action">
@@ -222,13 +246,13 @@ function ActionFields({ ed, a, errors, id }: { ed: Editor; a: Action; errors: Ma
             <Field label="Script" for={id('script')} error={err('action.script')} testid="script">
               <TextArea id={id('script')} value={a.script} rows={6} placeholder="echo 'hello'" onValue={(v) => patch({ script: v }, 'script')} invalid={!!err('action.script')} testid="field-script" />
             </Field>
-            <Field label="Shell" for={id('shell')} error={err('action.shell')} hint="Leave empty for the host's default shell.">
-              <TextInput id={id('shell')} value={a.shell ?? ''} mono placeholder="/bin/sh" onValue={(v) => patch({ shell: v || undefined }, 'shell')} testid="field-shell" />
+            <Field label="Shell" for={id('shell')} error={err('action.shell')} hint="Leave empty for the host's default: $SHELL, or /bin/sh without one (cmd.exe on Windows).">
+              <TextInput id={id('shell')} value={a.shell ?? ''} mono placeholder="$SHELL (or /bin/sh)" onValue={(v) => patch({ shell: v || undefined }, 'shell')} testid="field-shell" />
             </Field>
           </>
         ) : (
           <>
-            <Field label="Program" for={id('cmd')} error={err('action.command')} hint="A path, or a name on the host's PATH." testid="command">
+            <Field label="Program" for={id('cmd')} error={err('action.command')} hint="A path, or a name on the host's PATH. A relative path (./x.sh) starts in the working folder below." testid="command">
               <TextInput id={id('cmd')} value={a.command} mono placeholder="/usr/bin/say" onValue={(v) => patch({ command: v }, 'command')} invalid={!!err('action.command')} testid="field-command" />
             </Field>
             <Field label="Arguments" error={argErr} hint="One per line, passed as-is: no quotes needed.">
@@ -236,11 +260,16 @@ function ActionFields({ ed, a, errors, id }: { ed: Editor; a: Action; errors: Ma
             </Field>
           </>
         )}
-        <Field label="Working folder" for={id('cwd')} error={err('action.cwd')} hint="Default: the config file's folder. Relative paths start there too.">
+        <Field
+          label="Working folder"
+          for={id('cwd')}
+          error={err('action.cwd')}
+          hint={`Where it runs. Default: the config file's folder; a relative folder starts there.${a.type === 'exec' ? ' A relative program path starts here.' : ''}`}
+        >
           <TextInput id={id('cwd')} value={a.cwd ?? ''} mono placeholder="(config folder)" onValue={(v) => patch({ cwd: v || undefined }, 'cwd')} testid="field-cwd" />
         </Field>
-        <Field label="Environment" error={envErr} hint="Added to the host's environment.">
-          <EnvEditor env={a.env} onChange={(env, f) => patch({ env }, f)} />
+        <Field label="Environment" error={envErr} hint="Added to the host's environment. Names: letters, digits and _.">
+          <EnvEditor env={a.env} errors={errors} onChange={(env, f) => patch({ env }, f)} />
         </Field>
       </Section>
       <OutputTips shell={a.type === 'shell'} />
