@@ -2,19 +2,29 @@
  * Edit mode (admin only): a local draft of the whole config with undo/redo, edited on a WYSIWYG
  * canvas plus an editor panel (side panel when wide, bottom sheet on phones). Save = PUT with
  * baseRev; host validation errors, 409 conflicts and network errors keep the draft.
+ *
+ * Keeping in step with the host: a host config change under a draft with nothing unsaved is just
+ * taken; under unsaved changes it is merged in (merge.ts: what changed on one side only merges by
+ * itself, an undoable step; the rest the user resolves per item). This session's own saves coming
+ * back over the socket (even late, even several) are not news. A save whose answer got lost is
+ * recognized when the host's config turns out to be exactly what was sent. The draft is kept on the
+ * device (draft-store.ts) until saved or discarded.
  */
 import './edit.css';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { findButton, parseConfig, type Config } from '../../core/config.ts';
+import { buttonKey, findButton, parseConfig, type Config } from '../../core/config.ts';
 import type { WireConfig } from '../../core/protocol.ts';
-import type { Backend, Snapshot } from '../backend/types.ts';
-import { useStore, type Store } from '../lib/store.ts';
+import type { Backend } from '../backend/types.ts';
+import { useStore } from '../lib/store.ts';
 import { Close, Warn } from '../ui/icons.tsx';
 import { ButtonPanel, type Tab } from './ButtonPanel.tsx';
 import { Canvas } from './Canvas.tsx';
+import { BrokenFileDialog, ConflictDialog, MergeDialog, RestoreDialog, StopDialog } from './dialogs.tsx';
+import { clearDraft, DraftKeeper, draftScope, loadDraft, unsavedEdits, type StoredDraft } from './draft-store.ts';
 import { Editor, stable } from './editor.ts';
 import { Dialog, typingIn } from './fields.tsx';
 import { Plus, Redo, Sliders, Undo } from './icons.tsx';
+import { merge3, type Conflict, type MergeResult, type Side } from './merge.ts';
 import { PadPanel } from './PadPanel.tsx';
 import { nameOf, rectOf, refusal } from './ops.ts';
 import { buttonFieldErrors, describe, padFieldErrors, toProblems, type Problem } from './problems.ts';
@@ -44,13 +54,13 @@ function useMedia(q: string): boolean {
 /** Admins get the full config; a redacted one (cached layout) has no actions to edit. */
 const hasActions = (c: WireConfig): c is Config => c.pads.every((p) => p.buttons.every((b) => b.action !== undefined));
 
-function waitFor<T>(store: Store<T>, ok: (v: T) => boolean, ms: number): Promise<T | null> {
-  if (ok(store.get())) return Promise.resolve(store.get());
-  return new Promise((resolve) => {
-    const t = setTimeout(() => (off(), resolve(null)), ms);
-    const off = store.subscribe((v) => ok(v) && (clearTimeout(t), off(), resolve(v)));
-  });
-}
+/** Compares configs as the host keeps them ($schema is the host's business). */
+const keyOf = ({ $schema: _s, ...c }: WireConfig) => stable(c);
+
+/** Revs remembered as old news (own saves, merged, seen). */
+const KNOWN_MAX = 64;
+/** A config fetched over HTTP is ahead of a lagging socket: what the socket says until it catches up is older. */
+const AHEAD_MS = 15_000;
 
 export function EditMode(p: EditModeProps) {
   const role = useStore(p.backend.snapshot, (s) => s.role);
@@ -71,7 +81,27 @@ export function EditMode(p: EditModeProps) {
 
 type Toast = { msg: string; tone?: 'bad'; action?: { label: string; run(): void }; at: number };
 type Modal = 'leave' | 'discard' | 'delete-pad' | null;
+interface SaveOpts {
+  /** Replace whatever is on the host (the user said so). */
+  force?: boolean;
+  /** The user agreed to stop the runs this save ends. */
+  stopOk?: boolean;
+  /** After it saved (save and close, save and run). */
+  then?(): void;
+  retried?: boolean;
+}
+type Ask = { kind: 'stop'; runs: { name: string; ms: number }[]; go(): void } | { kind: 'broken'; errors: string[]; go(): void };
+interface Merging {
+  theirs: Config;
+  rev: string;
+  conflicts: Conflict[];
+  taken: number;
+  choices: Record<string, Side>;
+}
+
 const ARROWS: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+/** Canvas keys (arrows, Delete) act only with the focus on the canvas or nowhere: not on a notice's link, a toast's Undo… */
+const onCanvas = (t: EventTarget | null) => t === document.body || t === document.documentElement || (t instanceof Element && !!t.closest('.ed-canvas'));
 
 function Session({ backend, padId, onExit }: EditModeProps) {
   const ed = useMemo(() => {
@@ -84,6 +114,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const hostRev = useStore(backend.snapshot, (s) => s.rev);
   const hostConfig = useStore(backend.snapshot, (s) => s.config) as Config;
   const fileErrors = useStore(backend.snapshot, (s) => s.configErrors);
+  const states = useStore(backend.snapshot, (s) => s.states);
   const wide = useMedia(WIDE);
 
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -96,12 +127,46 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const [showProblems, setShowProblems] = useState(false);
   const [hostErrors, setHostErrors] = useState<{ list: Problem[]; draft: Config } | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [conflict, setConflict] = useState<{ rev: string } | null>(null);
-  const [hostChanged, setHostChanged] = useState(false);
+  const [conflict, setConflict] = useState<{ rev: string; again?: boolean; opts: SaveOpts } | null>(null);
+  const [merging, setMerging] = useState<Merging | null>(null);
+  const [ask, setAsk] = useState<Ask | null>(null);
   const [modal, setModal] = useState<Modal>(null);
+  /** The host's config as last known (socket or HTTP, own saves included). */
+  const [hostNow, setHostNowState] = useState(() => ({ rev: backend.snapshot.get().rev ?? '', config: backend.snapshot.get().config as Config }));
+  const hostNowRef = useRef(hostNow);
+  const setHostNow = (v: { rev: string; config: Config }) => ((hostNowRef.current = v), setHostNowState(v));
+  /** "Keep mine" for this host rev: no notice about it. */
+  const [dismissed, setDismissed] = useState<string | null>(null);
   const inFlight = useRef(false);
-  /** Last host rev accounted for: only *changes* of the host config matter. */
+  /** Last snapshot rev looked at: only *changes* of the host config matter. */
   const seen = useRef(backend.snapshot.get().rev);
+  /** Revs that are old news: this session's saves (their echoes), configs merged or adopted. */
+  const known = useRef(new Set<string>(backend.snapshot.get().rev ? [backend.snapshot.get().rev!] : []));
+  /** Saves with no answer (timeout, dropped link): they may still turn up on the host. */
+  const unsure = useRef<{ config: Config; key: string }[]>([]);
+  /** A rev fetched over HTTP the socket hasn't delivered yet (see AHEAD_MS). */
+  const ahead = useRef<{ rev: string; timer: ReturnType<typeof setTimeout> } | null>(null);
+  const noteRev = (rev: string) => {
+    const k = known.current;
+    k.delete(rev);
+    k.add(rev);
+    while (k.size > KNOWN_MAX) k.delete(k.values().next().value!);
+  };
+
+  // ---- the draft kept on this device ------------------------------------------------------
+
+  const scope = draftScope(backend.kind);
+  const [stored, setStored] = useState<StoredDraft | null>(() => {
+    const d = loadDraft(scope);
+    return d && stable(d.draft) !== stable(d.base) ? d : null;
+  });
+  const keeper = useMemo(() => new DraftKeeper(scope), []);
+  /** Until the restore question is answered, the stored draft is left alone. */
+  const keeping = useRef(!stored);
+  useEffect(() => {
+    const off = ed.store.subscribe(() => keeping.current && keeper.update(ed));
+    return () => (off(), keeper.dispose(), clearTimeout(ahead.current?.timer));
+  }, []);
 
   const draft = st.draft;
   const pi = st.view.pad;
@@ -118,13 +183,16 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const padsBad = new Set(problems.map((x) => x.pad));
   const full = pad.buttons.reduce((n, b) => n + b.w * b.h, 0) >= pad.cols * pad.rows;
 
+  useEffect(() => unsavedEdits.set(dirty), [dirty]);
+  useEffect(() => () => unsavedEdits.set(false), []);
+
   // ---- feedback ---------------------------------------------------------------------------
 
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const say = (msg: string, extra: Partial<Toast> = {}) => {
     clearTimeout(toastTimer.current);
     setToast({ msg, at: Date.now(), ...extra });
-    toastTimer.current = setTimeout(() => setToast(null), extra.action ? 5000 : 3200);
+    toastTimer.current = setTimeout(() => setToast(null), extra.action ? 6000 : 3200);
   };
   const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const blink = (ixs: number[]) => {
@@ -133,27 +201,114 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     flashTimer.current = setTimeout(() => setFlash(null), 900);
   };
   useEffect(() => () => (clearTimeout(toastTimer.current), clearTimeout(flashTimer.current)), []);
+  /** Toast with an Undo for the step just made. */
+  const undoable = (msg: string) => {
+    const depth = ed.state.past.length;
+    say(msg, { action: { label: 'Undo', run: () => ed.state.past.length === depth && ed.undo() } });
+  };
 
-  // ---- host config changes ----------------------------------------------------------------
+  // ---- the host's config ------------------------------------------------------------------
 
-  const adopt = (s: Snapshot) => {
-    ed.reset(s.config as Config, s.rev!);
-    seen.current = s.rev;
-    setHostChanged(false);
-    setHostErrors(null);
+  /** Our save is on the host as `rev` (its answer, or found there). */
+  const landed = (sent: Config, rev: string) => {
+    noteRev(rev);
+    unsure.current = [];
+    setHostNow({ rev, config: sent });
+    ed.saved(sent, rev);
+    setSaveError(null);
     setConflict(null);
+    setShowProblems(false);
   };
+
+  /** Fresh news from HTTP (the socket may be behind it). */
+  const learn = (config: Config, rev: string) => {
+    noteRev(rev);
+    setHostNow({ rev, config });
+    clearTimeout(ahead.current?.timer);
+    ahead.current = null;
+    if (backend.snapshot.get().rev !== rev)
+      ahead.current = {
+        rev,
+        timer: setTimeout(() => {
+          ahead.current = null;
+          syncHost();
+        }, AHEAD_MS),
+      };
+  };
+
+  const applyMerge = (res: MergeResult, theirs: Config, rev: string) => {
+    noteRev(rev);
+    ed.applyMerge(res, theirs, rev);
+    setMerging(null);
+    setDismissed(null);
+    const n = res.taken;
+    undoable(n ? `Merged ${n} change${n === 1 ? '' : 's'} from the host` : "Your draft is now based on the host's latest config");
+  };
+
+  /** The host's config is `theirs` now, and it's news: follow it, or merge it into unsaved changes. */
+  const hostChanged = (theirs: Config, rev: string) => {
+    setHostErrors(null);
+    if (!ed.dirty) {
+      ed.reset(theirs, rev);
+      return;
+    }
+    const res = merge3(ed.state.base, ed.state.draft, theirs, { origins: ed.origins() });
+    // Conflicts wait for the user (the notice); the rest merges by itself.
+    if (!res.conflicts.length) applyMerge(res, theirs, rev);
+  };
+
+  /** A config we sent (its answer lost) that turned up on the host. */
+  const ours = (cfg: WireConfig) => {
+    const k = keyOf(cfg);
+    return unsure.current.find((u) => u.key === k);
+  };
+
+  const busy = () => inFlight.current || !!merging || !!conflict || !!ask || !!stored;
   const syncHost = () => {
-    if (inFlight.current) return;
+    if (busy()) return; // decided once that is over
     const s = backend.snapshot.get();
-    if (!s.rev || !s.config || s.rev === seen.current) return;
+    if (!s.rev || !s.config || !hasActions(s.config) || s.rev === seen.current) return;
+    if (ahead.current) {
+      if (s.rev !== ahead.current.rev) return; // the socket still catching up: older than what we have
+      clearTimeout(ahead.current.timer);
+      ahead.current = null;
+    }
     seen.current = s.rev;
-    // Our own save coming back.
-    if (s.rev === ed.state.baseRev) return;
-    if (!ed.dirty) adopt(s);
-    else setHostChanged(true);
+    if (known.current.has(s.rev)) return; // our own save coming back, or already merged
+    noteRev(s.rev);
+    const mine = ours(s.config);
+    if (mine) {
+      landed(mine.config, s.rev);
+      say('Saved: live on every device now');
+      return;
+    }
+    setHostNow({ rev: s.rev, config: s.config });
+    hostChanged(s.config, s.rev);
   };
-  useEffect(syncHost, [hostRev]);
+  useEffect(syncHost, [hostRev, !!merging, !!conflict, !!ask, !!stored, saving]);
+
+  /** Merge the host's config, fetched fresh (the last broadcast may lag): at once if nothing conflicts. */
+  const startMerge = async () => {
+    let got: { config: WireConfig; rev: string };
+    try {
+      got = await backend.getConfig();
+    } catch (e) {
+      say(`Couldn't get the host's config: ${e instanceof Error ? e.message : String(e)}`, { tone: 'bad' });
+      return;
+    }
+    if (!hasActions(got.config)) return;
+    learn(got.config, got.rev);
+    const mine = ours(got.config);
+    if (mine) return void (landed(mine.config, got.rev), say('Saved: live on every device now'));
+    if (got.rev === ed.state.baseRev) return say("Nothing to merge: your draft is based on the host's config");
+    const res = merge3(ed.state.base, ed.state.draft, got.config, { origins: ed.origins() });
+    if (!res.conflicts.length) return applyMerge(res, got.config, got.rev);
+    setMerging({ theirs: got.config, rev: got.rev, conflicts: res.conflicts, taken: res.taken, choices: {} });
+  };
+
+  /** While behind the host: what a merge would do (for the notice). */
+  const behind = hostNow.rev !== '' && hostNow.rev !== st.baseRev && hostNow.rev !== dismissed && !!hostNow.config && hasActions(hostNow.config);
+  const preview = useMemo(() => (behind ? merge3(st.base, draft, hostNow.config, { origins: ed.origins() }) : null), [behind, st.base, draft, hostNow]);
 
   // ---- save -------------------------------------------------------------------------------
 
@@ -178,7 +333,37 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
   };
 
-  const save = async (baseRev = ed.state.baseRev): Promise<boolean> => {
+  /** Running buttons this config would end: deleted, or their pad's or their own id changed. */
+  const wouldStop = (next: Config) => {
+    const s = backend.snapshot.get();
+    const out: { name: string; ms: number }[] = [];
+    for (const [key, rs] of Object.entries(s.states)) {
+      if (rs.phase !== 'running') continue;
+      const [p, b] = key.split('/') as [string, string];
+      if (findButton(next, p, b)) continue;
+      const hb = s.config && findButton(s.config as Config, p, b);
+      out.push({ name: hb ? nameOf(hb) : b, ms: Date.now() - (rs.startedAt + s.clockSkew) });
+    }
+    return out;
+  };
+
+  /** Did a save of ours land after all? Asks the host. 'sent': this one; 'older': an earlier one whose answer was lost. */
+  const check = async (sent: Config): Promise<'sent' | 'older' | null> => {
+    let got: { config: WireConfig; rev: string };
+    try {
+      got = await backend.getConfig();
+    } catch {
+      return null;
+    }
+    if (!hasActions(got.config)) return null;
+    if (keyOf(got.config) === keyOf(sent)) return landed(sent, got.rev), 'sent';
+    const older = ours(got.config);
+    if (older) return landed(older.config, got.rev), 'older';
+    learn(got.config, got.rev);
+    return null;
+  };
+
+  const save = async (o: SaveOpts = {}): Promise<boolean> => {
     if (inFlight.current) return false;
     const sent = ed.state.draft;
     const r = parseConfig(sent);
@@ -187,35 +372,93 @@ function Session({ backend, padId, onExit }: EditModeProps) {
       goTo(toProblems(r.errors)[0]);
       return false;
     }
+    // Deleting or renaming a running button ends its run: say so first.
+    const runs = o.stopOk ? [] : wouldStop(r.config);
+    if (runs.length) return setAsk({ kind: 'stop', runs, go: () => void save({ ...o, stopOk: true }) }), false;
+    // A broken file on the host may be someone's edit in progress: replace it only when told to.
+    const broken = backend.snapshot.get().configErrors;
+    if (broken && !o.force) return setAsk({ kind: 'broken', errors: broken, go: () => void save({ ...o, force: true }) }), false;
     inFlight.current = true;
     setSaving(true);
     setSaveError(null);
     setHostErrors(null);
-    const res = await backend.saveConfig(r.config, baseRev);
-    inFlight.current = false;
-    setSaving(false);
-    if (res.ok) {
-      ed.saved(sent, res.rev);
-      setHostChanged(false);
-      setConflict(null);
-      setShowProblems(false);
+    let ok = false;
+    let again = false;
+    try {
+      const res = await backend.saveConfig(r.config, ed.state.baseRev, { force: o.force });
+      if (res.ok) {
+        landed(sent, res.rev);
+        ok = true;
+      } else if (res.kind === 'invalid') {
+        const list = toProblems(res.errors);
+        setHostErrors({ list, draft: sent });
+        setShowProblems(true);
+        goTo(list[0]);
+      } else if (res.kind === 'conflict') {
+        if (res.invalid) setAsk({ kind: 'broken', errors: res.errors ?? [], go: () => void save({ ...o, force: true }) });
+        else {
+          // It may be our own earlier save, its answer lost on the way.
+          const c = await check(sent);
+          if (c === 'sent') ok = true;
+          else if (c === 'older' && !o.retried) again = true;
+          else setConflict({ rev: res.rev, opts: o });
+        }
+      } else {
+        if (res.unsure) unsure.current = [...unsure.current.slice(-4), { config: sent, key: keyOf(sent) }];
+        if (res.unsure && (await check(sent)) === 'sent') ok = true;
+        else setSaveError(res.message);
+      }
+    } finally {
+      inFlight.current = false;
+      setSaving(false);
+    }
+    if (again) return save({ ...o, retried: true });
+    if (ok) {
       say('Saved: live on every device now');
-    } else if (res.kind === 'conflict') setConflict({ rev: res.rev });
-    else if (res.kind === 'invalid') {
-      const list = toProblems(res.errors);
-      setHostErrors({ list, draft: sent });
-      setShowProblems(true);
-      goTo(list[0]);
-    } else setSaveError(res.message);
-    syncHost();
-    return res.ok;
+      o.then?.();
+    }
+    return ok;
   };
 
-  const loadTheirs = async (rev?: string) => {
-    const s = (rev ? await waitFor(backend.snapshot, (x) => x.rev === rev, 3000) : null) ?? backend.snapshot.get();
-    adopt(s);
+  /** "Overwrite with mine": unless it changed yet again meanwhile (then say so). */
+  const overwrite = async (c: { rev: string; opts: SaveOpts }) => {
+    setConflict(null);
+    try {
+      const now = await backend.getConfig();
+      if (now.rev !== c.rev && !known.current.has(now.rev)) return setConflict({ rev: now.rev, again: true, opts: c.opts });
+    } catch {
+      /* can't tell: the save says */
+    }
+    void save({ ...c.opts, force: true });
+  };
+
+  const discardDraft = async () => {
     setModal(null);
-    say("Loaded the host's config");
+    let to = { config: hostNowRef.current.config, rev: hostNowRef.current.rev };
+    try {
+      const got = await backend.getConfig();
+      if (hasActions(got.config)) (learn(got.config, got.rev), (to = { config: got.config, rev: got.rev }));
+    } catch {
+      /* offline: back to the last known host config */
+    }
+    ed.discard(to.config, to.rev);
+    setHostErrors(null);
+    setSaveError(null);
+    deselect();
+    undoable('Changes discarded');
+  };
+
+  const restoreDraft = () => {
+    const d = stored;
+    if (!d) return;
+    ed.restore(d);
+    keeping.current = true;
+    setStored(null);
+    say('Restored your unsaved changes');
+    const s = backend.snapshot.get();
+    // Merged with the host's config as it is now, like any change on the host.
+    if (s.rev && s.config && hasActions(s.config) && s.rev !== d.baseRev) hostChanged(s.config, s.rev);
+    keeper.update(ed);
   };
 
   // ---- view helpers -----------------------------------------------------------------------
@@ -239,13 +482,19 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setSheetOpen(true);
   };
   const exit = () => (dirty ? setModal('leave') : onExit(pad.id));
+  const saveAndClose = async () => {
+    setModal(null);
+    // A save still on its way first.
+    while (inFlight.current) await new Promise((r) => setTimeout(r, 100));
+    if (!ed.dirty) return onExit(ed.pad.id);
+    void save({ then: () => onExit(ed.pad.id) });
+  };
 
   const del = () => {
     const b = ed.removeButton();
     if (!b) return;
-    const depth = ed.state.past.length;
     setSheetOpen(false);
-    say(`Deleted ${nameOf(b)}`, { action: { label: 'Undo', run: () => ed.state.past.length === depth && ed.undo() } });
+    undoable(`Deleted ${nameOf(b)}`);
   };
   const dup = () => {
     const ni = ed.duplicate();
@@ -264,6 +513,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
   };
 
+  const dialogOpen = !!(modal || conflict || merging || ask || stored);
+
   // ---- keyboard ---------------------------------------------------------------------------
 
   const keys = useRef<(e: KeyboardEvent) => void>(() => {});
@@ -273,10 +524,10 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
     if (mod && k === 's') {
       e.preventDefault();
-      if ((dirty || fileErrors) && !modal && !conflict) void save();
+      if ((dirty || fileErrors) && !dialogOpen) void save();
       return;
     }
-    if (modal || conflict) return;
+    if (dialogOpen) return;
     if (typingIn(e.target)) {
       if (k === 'Escape') (e.target as HTMLElement).blur();
       return;
@@ -292,8 +543,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
       if (sel !== null || padOpen || sheetOpen) (e.preventDefault(), deselect());
       return;
     }
-    // Canvas keys: not while working a control in the panel.
-    if (sel === null || (e.target instanceof Element && e.target.closest('.ed-panel, .ed-head'))) return;
+    // Canvas keys: only with the focus on the canvas (or nowhere), not on a control elsewhere.
+    if (sel === null || !onCanvas(e.target)) return;
     const d = ARROWS[k];
     if (d) {
       e.preventDefault();
@@ -309,7 +560,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     return () => window.removeEventListener('keydown', h);
   }, []);
 
-  // Closing the tab with unsaved changes: the browser asks.
+  // Closing the tab with unsaved changes: the browser asks (the draft is kept on the device anyway).
   useEffect(() => {
     if (!dirty) return;
     const h = (e: BeforeUnloadEvent) => {
@@ -327,6 +578,17 @@ function Session({ backend, padId, onExit }: EditModeProps) {
 
   // ---- render -----------------------------------------------------------------------------
 
+  /** Buttons of this pad running on the host (by the host's ids: the draft may have changed them). */
+  const running = useMemo(() => {
+    const out = new Set<number>();
+    const bp = ed.baseOf(pad);
+    pad.buttons.forEach((b, i) => {
+      const bb = bp && ed.baseOf(b, pad);
+      if (states[buttonKey(bb ? bp.id : pad.id, bb ? bb.id : b.id)]?.phase === 'running') out.add(i);
+    });
+    return out;
+  }, [pad, states, st.base]);
+
   const panel: 'button' | 'pad' | null = button ? 'button' : padOpen || wide ? 'pad' : null;
   const showPanel = panel !== null && (wide || sheetOpen);
   const sheet = wide ? null : { full: sheetFull, onToggle: () => setSheetFull((f) => !f) };
@@ -339,6 +601,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     dirty: wide ? 'Unsaved changes' : 'Unsaved',
     clean: 'All saved',
   }[state];
+  const overlap = preview?.conflicts.length ?? 0;
 
   const notices = (
     <>
@@ -355,21 +618,22 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           <Warn />
           <span>
             <b>The config file on the host has errors</b> (it still runs the previous config): {fileErrors[0]}
-            {fileErrors.length > 1 ? ` (+${fileErrors.length - 1} more)` : ''}. Saving writes this config over the broken file.
+            {fileErrors.length > 1 ? ` (+${fileErrors.length - 1} more)` : ''}. Someone may be editing it right now: saving asks before it replaces the file.
           </span>
         </div>
       )}
-      {hostChanged && !conflict && (
+      {behind && !conflict && !merging && (
         <div class="ed-notice is-warn" role="status" data-testid="notice-host-changed">
           <Warn />
           <span>
-            <b>The config changed on the host</b> (a hand edit of the file, or another admin). Your draft is based on the old one.
+            <b>The config changed on the host</b> (a hand edit of the file, or another admin).{' '}
+            {overlap ? `${overlap} of its changes ${overlap === 1 ? 'is' : 'are'} also changed in your draft.` : 'Your draft is based on the old one.'}
           </span>
           <div class="ed-notice-actions">
-            <button type="button" class="ed-btn" data-testid="host-changed-load" onClick={() => void loadTheirs()}>
-              Load theirs
+            <button type="button" class="ed-btn" data-testid="host-changed-merge" onClick={() => void startMerge()}>
+              {overlap ? 'Review and merge…' : 'Merge their changes'}
             </button>
-            <button type="button" class="ed-btn is-quiet" data-testid="host-changed-dismiss" onClick={() => setHostChanged(false)}>
+            <button type="button" class="ed-btn is-quiet" data-testid="host-changed-dismiss" onClick={() => setDismissed(hostNow.rev)}>
               Keep mine
             </button>
           </div>
@@ -422,6 +686,12 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     </>
   );
 
+  const discardBtn = dirty && (
+    <button type="button" class="ed-btn is-quiet ed-discard" data-testid="edit-discard" onClick={() => setModal('discard')}>
+      Discard
+    </button>
+  );
+
   return (
     <div class="bp-edit" data-testid="edit-mode" data-layout={wide ? 'wide' : 'narrow'} data-dirty={dirty ? '' : undefined} data-sheet={!wide && showPanel ? (sheetFull ? 'full' : 'half') : undefined}>
       <header class="ed-head">
@@ -472,13 +742,11 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           <button type="button" class="ed-icon ed-padbtn" aria-label="Pad settings" title="Pad settings" data-testid="edit-pad-settings" aria-pressed={panel === 'pad' && showPanel} onClick={showPadSettings}>
             <Sliders />
           </button>
+          {/* Phones: right here, not tucked away in the status chip. */}
+          {!wide && discardBtn}
         </nav>
         <div class="ed-actions">
-          {wide && dirty && (
-            <button type="button" class="ed-btn is-quiet" data-testid="edit-discard" onClick={() => setModal('discard')}>
-              Discard
-            </button>
-          )}
+          {wide && discardBtn}
           <button type="button" class="ed-icon" aria-label="Undo" title="Undo (⌘Z)" data-testid="edit-undo" disabled={!st.past.length} onClick={() => ed.undo()}>
             <Undo />
           </button>
@@ -499,6 +767,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
             pad={pad}
             sel={sel}
             bad={bad}
+            running={running}
             flash={flash}
             emptyHint={`${wide ? 'Click' : 'Tap'} a square to add a button`}
             onOpen={open}
@@ -555,6 +824,9 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 onTab={setTab}
                 hostButton={hostButton}
                 changed={changed}
+                running={running.has(sel)}
+                saving={saving}
+                onSaveAndRun={(run) => void save({ then: run })}
                 sheet={sheet}
                 onClose={deselect}
                 onDuplicate={dup}
@@ -590,13 +862,13 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           onClose={() => setModal(null)}
           actions={
             <>
-              <button type="button" class="ed-btn is-primary" data-testid="leave-save" onClick={() => (setModal(null), void save().then((ok) => ok && onExit(pad.id)))}>
+              <button type="button" class="ed-btn is-primary" data-testid="leave-save" onClick={() => void saveAndClose()}>
                 Save and close
               </button>
-              <button type="button" class="ed-btn is-danger" data-testid="leave-discard" onClick={() => onExit(pad.id)}>
+              <button type="button" class="ed-btn is-danger" data-testid="leave-discard" onClick={() => (keeper.forget(), onExit(pad.id))}>
                 Discard changes
               </button>
-              <button type="button" class="ed-btn is-quiet" data-testid="leave-cancel" onClick={() => setModal(null)}>
+              <button type="button" class="ed-btn is-quiet" data-testid="leave-cancel" data-autofocus onClick={() => setModal(null)}>
                 Keep editing
               </button>
             </>
@@ -613,16 +885,16 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           onClose={() => setModal(null)}
           actions={
             <>
-              <button type="button" class="ed-btn is-danger" data-testid="discard-confirm" onClick={() => (adopt(backend.snapshot.get()), setModal(null), deselect(), say('Changes discarded'))}>
+              <button type="button" class="ed-btn is-danger" data-testid="discard-confirm" onClick={() => void discardDraft()}>
                 Discard changes
               </button>
-              <button type="button" class="ed-btn is-quiet" onClick={() => setModal(null)}>
+              <button type="button" class="ed-btn is-quiet" data-testid="discard-cancel" data-autofocus onClick={() => setModal(null)}>
                 Keep editing
               </button>
             </>
           }
         >
-          Everything goes back to the config on the host. This can't be undone.
+          Everything goes back to the config on the host. Undo brings your changes back, until you leave the editor.
         </Dialog>
       )}
       {modal === 'delete-pad' && (
@@ -640,14 +912,13 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 onClick={() => {
                   const name = pad.name.trim() || pad.id;
                   ed.removePad();
-                  const depth = ed.state.past.length;
                   setModal(null);
-                  say(`Deleted pad “${name}”`, { action: { label: 'Undo', run: () => ed.state.past.length === depth && ed.undo() } });
+                  undoable(`Deleted pad “${name}”`);
                 }}
               >
                 Delete pad
               </button>
-              <button type="button" class="ed-btn is-quiet" onClick={() => setModal(null)}>
+              <button type="button" class="ed-btn is-quiet" data-testid="delete-pad-cancel" data-autofocus onClick={() => setModal(null)}>
                 Cancel
               </button>
             </>
@@ -656,33 +927,29 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           {pad.buttons.length ? `Its ${pad.buttons.length} button${pad.buttons.length === 1 ? '' : 's'} go with it. ` : ''}You can undo this until you save.
         </Dialog>
       )}
-      {conflict && (
-        <Dialog
-          title="The config changed on the host"
-          testid="dialog-conflict"
-          tone="warn"
-          onClose={() => setConflict(null)}
-          actions={
-            <>
-              <button type="button" class="ed-btn is-primary" data-testid="conflict-theirs" onClick={() => void loadTheirs(conflict.rev)}>
-                Load theirs
-              </button>
-              <button type="button" class="ed-btn is-danger" data-testid="conflict-mine" onClick={() => void save(conflict.rev)}>
-                Overwrite with mine
-              </button>
-              <button type="button" class="ed-btn is-quiet" data-testid="conflict-cancel" onClick={() => setConflict(null)}>
-                Cancel
-              </button>
-            </>
-          }
-        >
-          <p>
-            Since you started editing, the config on the host was changed: someone edited the file by hand, or another admin saved. Saving now would replace their version.
-          </p>
-          <p>
-            <b>Load theirs</b> throws away your draft and loads the host's config. <b>Overwrite with mine</b> saves your draft over theirs.
-          </p>
-        </Dialog>
+      {conflict && <ConflictDialog again={!!conflict.again} onMerge={() => (setConflict(null), void startMerge())} onOverwrite={() => void overwrite(conflict)} onCancel={() => setConflict(null)} />}
+      {merging && (
+        <MergeDialog
+          conflicts={merging.conflicts}
+          taken={merging.taken}
+          choices={merging.choices}
+          onChoose={(key, side) => setMerging({ ...merging, choices: { ...merging.choices, [key]: side } })}
+          onApply={() => applyMerge(merge3(ed.state.base, ed.state.draft, merging.theirs, { origins: ed.origins(), choices: merging.choices }), merging.theirs, merging.rev)}
+          onCancel={() => setMerging(null)}
+        />
+      )}
+      {ask?.kind === 'stop' && <StopDialog runs={ask.runs} onSave={() => (setAsk(null), ask.go())} onCancel={() => setAsk(null)} />}
+      {ask?.kind === 'broken' && <BrokenFileDialog errors={ask.errors} onSave={() => (setAsk(null), ask.go())} onCancel={() => setAsk(null)} />}
+      {stored && (
+        <RestoreDialog
+          savedAt={stored.savedAt}
+          onRestore={restoreDraft}
+          onDiscard={() => {
+            clearDraft(scope);
+            keeping.current = true;
+            setStored(null);
+          }}
+        />
       )}
     </div>
   );

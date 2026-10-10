@@ -66,6 +66,7 @@ export const clearDraft = (scope: string) => lsSet(key(scope), null);
 export class DraftKeeper {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private pending: Editor | null = null;
+  private forgotten = false;
   private readonly offs: (() => void)[] = [];
 
   constructor(
@@ -84,6 +85,7 @@ export class DraftKeeper {
 
   /** The draft changed: keep it (soon), or forget the stored one when nothing is unsaved. */
   update(ed: Editor): void {
+    if (this.forgotten) return;
     if (!ed.dirty) {
       this.pending = null;
       clearTimeout(this.timer);
@@ -102,8 +104,17 @@ export class DraftKeeper {
     if (ed?.dirty) lsSet(key(this.scope), JSON.stringify({ v: 1, savedAt: Date.now(), ...ed.snapshot() } satisfies StoredDraft));
   }
 
+  /** The user threw the draft away (leaving without saving): don't keep it. */
+  forget(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.pending = null;
+    this.forgotten = true;
+    clearDraft(this.scope);
+  }
+
   dispose(): void {
-    this.flush();
+    if (!this.forgotten) this.flush();
     for (const off of this.offs) off();
   }
 }
