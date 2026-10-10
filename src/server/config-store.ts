@@ -83,11 +83,21 @@ export function readConfigFile(path: string): ReadResult {
   return r.ok ? { ok: true, config: r.config, rev } : { ok: false, rev, errors: r.errors };
 }
 
+/** Rev of the file's bytes as they are now, valid config or not; undefined if it can't be read. */
+function revOfFile(path: string): string | undefined {
+  try {
+    return revOf(readFileSync(path));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Write via a temp file in the same directory + rename. Keeps the existing file's mode; a new file gets
- * 0600, since a config holds commands and their env.
+ * 0600, since a config holds commands and their env. `stillOk` gets a last say right before the
+ * rename: false leaves the file alone (and returns false).
  */
-export function atomicWrite(path: string, text: string) {
+export function atomicWrite(path: string, text: string, stillOk?: () => boolean): boolean {
   let mode = 0o600;
   try {
     mode = statSync(path).mode & 0o777;
@@ -102,7 +112,12 @@ export function atomicWrite(path: string, text: string) {
     } finally {
       closeSync(fd);
     }
+    if (stillOk && !stillOk()) {
+      rmSync(tmp, { force: true });
+      return false;
+    }
     renameSync(tmp, path);
+    return true;
   } catch (e) {
     rmSync(tmp, { force: true });
     throw e;
@@ -127,7 +142,15 @@ export class ConfigLoadError extends Error {
   }
 }
 
-export type SaveResult = { ok: true; rev: string } | { ok: false; status: 400; errors: string[] } | { ok: false; status: 409; rev: string };
+/**
+ * 409: the file isn't the one `baseRev` names. `rev` is the rev of its bytes now; `invalid` (with
+ * the file's `errors`) when those bytes aren't a valid config (a hand edit with a typo, or caught
+ * mid-write): the host still runs the previous config.
+ */
+export type SaveResult =
+  | { ok: true; rev: string }
+  | { ok: false; status: 400; errors: string[] }
+  | { ok: false; status: 409; rev: string; invalid?: true; errors?: string[] };
 
 export interface ConfigListener {
   /** A new config is active (hand edit or UI save). Also fires when a broken file is fixed. */
@@ -139,6 +162,8 @@ export interface ConfigListener {
 export class ConfigStore {
   /** Errors of the file on disk while it is broken (the last good config keeps running). */
   fileErrors: string[] | null = null;
+  /** Rev of the file's bytes as last read, valid or not (`rev` is the last valid one); undefined: unreadable. */
+  diskRev: string | undefined;
   private brokenRev: string | undefined;
   private listeners = new Set<ConfigListener>();
   private watching = false;
@@ -155,7 +180,9 @@ export class ConfigStore {
     readonly dir: string,
     public config: Config,
     public rev: string,
-  ) {}
+  ) {
+    this.diskRev = rev;
+  }
 
   /**
    * Load `path`; if it doesn't exist and `starter` is given, write `starter(absPath)` there first.
@@ -187,6 +214,7 @@ export class ConfigStore {
   /** Re-read the file now. */
   sync(): 'unchanged' | 'changed' | 'error' {
     const r = readConfigFile(this.path);
+    this.diskRev = r.rev;
     if (!r.ok) {
       const key = r.rev ?? r.errors.join('\n');
       if (key !== this.brokenRev) {
@@ -202,11 +230,15 @@ export class ConfigStore {
     return 'changed';
   }
 
-  /** A UI save: validate, check `baseRev`, write compactly. */
-  save(input: unknown, baseRev: string): SaveResult {
+  /**
+   * A UI save: check `baseRev`, validate, write compactly. `baseRev` must name the file's bytes as
+   * they are now, valid or not: a hand edit with a typo, or one caught mid-write, is someone's work
+   * too. `force` skips that check (the user chose to replace whatever is there).
+   */
+  save(input: unknown, baseRev: string, { force = false }: { force?: boolean } = {}): SaveResult {
     // Pick up a hand edit the watcher hasn't delivered yet, so baseRev is checked against the file.
     this.sync();
-    if (baseRev !== this.rev) return { ok: false, status: 409, rev: this.rev };
+    if (!force && baseRev !== this.diskRev) return this.conflict();
     const r = parseConfig(input);
     if (!r.ok) return { ok: false, status: 400, errors: r.errors };
     let config = r.config;
@@ -216,9 +248,20 @@ export class ConfigStore {
     }
     const text = serializeConfig(config);
     const rev = revOf(text);
-    atomicWrite(writeTarget(this.path), text);
+    const checked = this.diskRev;
+    // A last look right before the rename: a write that landed since the check stays (409 instead).
+    if (!atomicWrite(writeTarget(this.path), text, () => force || revOfFile(this.path) === checked)) {
+      this.sync();
+      return this.conflict();
+    }
+    this.diskRev = rev;
     if (rev !== this.rev || this.fileErrors !== null) this.activate(config, rev);
     return { ok: true, rev };
+  }
+
+  private conflict(): SaveResult {
+    if (this.fileErrors) return { ok: false, status: 409, rev: this.diskRev ?? this.rev, invalid: true, errors: this.fileErrors };
+    return { ok: false, status: 409, rev: this.rev };
   }
 
   private activate(config: Config, rev: string) {

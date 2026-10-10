@@ -1,6 +1,15 @@
 /** Pure draft helpers: placement checks, ids, colors, new buttons/pads, action conversion. */
 import { Button, Pad, type Action, type Config } from '../../core/config.ts';
 
+/** JSON with sorted keys and undefined dropped: equal configs compare equal regardless of key order. */
+export function stable(v: unknown): string {
+  return JSON.stringify(v, (_k, x: unknown) =>
+    x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.entries(x as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) : x,
+  );
+}
+
+export const same = (a: unknown, b: unknown) => a === b || stable(a) === stable(b);
+
 export interface Rect {
   x: number;
   y: number;
@@ -84,46 +93,76 @@ export function nextColor(pad: Pad): string {
 /** Harmless, and shows off status + result text on the first press. */
 export const STARTER_SCRIPT = "echo '@status working'; sleep 1; echo 'Done'";
 
-export function newButton(pad: Pad, x: number, y: number): Button {
-  const ids = new Set(pad.buttons.map((b) => b.id));
+/**
+ * `reserved`: ids to stay clear of besides the pad's own, i.e. the host's buttons on this pad. A new
+ * button must never take the id of one deleted in the draft: until the save, that id still names
+ * the host's button (its action, its run history).
+ */
+export function newButton(pad: Pad, x: number, y: number, reserved: Iterable<string> = []): Button {
+  const ids = new Set([...pad.buttons.map((b) => b.id), ...reserved]);
   let n = pad.buttons.length + 1;
   while (ids.has(`button-${n}`)) n++;
   return Button.parse({ id: `button-${n}`, label: `Button ${n}`, color: nextColor(pad), x, y, action: { type: 'shell', script: STARTER_SCRIPT } });
 }
 
-export function newPad(cfg: Config): Pad {
-  const ids = new Set(cfg.pads.map((p) => p.id));
+export function newPad(cfg: Config, reserved: Iterable<string> = []): Pad {
+  const ids = new Set([...cfg.pads.map((p) => p.id), ...reserved]);
   let n = cfg.pads.length + 1;
   while (ids.has(`pad-${n}`)) n++;
   return Pad.parse({ id: `pad-${n}`, name: `Pad ${n}`, cols: 2, rows: 3 });
 }
 
-// ---- actions ----------------------------------------------------------------------------------
-
-const SAFE_WORD = /^[\w./:=@%+,~-]+$/;
-export const shQuote = (s: string) => (SAFE_WORD.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
-
-/** Words of a simple command line (quotes only), or null if it uses any other shell syntax. */
-function simpleWords(script: string): string[] | null {
-  if (/[\n;&|<>$`\\(){}*?[\]#]/.test(script)) return null;
-  const out: string[] = [];
-  for (const m of script.matchAll(/'([^']*)'|"([^"]*)"|(\S+)/g)) {
-    if (m[3]?.match(/['"]/)) return null;
-    out.push(m[1] ?? m[2] ?? m[3]!);
-  }
-  return out;
+/** A copy for "Duplicate": new id and spot, and no key binding (one key, one button). */
+export function copyOf(b: Button, spot: Rect, id: string): Button {
+  const { key: _key, ...rest } = structuredClone(b);
+  return { ...rest, ...spot, id, label: b.label ? `${b.label} copy` : '' };
 }
 
-/** Switch exec ⇄ shell keeping the behavior (simple commands split into argv, anything else via sh -c). */
+// ---- actions ----------------------------------------------------------------------------------
+
+/**
+ * Characters a shell word may have and still mean exactly itself in sh, bash, zsh and fish: no
+ * quotes, `~`, `$`, globs, backslashes or other syntax. (`=` is fine inside an argument, but not in
+ * a command word: `NAME=value` there is an environment assignment.)
+ */
+const PLAIN = /^[\w./:@%+,-]+$/;
+const PLAIN_ARG = /^[\w./:@%+,=-]+$/;
+/** Words that mean something else to a shell than a program of that name. */
+const SHELL_WORDS = new Set(
+  'cd export unset source . exec eval set alias unalias exit return shift trap ulimit umask wait read readonly local declare typeset times hash type command builtin jobs fg bg time if then else elif fi for while until do done case esac function select coproc'.split(' '),
+);
+
+/** Does `s` mean exactly itself to a shell, as the command word (`cmd`) or as an argument? */
+const plain = (s: string, cmd: boolean) => (cmd ? PLAIN.test(s) && !SHELL_WORDS.has(s) : PLAIN_ARG.test(s) && !s.startsWith('='));
+
+/** Quoted for a POSIX shell, unless it means exactly itself as it is. */
+export const shQuote = (s: string, cmd = false) => (plain(s, cmd) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
+/**
+ * The words of a script that is nothing but a program and its arguments, or null if it uses
+ * anything a shell would interpret (quotes, `~`, `NAME=value`, globs, `$`, pipes, `;`, builtins…).
+ */
+export function simpleWords(script: string): string[] | null {
+  const words = script.trim().split(/[ \t]+/);
+  return words.every((w, i) => plain(w, i === 0)) ? words : null;
+}
+
+/** Shells whose `-c SCRIPT` runs SCRIPT, by file name. */
+const SHELLS = /^(?:.*[/\\])?(?:sh|bash|zsh|dash|ksh|mksh|ash|fish)$/;
+
+/** Switch exec ⇄ shell keeping the behavior: simple commands split into argv, anything else via `sh -c` (and back). */
 export function convertAction(a: Action, type: Action['type']): Action {
   if (a.type === type) return a;
   const common = { ...(a.cwd !== undefined ? { cwd: a.cwd } : {}), ...(a.env !== undefined ? { env: a.env } : {}) };
   if (type === 'shell') {
     const ex = a as Extract<Action, { type: 'exec' }>;
-    return { type, script: [ex.command, ...ex.args].filter((w, i) => i > 0 || w).map(shQuote).join(' '), ...common };
+    // `sh -c SCRIPT` is that script, run by that shell.
+    if (SHELLS.test(ex.command) && ex.args.length === 2 && ex.args[0] === '-c' && ex.args[1]!.trim()) return { type, script: ex.args[1]!, shell: ex.command, ...common };
+    const words = ex.command ? [ex.command, ...ex.args] : ex.args;
+    return { type, script: words.map((w, i) => shQuote(w, i === 0)).join(' '), ...common };
   }
   const sh = a as Extract<Action, { type: 'shell' }>;
   const words = simpleWords(sh.script);
-  if (words) return { type, command: words[0] ?? '', args: words.slice(1), ...common };
+  if (words) return { type, command: words[0]!, args: words.slice(1), ...common };
   return { type, command: sh.shell ?? '/bin/sh', args: ['-c', sh.script], ...common };
 }

@@ -4,7 +4,13 @@
  */
 import { z } from 'zod';
 
-const env = z.record(z.string(), z.string());
+/** Environment variable names a shell can use: no spaces, `=`, or leading digit. */
+export const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+export const ENV_NAME_MESSAGE = 'letters, digits and _ only, not starting with a digit';
+
+const env = z.record(z.string().regex(ENV_NAME), z.string(), {
+  error: (iss) => (iss.code === 'invalid_key' ? ENV_NAME_MESSAGE : undefined),
+});
 
 export const ExecAction = z.strictObject({
   type: z.literal('exec'),

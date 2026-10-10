@@ -210,9 +210,14 @@ export class DemoBackend implements Backend {
 
   kick(): void {}
 
-  async saveConfig(config: Config, baseRev: string): Promise<SaveResult> {
+  async getConfig(): Promise<{ config: Config; rev: string }> {
+    if (!this.online || this.disposed) throw new Error('not connected to the host');
+    return { config: this.config, rev: rev(JSON.stringify(this.config)) };
+  }
+
+  async saveConfig(config: Config, baseRev: string, { force = false } = {}): Promise<SaveResult> {
     const current = rev(JSON.stringify(this.config));
-    if (baseRev !== current) return { ok: false, kind: 'conflict', rev: current };
+    if (baseRev !== current && !force) return { ok: false, kind: 'conflict', rev: current };
     const r = parseConfig(config);
     if (!r.ok) return { ok: false, kind: 'invalid', errors: r.errors };
     // Removing a running button kills it.

@@ -55,6 +55,24 @@ export type ClientMsg = {
   button: string;
 };
 
+/** PUT /api/config (admin). */
+export interface SaveConfigBody {
+  config: unknown;
+  /** The rev the edit is based on: the host refuses (409) unless it names the config file's bytes as they are now. */
+  baseRev: string;
+  /** Replace the file whatever is there now (the user chose to overwrite, e.g. a broken file). */
+  force?: boolean;
+}
+
+/** PUT /api/config → 409. */
+export interface ConfigConflict {
+  /** Rev of the config file's bytes now. */
+  rev: string;
+  /** Those bytes aren't a valid config (the host still runs the previous one); `errors` says why. */
+  invalid?: true;
+  errors?: string[];
+}
+
 /** One finished (or running) execution, as returned by GET /api/runs (admin). */
 export interface RunRecord {
   runId: number;

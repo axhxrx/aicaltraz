@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from 'bun:test';
-import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { Button, Config, findButton, parseConfig, type ConfigInput } from '../src/core/config.ts';
-import { ConfigLoadError, ConfigStore, redactConfig, revOf, serializeConfig } from '../src/server/config-store.ts';
+import { atomicWrite, ConfigLoadError, ConfigStore, redactConfig, revOf, serializeConfig } from '../src/server/config-store.ts';
 import { starterConfig, starterConfigText } from '../src/server/starter.ts';
 import { cleanupTmp, padConfig, tmpDir, waitFor, writeJson } from './helpers.ts';
 
@@ -109,6 +109,15 @@ describe('schema validation', () => {
     expect(errorsOf(padConfig([btn('a', 0, 0, { action: { type: 'exec', command: 'x', script: 'y' } })]))[0]).toStartWith('pads.0.buttons.0.action:');
     expect(errorsOf(padConfig([btn('a', 0, 0, { action: { type: 'exec', command: 'x', env: { A: 1 } } })]))[0]).toStartWith('pads.0.buttons.0.action.env.A:');
     expect(errorsOf({ ...padConfig([]), extra: true })[0]).toStartWith('(root):');
+  });
+
+  test('env variable names: letters, digits and _, not starting with a digit (no spaces, "=" or empty)', () => {
+    const withEnv = (env: Record<string, string>) => padConfig([btn('a', 0, 0, { action: { type: 'exec', command: 'x', env } })]);
+    for (const name of ['FOO ', ' FOO', 'A B', 'A=B', '', '1ABC', 'A-B', 'Ä'])
+      expect(errorsOf(withEnv({ [name]: 'v' }))).toEqual([`pads.0.buttons.0.action.env.${name}: letters, digits and _ only, not starting with a digit`]);
+    expect(parseConfig(withEnv({ FOO: '', _x: '1', LC_ALL: 'C', a1: 'b' })).ok).toBe(true);
+    // Shell actions too.
+    expect(errorsOf(padConfig([btn('a', 0, 0, { action: { type: 'shell', script: 'true', env: { 'BAD NAME': 'x' } } })]))[0]).toStartWith('pads.0.buttons.0.action.env.BAD NAME:');
   });
 
   test('reports every error at once', () => {
@@ -310,14 +319,78 @@ describe('ConfigStore', () => {
     expect(events).toEqual(['change:a,b', 'error:1', 'error:1', 'change:a,b']);
   });
 
-  test('save over a broken file (UI fixes it) is allowed with the last good rev', () => {
+  test('a broken hand edit since baseRev is a 409 too (invalid, with its errors): it is replaced only with force or its own rev', () => {
     const path = join(tmpDir(), 'c.json');
     writeJson(path, valid);
     const { store } = ConfigStore.open(path);
-    writeFileSync(path, '{ broken');
-    expect(store.save(padConfig([btn('fixed', 0, 0)]), store.rev).ok).toBe(true);
+    const goodRev = store.rev;
+    // A colleague's edit with a typo, or one caught mid-write: someone's work all the same.
+    const broken = '{ "version": 1, "pads": [ { "id": "p", "name": "Pad", "buttons": [ {"id": "theirs" ';
+    writeFileSync(path, broken);
+    const r = store.save(padConfig([btn('mine', 0, 0)]), goodRev);
+    expect(r).toEqual({ ok: false, status: 409, rev: revOf(broken), invalid: true, errors: [expect.stringMatching(/^\(root\): invalid JSON/)] });
+    expect(readFileSync(path, 'utf8')).toBe(broken);
+    expect(store.rev).toBe(goodRev); // still running the last good config
+    // Saving with the broken file's own rev means "I've seen it": that replaces it.
+    expect(store.save(padConfig([btn('fixed', 0, 0)]), revOf(broken)).ok).toBe(true);
     expect(store.fileErrors).toBeNull();
     expect(JSON.parse(readFileSync(path, 'utf8')).pads[0].buttons[0].id).toBe('fixed');
+    // So does force, whatever the base.
+    writeFileSync(path, '{ broken again');
+    expect(store.save(padConfig([btn('forced', 0, 0)]), 'whatever')).toMatchObject({ ok: false, status: 409, invalid: true });
+    const f = store.save(padConfig([btn('forced', 0, 0)]), 'whatever', { force: true });
+    expect(f).toEqual({ ok: true, rev: revOf(readFileSync(path)) });
+    expect(store.config.pads[0]!.buttons[0]!.id).toBe('forced');
+  });
+
+  test('force overwrites a newer valid hand edit; without it that is a 409 naming the new rev', () => {
+    const path = join(tmpDir(), 'c.json');
+    writeJson(path, valid);
+    const { store } = ConfigStore.open(path);
+    const base = store.rev;
+    writeJson(path, padConfig([btn('hand', 0, 0)]));
+    const r = store.save(padConfig([btn('ui', 0, 0)]), base);
+    expect(r).toEqual({ ok: false, status: 409, rev: revOf(readFileSync(path)) });
+    expect(store.save(padConfig([btn('ui', 0, 0)]), base, { force: true }).ok).toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8')).pads[0].buttons[0].id).toBe('ui');
+    // A deleted file counts as changed (invalid: nothing to read).
+    rmSync(path);
+    expect(store.save(valid, store.rev)).toMatchObject({ ok: false, status: 409, invalid: true, errors: [expect.stringContaining('cannot read')] });
+    expect(store.save(valid, store.rev, { force: true }).ok).toBe(true);
+    expect(existsSync(path)).toBe(true);
+  });
+
+  test('atomicWrite: a last check right before the rename can call it off, leaving no temp file', () => {
+    const dir = tmpDir();
+    const path = join(dir, 'c.json');
+    writeFileSync(path, 'old');
+    expect(atomicWrite(path, 'new', () => false)).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe('old');
+    expect(readdirSync(dir)).toEqual(['c.json']);
+    expect(atomicWrite(path, 'new', () => true)).toBe(true);
+    expect(readFileSync(path, 'utf8')).toBe('new');
+  });
+
+  test('a write that lands while a save is writing is kept: 409, not replaced', () => {
+    const path = join(tmpDir(), 'c.json');
+    writeJson(path, valid);
+    const { store } = ConfigStore.open(path);
+    const base = store.rev;
+    // The hand edit lands right after the save checked baseRev against the file, before its rename.
+    const realSync = store.sync.bind(store);
+    let first = true;
+    store.sync = () => {
+      const r = realSync();
+      if (first) {
+        first = false;
+        writeJson(path, padConfig([btn('hand', 0, 0)]));
+      }
+      return r;
+    };
+    const r = store.save(padConfig([btn('ui', 0, 0)]), base);
+    expect(r).toEqual({ ok: false, status: 409, rev: revOf(readFileSync(path)) });
+    expect(JSON.parse(readFileSync(path, 'utf8')).pads[0].buttons[0].id).toBe('hand');
+    expect(store.config.pads[0]!.buttons[0]!.id).toBe('hand');
   });
 
   test('watch: debounced reload on hand edits, including editor-style rename-over', async () => {

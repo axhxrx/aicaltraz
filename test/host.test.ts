@@ -390,6 +390,40 @@ describe('config over HTTP and hand edits', () => {
     expect(fresh.rev).toBe(newRev);
   });
 
+  test('PUT /api/config over a broken hand edit: 409 {rev, invalid, errors} (no silent overwrite); force replaces it', async () => {
+    const { api, admin, configPath, host, ws } = await setup();
+    const a = await ws(admin);
+    await a.next('hello');
+    const { config, rev } = await (await api('/api/config', { token: admin })).json();
+    const put = (body: unknown) => api('/api/config', { method: 'PUT', token: admin, body });
+    const broken = '{ "version": 1, "pads": [ ';
+    writeFileSync(configPath, broken);
+    // Before the watcher even noticed: the PUT itself looks at the file.
+    const r409 = await put({ config, baseRev: rev });
+    expect(r409.status).toBe(409);
+    expect(await r409.json()).toEqual({ rev: revOf(broken), invalid: true, errors: [expect.stringMatching(/invalid JSON/)] });
+    expect(readFileSync(configPath, 'utf8')).toBe(broken);
+    expect(host.config.rev).toBe(rev);
+    expect((await put({ config, baseRev: rev, force: 'yes' })).status).toBe(400);
+    const next = structuredClone(config);
+    next.pads[0].buttons[0].label = 'Replaced the broken file';
+    const ok = await put({ config: next, baseRev: rev, force: true });
+    expect(ok.status).toBe(200);
+    const { rev: newRev } = await ok.json();
+    expect(newRev).toBe(revOf(readFileSync(configPath)));
+    expect((await a.next('config', (m) => m.rev === newRev)).config.pads[0]!.buttons[0]!.label).toBe('Replaced the broken file');
+    // A valid hand edit: 409 with its rev, and force overwrites it.
+    const cfg = baseConfig();
+    cfg.pads[0]!.name = 'By hand';
+    writeJson(configPath, cfg);
+    const handRev = revOf(readFileSync(configPath));
+    const stale = await put({ config: next, baseRev: newRev });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toEqual({ rev: handRev });
+    expect((await put({ config: next, baseRev: newRev, force: true })).status).toBe(200);
+    expect(readJson<{ pads: { name: string }[] }>(configPath).pads[0]!.name).toBe('Main');
+  });
+
   test('hand edits are reloaded and broadcast', async () => {
     const { ws, press, admin, configPath } = await setup();
     const p = await ws(press);

@@ -34,8 +34,14 @@ export interface Snapshot {
 export type SaveResult =
   | { ok: true; rev: string }
   | { ok: false; kind: 'invalid'; errors: string[] }
-  | { ok: false; kind: 'conflict'; rev: string }
-  | { ok: false; kind: 'error'; message: string };
+  /** The config on the host isn't `baseRev` any more; `invalid`: its file is broken right now (`errors`). */
+  | { ok: false; kind: 'conflict'; rev: string; invalid?: boolean; errors?: string[] }
+  /** `unsure`: no answer (timeout, link dropped): the host may have saved it all the same. */
+  | { ok: false; kind: 'error'; message: string; unsure?: boolean };
+
+/** Max PUT /api/config body, as the host enforces it. */
+export const MAX_CONFIG_BYTES = 1024 * 1024;
+export const TOO_LARGE = 'config too large (max 1 MB)';
 
 /**
  * Why a press has no ack. `sent: false`: it never left this device (not connected), so it surely
@@ -63,8 +69,13 @@ export interface Backend {
   press(pad: string, button: string, onSent?: () => void): Promise<PressResult>;
   /** The link looks dead (e.g. a press went unacknowledged): check it now; reconnect if it is. */
   kick(): void;
-  /** Admin: replace the config (PUT /api/config semantics). */
-  saveConfig(config: Config, baseRev: string): Promise<SaveResult>;
+  /**
+   * Admin: replace the config (PUT /api/config semantics; `force` replaces whatever is there). Gives
+   * up after a while without an answer (`unsure`): it never hangs.
+   */
+  saveConfig(config: Config, baseRev: string, opts?: { force?: boolean }): Promise<SaveResult>;
+  /** The host's config as it is right now (asked for, not the last broadcast, which may lag). Rejects when unreachable. */
+  getConfig(): Promise<{ config: WireConfig; rev: string }>;
   /** Admin: recent runs, newest first. */
   runs(q?: { pad?: string; button?: string }): Promise<RunRecord[]>;
   dispose(): void;

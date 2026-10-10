@@ -6,7 +6,7 @@ import type { Server, ServerWebSocket } from 'bun';
 import { hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 import type { RunState } from '../core/machine.ts';
-import { PROTOCOL_VERSION, type ClientMsg, type HostInfo, type Role, type ServerMsg } from '../core/protocol.ts';
+import { PROTOCOL_VERSION, type ClientMsg, type ConfigConflict, type HostInfo, type Role, type ServerMsg } from '../core/protocol.ts';
 import webApp from '../web/index.html';
 import pkg from '../../package.json';
 import { ConfigStore } from './config-store.ts';
@@ -208,18 +208,19 @@ export async function startHost(opts: HostOptions): Promise<Host> {
           const body = await readJson(req);
           if (!body.ok) return json({ errors: [body.error] }, body.status);
           const b = body.value;
-          if (!isRecord(b) || typeof b.baseRev !== 'string' || !('config' in b))
-            return json({ errors: ['body must be {"config": {…}, "baseRev": "…"}'] }, 400);
+          if (!isRecord(b) || typeof b.baseRev !== 'string' || !('config' in b) || (b.force !== undefined && typeof b.force !== 'boolean'))
+            return json({ errors: ['body must be {"config": {…}, "baseRev": "…", "force"?: true}'] }, 400);
           let r;
           try {
-            r = config.save(b.config, b.baseRev);
+            r = config.save(b.config, b.baseRev, { force: b.force === true });
           } catch (e) {
             const error = `could not write ${config.path}: ${(e as Error).message}`;
             log(error);
             return json({ error, errors: [error] }, 500);
           }
           if (r.ok) return json({ rev: r.rev });
-          return r.status === 409 ? json({ rev: r.rev }, 409) : json({ errors: r.errors }, 400);
+          if (r.status === 400) return json({ errors: r.errors }, 400);
+          return json(r.invalid ? ({ rev: r.rev, invalid: true, errors: r.errors } satisfies ConfigConflict) : ({ rev: r.rev } satisfies ConfigConflict), 409);
         }),
       },
       '/api/state': { GET: withRole('any', () => json({ states: state.states(), serverNow: Date.now() })) },

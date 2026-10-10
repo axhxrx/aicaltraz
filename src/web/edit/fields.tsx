@@ -1,6 +1,7 @@
 /** Form controls for the editor panels: dark, 16px text (no iOS zoom), 44px+ touch targets. */
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { ENV_NAME, ENV_NAME_MESSAGE } from '../../core/config.ts';
 import { inkFor, isValidColor, toRGB } from '../lib/color.ts';
 import { keyName } from '../run/view.ts';
 import { Close } from '../ui/icons.tsx';
@@ -200,7 +201,10 @@ export function Stepper(p: { value: number; min: number; max: number; onChange(v
 const MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'Fn', 'FnLock', 'Hyper', 'Super', 'OS', 'Tab', 'Unidentified', 'Dead', 'Process']);
 const KEY_WORDS: Record<string, string> = { ' ': 'Space', Enter: 'Enter', ArrowUp: 'Arrow up', ArrowDown: 'Arrow down', ArrowLeft: 'Arrow left', ArrowRight: 'Arrow right' };
 
-/** "Press a key to bind": captures the next keydown (Esc cancels), before any other handler sees it. */
+/**
+ * "Press a key to bind": captures the next keydown (Esc cancels), before any other handler sees it.
+ * Shortcuts (⌘/Ctrl/Alt + key, e.g. ⌘S to save) pass through: a remote doesn't send those.
+ */
 export function KeyCapture(p: { value: string | undefined; onChange(k: string | undefined): void; conflict?: string; testid: string }) {
   const [listening, setListening] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
@@ -212,6 +216,7 @@ export function KeyCapture(p: { value: string | undefined; onChange(k: string | 
   const start = () => {
     const key = (e: KeyboardEvent) => {
       if (MODIFIERS.has(e.key)) return;
+      if ((e.metaKey || e.ctrlKey || e.altKey) && !e.getModifierState?.('AltGraph')) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       if (e.key !== 'Escape') onChange.current(e.key.length === 1 ? e.key.toLowerCase() : e.key);
@@ -312,9 +317,13 @@ export function ColorPicker(p: { value: string; onChange(c: string): void; testi
   );
 }
 
-/** Ordered string list (exec args): edit, add, remove, move up/down. */
+/**
+ * Ordered string list (exec args): edit, add, remove, move up/down. An empty item gets a warning
+ * (it is passed as an empty argument, which few programs expect) but is allowed.
+ */
 export function ListEditor(p: { items: string[]; onChange(items: string[], field?: string): void; errors: Map<string, string>; testid: string; addLabel: string; placeholder?: string }) {
   const [focus, setFocus] = useState<number | null>(null);
+  const [editing, setEditing] = useState<number | null>(null);
   const root = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (focus === null) return;
@@ -330,18 +339,35 @@ export function ListEditor(p: { items: string[]; onChange(items: string[], field
   return (
     <div class="ed-list" ref={root}>
       {p.items.map((v, i) => (
-        <div class="ed-list-row" key={i}>
-          <span class="ed-list-n">{i + 1}</span>
-          <TextInput value={v} mono placeholder={p.placeholder} onValue={(t) => set(i, t)} testid={`${p.testid}-${i}`} aria-label={`Argument ${i + 1}`} invalid={p.errors.has(`action.args.${i}`)} />
-          <button type="button" class="ed-icon" aria-label="Move up" disabled={i === 0} onClick={() => swap(i, i - 1)} data-testid={`${p.testid}-${i}-up`}>
-            <ChevronUp />
-          </button>
-          <button type="button" class="ed-icon" aria-label="Move down" disabled={i === p.items.length - 1} onClick={() => swap(i, i + 1)} data-testid={`${p.testid}-${i}-down`}>
-            <ChevronDown />
-          </button>
-          <button type="button" class="ed-icon" aria-label="Remove" onClick={() => p.onChange(p.items.filter((_, j) => j !== i))} data-testid={`${p.testid}-${i}-remove`}>
-            <Close />
-          </button>
+        <div class="ed-list-item" key={i}>
+          <div class="ed-list-row">
+            <span class="ed-list-n">{i + 1}</span>
+            <TextInput
+              value={v}
+              mono
+              placeholder={p.placeholder}
+              onValue={(t) => set(i, t)}
+              onFocus={() => setEditing(i)}
+              onBlur={() => setEditing(null)}
+              testid={`${p.testid}-${i}`}
+              aria-label={`Argument ${i + 1}`}
+              invalid={p.errors.has(`action.args.${i}`)}
+            />
+            <button type="button" class="ed-icon" aria-label="Move up" disabled={i === 0} onClick={() => swap(i, i - 1)} data-testid={`${p.testid}-${i}-up`}>
+              <ChevronUp />
+            </button>
+            <button type="button" class="ed-icon" aria-label="Move down" disabled={i === p.items.length - 1} onClick={() => swap(i, i + 1)} data-testid={`${p.testid}-${i}-down`}>
+              <ChevronDown />
+            </button>
+            <button type="button" class="ed-icon" aria-label="Remove" onClick={() => p.onChange(p.items.filter((_, j) => j !== i))} data-testid={`${p.testid}-${i}-remove`}>
+              <Close />
+            </button>
+          </div>
+          {v === '' && editing !== i && (
+            <span class="ed-warn-note" data-testid={`${p.testid}-${i}-empty`}>
+              Empty: the program gets an empty argument here. Remove it if that's not what you want.
+            </span>
+          )}
         </div>
       ))}
       <button type="button" class="ed-add" data-testid={`${p.testid}-add`} onClick={() => (p.onChange([...p.items, '']), setFocus(p.items.length))}>
@@ -351,13 +377,15 @@ export function ListEditor(p: { items: string[]; onChange(items: string[], field
   );
 }
 
-function EnvRow(p: { name: string; value: string; taken: (k: string) => boolean; onRename(k: string): void; onValue(v: string): void; onRemove(): void; i: number }) {
+function EnvRow(p: { name: string; value: string; error?: string; taken: (k: string) => boolean; onRename(k: string): void; onValue(v: string): void; onRemove(): void; i: number }) {
   const [name, setName] = useState(p.name);
   const editing = useRef(false);
   useEffect(() => {
     if (!editing.current) setName(p.name);
   }, [p.name]);
-  const err = name.trim() === '' ? "Can't be empty" : name !== p.name && p.taken(name) ? 'Already set above' : '';
+  // Checked as typed (a bad name also goes to the draft, where it blocks saving until fixed).
+  const err =
+    name === '' ? "Can't be empty" : !ENV_NAME.test(name) ? `${ENV_NAME_MESSAGE.charAt(0).toUpperCase()}${ENV_NAME_MESSAGE.slice(1)}` : name !== p.name && p.taken(name) ? 'Already set above' : (p.error ?? '');
   return (
     <div class="ed-env-row">
       <div class="ed-env-cells">
@@ -372,7 +400,7 @@ function EnvRow(p: { name: string; value: string; taken: (k: string) => boolean;
           onBlur={() => ((editing.current = false), setName(p.name))}
           onValue={(t) => {
             setName(t);
-            if (t.trim() !== '' && (t === p.name || !p.taken(t))) p.onRename(t);
+            if (t !== '' && (t === p.name || !p.taken(t))) p.onRename(t);
           }}
         />
         <span class="ed-env-eq">=</span>
@@ -381,13 +409,17 @@ function EnvRow(p: { name: string; value: string; taken: (k: string) => boolean;
           <Close />
         </button>
       </div>
-      {err && <span class="ed-err">{err}</span>}
+      {err && (
+        <span class="ed-err" data-testid={`env-error-${p.i}`}>
+          {err}
+        </span>
+      )}
     </div>
   );
 }
 
-/** Environment variables: an ordered record; empty → undefined (keeps the file compact). */
-export function EnvEditor(p: { env: Record<string, string> | undefined; onChange(env: Record<string, string> | undefined, field?: string): void }) {
+/** Environment variables: an ordered record; empty → undefined (keeps the file compact). `errors`: the button's field errors. */
+export function EnvEditor(p: { env: Record<string, string> | undefined; errors?: Map<string, string>; onChange(env: Record<string, string> | undefined, field?: string): void }) {
   const entries = Object.entries(p.env ?? {});
   const [focus, setFocus] = useState<number | null>(null);
   const root = useRef<HTMLDivElement>(null);
@@ -412,6 +444,7 @@ export function EnvEditor(p: { env: Record<string, string> | undefined; onChange
           i={i}
           name={k}
           value={v}
+          error={p.errors?.get(`action.env.${k}`)}
           taken={(n) => entries.some(([o], j) => j !== i && o === n)}
           onRename={(n) => out(entries.map((e, j) => (j === i ? [n, e[1]] : e)), `envk${i}`)}
           onValue={(nv) => out(entries.map((e, j) => (j === i ? [e[0], nv] : e)), `envv${i}`)}
@@ -425,14 +458,17 @@ export function EnvEditor(p: { env: Record<string, string> | undefined; onChange
   );
 }
 
-/** Modal: Esc / backdrop closes; focuses its first action. */
+/**
+ * Modal: Esc / backdrop closes. Focuses its `data-autofocus` action, else the first: a dialog that
+ * can destroy work marks its safe way out, so a stray Enter (⌘S then Enter…) can't do damage.
+ */
 export function Dialog(p: { title: string; children: ComponentChildren; actions: ComponentChildren; onClose(): void; testid: string; tone?: 'danger' | 'warn' }) {
   const box = useRef<HTMLDivElement>(null);
   const close = useRef(p.onClose);
   close.current = p.onClose;
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
-    box.current?.querySelector<HTMLButtonElement>('.ed-dialog-actions button')?.focus();
+    (box.current?.querySelector<HTMLButtonElement>('.ed-dialog-actions [data-autofocus]') ?? box.current?.querySelector<HTMLButtonElement>('.ed-dialog-actions button'))?.focus();
     const k = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       e.preventDefault();

@@ -14,11 +14,11 @@
  * its socket is still the current one: a stale socket's late events can't touch a newer one.
  */
 import type { Config } from '../../core/config.ts';
-import type { PressResult, RunRecord, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
+import type { PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { emptySnapshot, PressError, type Backend, type SaveResult, type Snapshot } from './types.ts';
+import { emptySnapshot, MAX_CONFIG_BYTES, PressError, TOO_LARGE, type Backend, type SaveResult, type Snapshot } from './types.ts';
 
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 5000;
@@ -41,6 +41,10 @@ const PRESS_DOUBT_AFTER = 600;
 const HIDDEN_DOUBT_AFTER = 1000;
 /** The probe. Not part of the protocol: the host answers it with `error`, which is the point. */
 const PING = JSON.stringify({ t: 'ping' });
+/** A config save with no answer by then is given up on (it may have landed: the caller checks). */
+const SAVE_TIMEOUT = 10_000;
+/** GET /api/config when asked for it (merges, checks). */
+const GET_TIMEOUT = 5000;
 
 interface Pending {
   resolve: (r: PressResult) => void;
@@ -342,25 +346,54 @@ export class WsBackend implements Backend {
     else if (!c) this.connectNow();
   }
 
-  private async http(method: string, path: string, body?: unknown): Promise<Response> {
+  private async http(method: string, path: string, body?: string, signal?: AbortSignal): Promise<Response> {
     return fetch(`${this.origin}${path}`, {
       method,
       headers: { authorization: `Bearer ${this.token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body,
       cache: 'no-store',
+      signal,
     });
   }
 
-  async saveConfig(config: Config, baseRev: string): Promise<SaveResult> {
+  async saveConfig(config: Config, baseRev: string, { force = false } = {}): Promise<SaveResult> {
+    const body = JSON.stringify({ config, baseRev, ...(force ? { force: true } : {}) } satisfies SaveConfigBody);
+    if (new Blob([body]).size > MAX_CONFIG_BYTES) return { ok: false, kind: 'error', message: TOO_LARGE };
+    // A PUT on a link that died without a reset would wait for minutes: give up, the caller checks.
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), SAVE_TIMEOUT);
     try {
-      const r = await this.http('PUT', '/api/config', { config, baseRev });
-      const j = (await r.json().catch(() => ({}))) as { rev?: string; errors?: string[]; error?: string };
+      const r = await this.http('PUT', '/api/config', body, ctl.signal);
+      const j = (await r.json().catch((e: unknown) => {
+        if (ctl.signal.aborted) throw e;
+        return {};
+      })) as { rev?: string; errors?: string[]; error?: string; invalid?: boolean };
       if (r.ok && j.rev) return { ok: true, rev: j.rev };
       if (r.status === 400) return { ok: false, kind: 'invalid', errors: j.errors ?? ['invalid config'] };
-      if (r.status === 409) return { ok: false, kind: 'conflict', rev: j.rev ?? '' };
+      if (r.status === 409) return { ok: false, kind: 'conflict', rev: j.rev ?? '', ...(j.invalid ? { invalid: true, errors: j.errors ?? [] } : {}) };
+      if (r.status === 413) return { ok: false, kind: 'error', message: TOO_LARGE };
       return { ok: false, kind: 'error', message: j.error ?? `HTTP ${r.status}` };
     } catch (e) {
-      return { ok: false, kind: 'error', message: e instanceof Error ? e.message : String(e) };
+      const message = ctl.signal.aborted ? `the host didn't answer within ${SAVE_TIMEOUT / 1000} s` : e instanceof Error ? e.message : String(e);
+      return { ok: false, kind: 'error', message, unsure: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async getConfig(): Promise<{ config: WireConfig; rev: string }> {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), GET_TIMEOUT);
+    try {
+      const r = await this.http('GET', '/api/config', undefined, ctl.signal);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = (await r.json()) as { config?: WireConfig; rev?: string };
+      if (!j.config?.pads || typeof j.rev !== 'string') throw new Error('unexpected answer from the host');
+      return { config: j.config, rev: j.rev };
+    } catch (e) {
+      throw ctl.signal.aborted ? new Error(`the host didn't answer within ${GET_TIMEOUT / 1000} s`) : e;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

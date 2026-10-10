@@ -767,6 +767,15 @@ button.ed-status:active {
   align-items: center;
   gap: 2px;
 }
+.ed-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ed-list-item > .ed-warn-note {
+  padding-left: 24px;
+  line-height: 1.35;
+}
 .ed-list-n {
   flex: none;
   width: 20px;
