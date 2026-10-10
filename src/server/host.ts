@@ -15,6 +15,7 @@ import { errnoText, listenError } from './errors.ts';
 import { WriteError } from './files.ts';
 import { ThrottledLog } from './limits.ts';
 import { STATE_FILE } from './persist.ts';
+import { sanitizeLog } from './runner.ts';
 import { bearerToken, loadSecrets, makeAuth, type Secrets } from './secrets.ts';
 import { starterConfigText } from './starter.ts';
 import { runEndLine, StateStore, type PressReply, type StartLimits } from './state-store.ts';
@@ -211,7 +212,10 @@ const KNOWN_PATHS: [RegExp, string][] = [
 ];
 
 export async function startHost(opts: HostOptions): Promise<Host> {
-  const log = opts.log ?? ((m: string) => console.log(m));
+  const sink = opts.log ?? ((m: string) => console.log(m));
+  // The log goes to a terminal, and its lines quote the config and files (labels, paths, #! lines,
+  // parse errors): no escape sequences or control characters get through.
+  const log = (m: string) => sink(sanitizeLog(m));
   const { store: config, created: createdConfig } = ConfigStore.open(opts.configPath, opts.createConfig === false ? undefined : starterConfigText);
   const secretsPath = opts.secretsPath ?? join(config.dir, 'buttpad.secrets.json');
   const sec = loadSecrets(secretsPath, { rotate: opts.rotateTokens });

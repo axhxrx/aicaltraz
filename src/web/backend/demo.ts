@@ -59,6 +59,10 @@ const tail = (lines: string[]) => lines.join('\n').slice(-TAIL);
 /** `pad/button`, `pad/*` or `*` (config.ts STOP_PATTERN) against a button key. */
 const stopMatches = (pattern: string, key: string) => pattern === '*' || pattern === key || (pattern.endsWith('/*') && key.startsWith(pattern.slice(0, -1)));
 
+/** A result as READY shows it once it's over (the machine's reset), with no re-run to come. */
+const settled = (s: RunState): RunState =>
+  s.phase === 'success' || s.phase === 'failure' ? transition({ ...s, queued: false }, { type: 'reset', runId: s.runId }, { whileRunning: 'ignore', resultHoldMs: 0 })[0] : s;
+
 export function loadDemoConfig(): Config {
   const stored = lsJSON<unknown>(KEYS.demoConfig);
   if (stored) {
@@ -205,9 +209,14 @@ export class DemoBackend implements Backend {
     setTimeout(() => run.finish(null), this.opts.exact ? 50 : 150 + Math.random() * 250);
   }
 
+  /** When a press was made (its gesture's time, PressOpts.at), by the demo's "host clock" (wall()). */
+  private madeAt(opts: PressOpts): number {
+    return opts.at === undefined ? wall() : wall() - Math.max(0, mono() - opts.at);
+  }
+
   press(pad: string, button: string, opts: PressOpts = {}): Promise<PressResult> {
     if (!this.online || this.disposed) return Promise.reject(new PressError(false, 'not connected to the host'));
-    const at = wall();
+    const at = this.madeAt(opts);
     opts.onSent?.();
     if (this.dropping > 0) {
       this.dropping--;
@@ -315,10 +324,33 @@ export class DemoBackend implements Backend {
       this.kill(key);
     }
     this.config = r.config;
+    this.dropRemoved();
     lsSet(KEYS.demoConfig, JSON.stringify(r.config));
     const next = rev(JSON.stringify(r.config));
     this.snapshot.set((s) => ({ ...s, config: r.config, rev: next, configErrors: null }));
     return { ok: true, rev: next };
+  }
+
+  /**
+   * As on the host, a button gone from the config takes with it its device state (`@state`, which
+   * doesn't come back with the button) and whatever was still to come: a re-run, its reset.
+   */
+  private dropRemoved() {
+    for (const key of new Set([...this.latched.keys(), ...this.states.keys()])) {
+      const [pad, id] = key.split('/') as [string, string];
+      if (this.button(pad, id)) continue;
+      if (this.latched.has(key)) this.latch(key, '');
+      const s = this.states.get(key);
+      if (!s || s.phase === 'ready') continue;
+      if (s.phase === 'running') {
+        // Being stopped (above): it ends without its re-run.
+        if (s.queued) this.setState(key, { ...s, queued: false });
+        continue;
+      }
+      clearTimeout(this.timers.get(key));
+      this.timers.delete(key);
+      this.setState(key, settled(s));
+    }
   }
 
   async runs(q: { pad?: string; button?: string } = {}): Promise<RunRecord[]> {
@@ -362,7 +394,7 @@ export class DemoBackend implements Backend {
     this.press = (pad, button, opts = {}) => {
       this.press = press;
       if (!this.online) return press(pad, button, opts);
-      const at = wall();
+      const at = this.madeAt(opts);
       opts.onSent?.();
       this.setOnline(false);
       this.handle(pad, button, at, !!opts.confirm);
@@ -370,8 +402,14 @@ export class DemoBackend implements Backend {
     };
   }
 
-  /** Like a host that crashed and came back: what was running ends INTERRUPTED. */
+  /**
+   * Like a host that crashed and came back: what was running ends INTERRUPTED; its timers are gone
+   * (no queued re-run, a result shows as READY's last), as on a host starting up.
+   */
   restart(): void {
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
+    for (const [key, s] of this.states) if (s.phase === 'success' || s.phase === 'failure') this.states.set(key, settled(s));
     for (const [key, run] of [...this.runs_]) {
       run.done = true;
       run.handle.kill();

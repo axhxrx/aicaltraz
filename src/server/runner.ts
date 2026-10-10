@@ -9,7 +9,7 @@
  *   @state text   the device's latched state ("REC ●", "ON 80%"), kept across runs; `@state` alone clears it
  *
  * Text that reaches clients (status, result, latched state) is sanitized: ANSI escape sequences,
- * control characters and bidi overrides/isolates are removed.
+ * control characters and bidi overrides/isolates are removed. So is the host log (sanitizeLog).
  */
 import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -182,6 +182,9 @@ export const stripAnsi = (s: string) => s.replace(ANSI, '');
 
 /** Display text from untrusted output: no escape sequences, controls (tabs etc. become spaces) or bidi overrides. */
 export const sanitize = (s: string) => s.replace(ANSI, '').replace(SPACING, ' ').replace(CONTROLS, '');
+
+/** Host log text (it goes to a terminal): sanitize() line by line, so a multi-line message keeps its line breaks. */
+export const sanitizeLog = (s: string) => s.split('\n').map(sanitize).join('\n');
 
 const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
 

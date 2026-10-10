@@ -12,10 +12,16 @@
  * Written atomically (temp file + rename), throttled: routine changes at most every
  * SAVE_INTERVAL_MS, run starts/ends sooner (URGENT_SAVE_INTERVAL_MS). A missing or unreadable
  * file means starting fresh (the host says so); the next save replaces it.
+ *
+ * The fingerprint is no secret (anyone can read /proc), so the runs in flight are trusted to name
+ * processes to stop only when no one but the host's user could have written the file (`notPrivate`).
  */
+import { statSync, type Stats } from 'node:fs';
+import { dirname } from 'node:path';
 import type { FailureReason, LastResult } from '../core/machine.ts';
 import { atomicWrite } from './config-store.ts';
-import { NotRegularFileError, readRegularFile } from './files.ts';
+import { errnoText } from './errors.ts';
+import { NotRegularFileError, readRegularFileStat } from './files.ts';
 
 export const STATE_FILE = 'buttpad.state.json';
 export const STATE_VERSION = 1;
@@ -56,6 +62,8 @@ export interface PersistedState {
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+/** A button key as the host writes them: `pad/button`, both ids as the config allows them (src/core/config.ts). */
+const isKey = (v: unknown): v is string => typeof v === 'string' && v.length <= 500 && /^[\w-]+\/[\w-]+$/.test(v);
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 const isPid = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 1;
@@ -72,7 +80,7 @@ function parseLast(v: unknown, clean: (s: string, max: number) => string): LastR
 }
 
 function parseLive(v: unknown): LiveEntry | undefined {
-  if (!isRecord(v) || typeof v.key !== 'string' || !v.key.includes('/') || v.key.length > 500) return undefined;
+  if (!isRecord(v) || !isKey(v.key)) return undefined;
   if (!isCount(v.runId) || !isPid(v.pid) || !isPid(v.pgid) || !isTime(v.startedAt)) return undefined;
   // The host only ever writes its runs' own process groups (detached: pgid = pid), and never itself:
   // anything else would let a hand-edited file aim a kill at some other group.
@@ -100,7 +108,7 @@ export function parseState(raw: unknown, clean: (s: string, max: number) => stri
   const buttons: Record<string, ButtonMemo> = {};
   if (isRecord(raw.buttons))
     for (const [key, v] of Object.entries(raw.buttons)) {
-      if (!isRecord(v) || !key.includes('/') || key.length > 500 || !isCount(v.lastRunId)) continue;
+      if (!isRecord(v) || !isKey(key) || !isCount(v.lastRunId)) continue;
       const memo: ButtonMemo = { lastRunId: v.lastRunId };
       const last = parseLast(v.last, clean);
       if (last) memo.last = last;
@@ -114,16 +122,45 @@ export function parseState(raw: unknown, clean: (s: string, max: number) => stri
   return state;
 }
 
-export type LoadResult = { ok: true; state: PersistedState } | { ok: false; missing: boolean; error: string };
+/** `notPrivate`: why someone else could have written the file (see notPrivate()); absent when no one could. */
+export type LoadResult = { ok: true; state: PersistedState; notPrivate?: string } | { ok: false; missing: boolean; error: string };
 
 /** A state file is a few KB; a bigger one isn't ours. */
 const MAX_STATE_BYTES = 8 * 1024 * 1024;
 
+const octal = (mode: number) => (mode & 0o777).toString(8).padStart(4, '0');
+
+/**
+ * Why the state file at `path` could have been written by someone other than this host's user
+ * (`st`: the stat of the open file that was read); undefined when it couldn't: owned by that user,
+ * mode 0600 or stricter (`mode & 0o077` = 0), in a folder that isn't group- or world-writable (the
+ * same posture as the secrets file). A file that fails this could aim the startup kill at any
+ * process group of this user (its fingerprints are computable from /proc), so its runs in flight are
+ * never signalled. Windows: no check (no fingerprint there, nothing is ever signalled).
+ */
+export function notPrivate(path: string, st: Stats, uid: number | undefined = process.geteuid?.()): string | undefined {
+  if (process.platform === 'win32' || uid === undefined) return undefined;
+  if (st.uid !== uid) return `it is owned by uid ${st.uid}, not by this host's user (uid ${uid})`;
+  if (st.mode & 0o077) return `its mode is ${octal(st.mode)}, not 0600`;
+  const dir = dirname(path);
+  let d: Stats;
+  try {
+    d = statSync(dir);
+  } catch (e) {
+    return `its folder ${dir} can't be checked: ${errnoText(e)}`;
+  }
+  if (d.mode & 0o022) return `its folder ${dir} is group- or world-writable (mode ${octal(d.mode)})`;
+  return undefined;
+}
+
 export function loadState(path: string, clean: (s: string, max: number) => string): LoadResult {
   let text: string;
+  let stat: Stats;
   try {
     // Never blocks on a FIFO or device (files.ts checks before and after opening, non-blocking).
-    text = readRegularFile(path, MAX_STATE_BYTES).toString('utf8');
+    const r = readRegularFileStat(path, MAX_STATE_BYTES);
+    text = r.data.toString('utf8');
+    stat = r.stat;
   } catch (e) {
     if (e instanceof NotRegularFileError) return { ok: false, missing: false, error: `not a regular file: it is ${e.kind}` };
     const err = e as NodeJS.ErrnoException;
@@ -136,7 +173,9 @@ export function loadState(path: string, clean: (s: string, max: number) => strin
     return { ok: false, missing: false, error: `invalid JSON (${(e as Error).message})` };
   }
   const r = parseState(raw, clean);
-  return typeof r === 'string' ? { ok: false, missing: false, error: r } : { ok: true, state: r };
+  if (typeof r === 'string') return { ok: false, missing: false, error: r };
+  const why = notPrivate(path, stat);
+  return why ? { ok: true, state: r, notPrivate: why } : { ok: true, state: r };
 }
 
 export interface StateFileOptions {

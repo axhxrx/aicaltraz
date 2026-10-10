@@ -81,6 +81,11 @@ const reason = (e: unknown) => ((e as { plain?: boolean } | undefined)?.plain ? 
  * (opened non-blocking, in case it was swapped for a FIFO in between). Bigger than `maxBytes`: EFBIG.
  */
 export function readRegularFile(path: string, maxBytes = MAX_READ_BYTES): Buffer {
+  return readRegularFileStat(path, maxBytes).data;
+}
+
+/** readRegularFile, plus the stat of the file the bytes came from (the open file: owner and mode of exactly what was read). */
+export function readRegularFileStat(path: string, maxBytes = MAX_READ_BYTES): { data: Buffer; stat: Stats } {
   const st = statSync(path);
   if (!st.isFile()) throw new NotRegularFileError(path, fileKind(st));
   const fd = openSync(path, constants.O_RDONLY | O_NONBLOCK);
@@ -88,7 +93,7 @@ export function readRegularFile(path: string, maxBytes = MAX_READ_BYTES): Buffer
     const now = fstatSync(fd);
     if (!now.isFile()) throw new NotRegularFileError(path, fileKind(now));
     if (now.size > maxBytes) throw ioError(`${path} is too big (${(now.size / 1048576).toFixed(1)} MB; at most ${maxBytes / 1048576} MB)`, 'EFBIG');
-    return readAll(fd, now.size, maxBytes, path);
+    return { data: readAll(fd, now.size, maxBytes, path), stat: now };
   } finally {
     closeQuietly(fd);
   }

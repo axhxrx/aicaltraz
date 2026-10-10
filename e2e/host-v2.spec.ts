@@ -1,12 +1,14 @@
 /**
  * Protocol v2 against a real host (one per spec file and project): presses carry `at` and
- * `confirm`; a press held up in a dead link is dropped, never run late; two devices pressing at
- * once (only the winner hears success); `@state` latched device state; "host is full"; a touch
- * while offline reconnects at once; a slow hello still connects; blocked storage.
+ * `confirm`; a press held up in a dead link (or a stalled page) is dropped, never run late; two
+ * devices pressing at once (only the winner hears success); `@state` latched device state; "host
+ * is full"; a touch while offline reconnects at once; a slow hello still connects, and its clock
+ * offset holds; a queued re-run that gets dropped stops being this device's; a host that lost its
+ * state file (run ids start over); blocked storage.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import type { ConfigInput } from '../src/core/config.ts';
 import { btn, expectVisual, Fingers, recordPressFrames, recordVibrations, VIB } from './helpers.ts';
 import { startHost, type Host } from './host.ts';
@@ -47,6 +49,18 @@ const CONFIG: ConfigInput = {
       // Keeps frames coming from the host (progress every 100 ms): a socket with traffic isn't probed.
       buttons: [{ id: 'ticker', label: 'Ticker', x: 0, y: 0, trigger: 'tap', action: sh('i=0; while [ $i -lt 300 ]; do echo "@progress $((i / 3))"; i=$((i + 1)); sleep 0.1; done') }],
     },
+    {
+      id: 'work',
+      name: 'Work',
+      cols: 3,
+      rows: 1,
+      // Each fails while its flag file exists (in the host's folder).
+      buttons: [
+        { id: 'render', label: 'Render', x: 0, y: 0, trigger: 'tap', key: 'r', whileRunning: 'queue', resultHoldMs: 600, action: sh('if [ -f render.fail ]; then sleep 0.6; echo "render failed" >&2; exit 3; fi; sleep 1.5; echo rendered') },
+        { id: 'off', label: 'All off', x: 1, y: 0, trigger: 'tap', stops: ['work/*'], action: { type: 'none' } },
+        { id: 'upload', label: 'Upload', x: 2, y: 0, trigger: 'tap', key: 'u', cooldownMs: 0, resultHoldMs: 600, action: sh('if [ -f upload.fail ]; then sleep 0.4; echo "upload failed" >&2; exit 1; fi; sleep 0.3; echo uploaded') },
+      ],
+    },
   ],
 };
 
@@ -73,9 +87,18 @@ const runs = () => {
   return existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').length : 0;
 };
 
-async function open(page: Page, via: Proxy | null = null) {
-  await page.goto(`${via?.url ?? host.url}/?pad=main#token=${host.pressToken}`);
+async function open(page: Page, via: Proxy | null = null, pad = 'main') {
+  await page.goto(`${via?.url ?? host.url}/?pad=${pad}#token=${host.pressToken}`);
   await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 10_000 });
+}
+
+/** A file in the host's folder (its actions run there). */
+const hostFile = (name: string) => path.join(path.dirname(host.configPath), name);
+
+/** Another device presses (the HTTP API): no ack for this page. */
+async function pressElsewhere(request: APIRequestContext, pad: string, button: string) {
+  const r = await request.post(`${host.url}/api/press/${pad}/${button}`, { headers: { authorization: `Bearer ${host.pressToken}` } });
+  return ((await r.json()) as { result?: string }).result;
 }
 
 test('presses carry `at` (the host clock) and `confirm` only after the confirm step', async ({ page, hasTouch }) => {
@@ -187,6 +210,114 @@ test('a hello slower than 5 s (a big config, a slow link) still gets through: th
   proxy.wsLatency = 3000;
   await page.goto(`${proxy.url}/?pad=main#token=${host.pressToken}`);
   await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 40_000 });
+});
+
+test('a hello that arrives seconds after its socket opened (a big config): the clock offset is right, presses run', async ({ page }) => {
+  proxy = await startProxy(host.port);
+  // The upgrade's answer comes at once; the hello behind it 3.5 s later. The host stamped its
+  // serverNow before that: an offset taken when the hello arrived was 3.5 s off, and every press
+  // went out "made 3.5 s ago" (dropped as too old, and the socket renewed, again and again).
+  proxy.helloDelayMs = 3500;
+  const frames = await recordPressFrames(page);
+  await open(page, proxy);
+  await expectVisual(page, 'tap', 'ready', 8000);
+  const before = runs();
+  await page.keyboard.press('t');
+  await expectVisual(page, 'tap', 'success', 5000);
+  expect(runs()).toBe(before + 1);
+  const [sent] = await frames();
+  expect(Math.abs(sent!.at! - sent!.sentAt)).toBeLessThan(1000);
+});
+
+test('a tap made right before the page stalled says when it was made: the host drops it (too late) rather than run it 4 s late', async ({ page, hasTouch }) => {
+  const frames = await recordPressFrames(page);
+  await open(page);
+  await expectVisual(page, 'quick', 'ready', 8000);
+  const socket = await page.evaluateHandle(() => window.__buttpad!.backend.ws);
+  // Busy from 20 ms after the touch for 4 s; the finger lifted at 80 ms (stamped events).
+  await page.evaluate(() =>
+    document.querySelector('[data-testid="btn-quick"]')!.addEventListener(
+      'pointerdown',
+      () =>
+        setTimeout(() => {
+          const end = performance.now() + 4000;
+          while (performance.now() < end);
+        }, 20),
+      { once: true },
+    ),
+  );
+  const f = new Fingers(page, hasTouch);
+  const t0 = Date.now();
+  await f.downAt('quick', t0);
+  await page.waitForTimeout(150);
+  await f.upAt(t0 + 80);
+  await expect(btn(page, 'quick')).toContainText('NOT SENT', { timeout: 8000 });
+  await expect(btn(page, 'quick')).toContainText('too late');
+  const [sent] = await frames();
+  expect(Math.abs(sent!.at! - (t0 + 80))).toBeLessThan(400);
+  expect(sent!.sentAt - t0).toBeGreaterThan(3500);
+  expect(host.log()).toMatch(/dropped a stale press of main\/quick/);
+  // The offset was fine (the press was old already when it went out): the socket is kept.
+  expect(await page.evaluate((ws) => ws === window.__buttpad!.backend.ws, socket)).toBe(true);
+});
+
+test('a queued re-run that All off drops is no longer this device’s: a later run by someone else is marked, and its failure not kept here', async ({ page, request }) => {
+  const vib = await recordVibrations(page);
+  await open(page, null, 'work');
+  rmSync(hostFile('render.fail'), { force: true });
+  // Someone else's render runs; this device queues a re-run behind it.
+  expect(await pressElsewhere(request, 'work', 'render')).toBe('started');
+  await expectVisual(page, 'render', 'running');
+  await page.keyboard.press('r');
+  await expect(btn(page, 'render')).toContainText('QUEUED');
+  // Another device's All off: the run is stopped and its re-run dropped.
+  expect(await pressElsewhere(request, 'work', 'off')).toBe('started');
+  await expectVisual(page, 'render', 'stopped');
+  await expectVisual(page, 'render', 'ready', 4000);
+  // Later, a third device runs it, and it fails.
+  writeFileSync(hostFile('render.fail'), '');
+  const failures = (await vib()).filter((v) => v === VIB.failure).length;
+  expect(await pressElsewhere(request, 'work', 'render')).toBe('started');
+  await expectVisual(page, 'render', 'running');
+  await expect(page.getByTestId('other-render')).toBeVisible();
+  await expectVisual(page, 'render', 'failure', 4000);
+  // Past its resultHoldMs: READY here too (it isn't this device's failure to keep).
+  await expectVisual(page, 'render', 'ready', 4000);
+  expect((await vib()).filter((v) => v === VIB.failure).length).toBe(failures);
+  rmSync(hostFile('render.fail'), { force: true });
+});
+
+test('a host that comes back without its state file (run ids start over): whose run it is, is told afresh', async ({ page, request }) => {
+  const vib = await recordVibrations(page);
+  rmSync(hostFile('upload.fail'), { force: true });
+  await open(page, null, 'work');
+  // This device runs it twice (run ids 1 and 2, or more).
+  for (let i = 0; i < 2; i++) {
+    await page.keyboard.press('u');
+    await expectVisual(page, 'upload', 'success', 4000);
+    await expectVisual(page, 'upload', 'ready', 4000);
+  }
+  await host.stop();
+  rmSync(hostFile('buttpad.state.json'), { force: true });
+  await host.start();
+  await expect(conn(page)).toHaveAttribute('data-status', 'online', { timeout: 10_000 });
+  // Someone else's run 1: theirs.
+  expect(await pressElsewhere(request, 'work', 'upload')).toBe('started');
+  await expectVisual(page, 'upload', 'running');
+  await expect(page.getByTestId('other-upload')).toBeVisible();
+  await expectVisual(page, 'upload', 'ready', 4000);
+  // This device's own run 2 fails: buzzed, and kept until touched.
+  writeFileSync(hostFile('upload.fail'), '');
+  const failures = (await vib()).filter((v) => v === VIB.failure).length;
+  await page.keyboard.press('u');
+  await expectVisual(page, 'upload', 'running');
+  await expect(page.getByTestId('other-upload')).toHaveCount(0);
+  await expectVisual(page, 'upload', 'failure', 4000);
+  await page.waitForTimeout(1200);
+  await expectVisual(page, 'upload', 'failure');
+  await expect(btn(page, 'upload')).toHaveAttribute('data-sticky', '');
+  expect((await vib()).filter((v) => v === VIB.failure).length).toBe(failures + 1);
+  rmSync(hostFile('upload.fail'), { force: true });
 });
 
 test('storage blocked (private mode): the pairing works for this tab, with a warning that it won’t be remembered', async ({ page }) => {

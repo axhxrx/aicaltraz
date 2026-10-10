@@ -12,7 +12,7 @@ import { wall } from '../lib/clock.ts';
 import { eventTime } from '../lib/env.ts';
 import { settings } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { ButtonController, resultShown } from './controller.ts';
+import { ButtonController, resultShown, type KeyResult } from './controller.ts';
 import { keyName, READY } from './view.ts';
 
 /** Contacts landing on this many buttons within PALM_MS: a palm or a sleeve, not presses. */
@@ -85,7 +85,8 @@ export class RunSession {
     const live = p.status === 'online' && s.status === 'online';
     if (s.states !== p.states)
       for (const e of this.entries.values()) {
-        const st = s.states[e.key];
+        // A state that's gone (the demo's Reset) is READY, run ids started over.
+        const st = s.states[e.key] ?? (p.states[e.key] ? READY : undefined);
         if (st && st !== p.states[e.key]) e.ctrl.onHost(st, live);
       }
     if (s.status !== p.status) for (const e of this.entries.values()) e.ctrl.onLink(s.status === 'online');
@@ -130,6 +131,7 @@ export class RunSession {
     ctrl.setCtx({
       button: () => e.button,
       host: (): RunState => snap().states[key] ?? READY,
+      skew: () => snap().clockSkew,
       online: () => snap().status === 'online',
       rough: () => settings.get().rough,
       press: (opts) => {
@@ -139,11 +141,10 @@ export class RunSession {
           opts.onAck(a);
         };
         // A backend that only resolves (no onAck) still gets its answer through.
-        return this.backend.press(e.pad.id, e.button.id, { confirm: opts.confirm, onSent: opts.onSent, onAck }).then((result) => acked || onAck({ result }));
+        return this.backend.press(e.pad.id, e.button.id, { confirm: opts.confirm, at: opts.at, onSent: opts.onSent, onAck }).then((result) => acked || onAck({ result }));
       },
       kick: () => this.backend.kick(),
       mayStart: (t) => this.mayStart(e, t),
-      started: (t) => this.starts.push({ key, t }),
     });
     e.off = ctrl.local.subscribe(() => this.updateMarks());
     return e;
@@ -162,12 +163,14 @@ export class RunSession {
   }
 
   private mayStart(e: Entry, t: number): boolean {
+    // Every contact counts toward a palm, also one refused (rough mode's one button at a time).
+    this.starts = this.starts.filter((s) => t - s.t < 1000);
+    this.starts.push({ key: e.key, t });
     // A palm (or a sleeve) lands on several buttons at once: none of those contacts is a press.
     if (t < this.palmUntil) return false;
-    this.starts = this.starts.filter((s) => t - s.t < 1000);
-    const recent = this.starts.filter((s) => s.key !== e.key && Math.abs(t - s.t) <= PALM_MS && this.entries.get(s.key)?.ctrl.pressing);
-    if (new Set(recent.map((s) => s.key)).size >= PALM_BUTTONS - 1) {
-      for (const s of recent) this.entries.get(s.key)?.ctrl.drop();
+    const near = this.starts.filter((s) => Math.abs(t - s.t) <= PALM_MS);
+    if (new Set(near.map((s) => s.key)).size >= PALM_BUTTONS) {
+      for (const s of near) if (s.key !== e.key) this.entries.get(s.key)?.ctrl.drop();
       this.palmUntil = t + PALM_MS;
       this.starts = [];
       return false;
@@ -198,10 +201,24 @@ export class RunSession {
   }
 
   /**
+   * A key pressed a button on another pad: say what it did, since that button isn't on screen.
+   * "▶" only when it fired.
+   */
+  private sayKey(pad: WirePad, b: WireButton, what: KeyResult) {
+    const name = `${b.label || b.id} (${pad.name})`;
+    if (what === 'sent') this.say(`▶ ${name}`);
+    else if (what === 'confirm') this.say(`${name}: press again to confirm`);
+    else if (what === 'again') this.say(`${name}: press again (double press)`);
+    else if (what === 'cooldown') this.say(`${name}: too soon after the last press, ignored`, 'warn');
+    else if (what === 'busy') this.say(`${name}: busy, the last press is still on its way`, 'warn');
+    else if (what === 'offline') this.say(`${name}: not sent, not connected to the host`, 'warn');
+  }
+
+  /**
    * Keys are global (BLE remotes pair as keyboards). A key presses the button on the pad on screen
-   * that has it; else the one button on any other pad that has it (with a toast saying which); when
-   * several other pads have it, nothing (a toast says so). `onKey` runs when a key fires a button
-   * (the app closes its menu: keys keep working while it's open). Returns the cleanup.
+   * that has it; else the one button on any other pad that has it (with a toast saying what it
+   * did); when several other pads have it, nothing (a toast says so). `onKey` runs when a key fires
+   * a button (the app closes its menu: keys keep working while it's open). Returns the cleanup.
    */
   listenKeys(onKey: () => void, enabled: () => boolean = () => true): () => void {
     const held = new Set<string>();
@@ -232,8 +249,10 @@ export class RunSession {
       if (e.repeat || held.has(code) || !pad) return;
       held.add(code);
       onKey();
-      if (pad !== visible) this.say(`▶ ${b.label || b.id} (${pad.name})`);
-      this.controller(pad, b).key(eventTime(e));
+      // Not on screen: nobody sees a result it keeps there, so the key presses it (not just clears that).
+      const offscreen = pad !== visible;
+      const what = this.controller(pad, b).key(eventTime(e), offscreen);
+      if (offscreen) this.sayKey(pad, b, what);
     };
     const up = (e: KeyboardEvent) => {
       if (held.delete(e.code || e.key)) e.preventDefault();

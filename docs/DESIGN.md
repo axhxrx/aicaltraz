@@ -187,7 +187,9 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
     stdout, last non-empty stderr line; spawn error → the error message. Truncate to 200 chars.
   - Result, status and latched text are sanitized: ANSI CSI/OSC/DCS sequences, C0/C1 control
     characters and bidi overrides/isolates (U+202A–U+202E, U+2066–U+2069) are removed, tabs become
-    spaces. Cut between graphemes, with an ellipsis.
+    spaces. Cut between graphemes, with an ellipsis. So are `RunRecord.error` and every host log
+    line (what they quote from labels, paths, scripts' `#!` lines, a broken file's parse error),
+    which keep only their own line breaks.
   - A last line without a newline counts, even while a background process holds the pipe open.
   - Output is read in turns with everything else: a flood (`yes`) can't stall timers or other presses.
   - When the main process has exited and its pipes had 250 ms to drain, the host closes its ends
@@ -202,7 +204,10 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 - Run log (`RunRecord`, admin): `command` (what ran: the argv shell-quoted, `/bin/sh -c '…'` for a
   shell action), `cwd` (resolved), `error` (the spawn failure in full, or how the host stopped it).
 - Durations and throttles use a monotonic clock; only `startedAt`/`endedAt` are wall-clock (epoch ms).
-- Keep only tails in memory: 16 KB per stream per run; last 20 runs per button.
+- Keep only tails in memory: 16 KB per stream per run; last 20 runs per button. A button removed
+  (or renamed) by a config change takes its runs with it, except a run the change killed: its
+  record stays until the next config change. Over all buttons, at most 32 MB of output: past
+  that, the oldest runs that hold output are dropped first.
 
 ### State store
 
@@ -238,7 +243,11 @@ WebSocket connection and per client address (all of an address's connections and
 together: more sockets don't buy a device more presses), so one press token can't lock everyone
 out; one over all sources of bursts of 40, then 20/s; and at most 32 runs at a time. A refusal is
 `ignored` over WebSocket and a 503 "host full" over HTTP; logged at most once per 10 s with a
-count. Behind a reverse proxy every client has the proxy's address, and shares these limits (and
+count. Action `none` spawns nothing: it never counts toward the 32 and is never refused by that
+limit. A `none` button with `stops` that has something to stop (a RUNNING button it names that
+isn't being cancelled yet, or a queued re-run) is exempt from the rate limits too, and takes no
+token: an emergency "All off" gets through even right after its device (or everyone) used up the
+bursts. With nothing to stop it is an ordinary press, so a flood of it is still limited. Behind a reverse proxy every client has the proxy's address, and shares these limits (and
 the 16-connection cap).
 
 Queue: when a run with a queued re-run ends, its result is broadcast (with `queued: true`) and shown
@@ -248,9 +257,11 @@ are going.
 
 `stops` and `none`: a press that will start a run (a queued re-run too) first cancels every RUNNING
 button its patterns name (`pad/button`, `pad/*`, `*`; never itself), whatever their own
-`whileRunning`, and drops their queued re-runs (also one waiting out its result). Those runs end
-FAILURE `cancelled` with the text `Stopped by <label>`. Action `none` runs nothing: success at once,
-text `Stopped N` when it stopped N > 0 runs, else `Done`.
+`whileRunning`, and drops their queued re-runs (also one waiting out its result, and one behind a
+run whose process already exited: too late to cancel, it ends as what it was, but without the
+re-run). Those runs end FAILURE `cancelled` with the text `Stopped by <label>` (sanitized; the id
+when nothing is left of it). Action `none` runs nothing: success at once, text `Stopped N` when it
+stopped N > 0 runs, else `Done`.
 
 Kill reasons, distinct in RunRecord.error and the host log (`■ pad/button #7 1.2s <reason>`):
 `cancelled from a device` (the log adds the connection's address), `stopped by <label>`,
@@ -281,6 +292,15 @@ runs):
   fingerprint) is left alone. Either way the button shows FAILURE `interrupted`
   ("Interrupted: host restarted") for its resultHoldMs, then READY with that as `last`; the run log
   gets a record of it. On Windows there is no fingerprint: nothing is killed.
+- Only a **private** state file is trusted to name processes: owned by the host's user, mode 0600
+  or stricter (`mode & 0o077` = 0, checked on the file as opened), in a folder that isn't group- or
+  world-writable. A fingerprint is no secret (anyone can read `/proc`), so whoever could write any
+  other file could aim that kill at any process group of the host's user. From a file that isn't
+  private, the runs in flight are reported as above but left alone ("pid N left alone: the state
+  file is not private"; once listening, a log line says why) and lose their fingerprints, so they
+  stay inert even once saved again. The rest (run ids, results, latched states: checked, sanitized
+  display data) is used as usual; the next save writes the file 0600. Keys that aren't
+  `pad/button` ids are dropped.
 - A graceful shutdown keeps the runs it stopped in the file (`stopped: "shutdown"`): the next host
   reports them the same way.
 - A missing, unreadable (a FIFO or device is never opened for reading) or unknown-version file:

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { Config, type ConfigInput } from '../src/core/config.ts';
 import type { RunState } from '../src/core/machine.ts';
 import { startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec } from '../src/server/runner.ts';
-import { CANCEL_GRACE_MS, HISTORY_SIZE, START_LIMITS, StateStore, type PressOptions, type StateStoreOptions } from '../src/server/state-store.ts';
+import { CANCEL_GRACE_MS, HISTORY_OUTPUT_MAX, HISTORY_SIZE, START_LIMITS, StateStore, type PressOptions, type StateStoreOptions } from '../src/server/state-store.ts';
 import { cleanupTmp, isAlive, padConfig, tmpDir, waitFor, writeExecutable } from './helpers.ts';
 
 afterAll(cleanupTmp);
@@ -246,6 +246,65 @@ describe('StateStore', () => {
     expect(store.get('p/a')).toEqual({ phase: 'ready', runId: 1 });
     press('a');
     expect(store.get('p/a')).toMatchObject({ phase: 'running', runId: 2 });
+  });
+
+  test('run history goes with its button (removed or renamed); a run still going keeps its record until the next config change; ids continue', () => {
+    const { store, runs, press } = setup([
+      { id: 'a', x: 0, y: 0, action: shell('x') },
+      { id: 'b', x: 1, y: 0, action: shell('x') },
+    ]);
+    for (let i = 0; i < 3; i++) {
+      press('a');
+      runs.at(-1)!.exit();
+    }
+    press('b');
+    const b = runs.at(-1)!;
+    store.setConfig(Config.parse(padConfig([{ id: 'a2', x: 0, y: 0, action: shell('x') }]))); // a renamed, b removed while it runs
+    expect(store.runs({ button: 'a' })).toEqual([]);
+    // What the change stopped stays in the run log for now…
+    b.exit({ exitCode: null, signal: 'SIGTERM' });
+    expect(store.runs().map((r) => [r.button, r.reason, r.error])).toEqual([['b', 'cancelled', 'stopped: button removed by a config change']]);
+    // …until the config changes again.
+    store.setConfig(Config.parse(padConfig([{ id: 'a', x: 0, y: 0, action: shell('x') }])));
+    expect(store.runs()).toEqual([]);
+    expect(press('a')).toBe('started');
+    expect(store.get('p/a')).toMatchObject({ phase: 'running', runId: 4 });
+  });
+
+  test('a config that renames a button again and again keeps the history of the current one only', () => {
+    const big = 'x'.repeat(16 * 1024);
+    const { store, runs } = setup([{ id: 'b0', x: 0, y: 0, action: shell('x') }]);
+    for (let i = 0; i < 40; i++) {
+      store.setConfig(Config.parse(padConfig([{ id: `b${i}`, x: 0, y: 0, action: shell('x') }])));
+      for (let k = 0; k < HISTORY_SIZE; k++) {
+        store.press('p', `b${i}`);
+        runs.at(-1)!.exit({ stdout: big, stderr: big });
+      }
+    }
+    const all = store.runs();
+    expect(new Set(all.map((r) => r.button))).toEqual(new Set(['b39']));
+    expect(all.length).toBe(HISTORY_SIZE);
+  });
+
+  test(`over all buttons the run log keeps at most HISTORY_OUTPUT_MAX of output: the oldest runs holding output go first`, () => {
+    const big = 'x'.repeat(16 * 1024); // a full tail, both streams: 32 K characters a run
+    const n = Math.ceil(HISTORY_OUTPUT_MAX / (2 * big.length) / HISTORY_SIZE) + 8;
+    const buttons = [{ id: 'quiet', x: 0, y: 0, action: shell('x') }, ...Array.from({ length: n }, (_, i) => ({ id: `b${i}`, x: (i + 1) % 10, y: Math.floor((i + 1) / 10), action: shell('x') }))];
+    const { store, runs, press } = setup(buttons, {}, { cols: 10, rows: Math.ceil((n + 1) / 10) });
+    press('quiet');
+    runs.at(-1)!.exit({ stdout: '', stderr: '' });
+    for (let i = 0; i < n; i++)
+      for (let k = 0; k < HISTORY_SIZE; k++) {
+        press(`b${i}`);
+        runs.at(-1)!.exit({ stdout: big, stderr: big });
+      }
+    const all = store.runs();
+    const chars = all.reduce((sum, r) => sum + r.stdout.length + r.stderr.length, 0);
+    expect(chars).toBeLessThanOrEqual(HISTORY_OUTPUT_MAX);
+    expect(chars).toBeGreaterThan(HISTORY_OUTPUT_MAX / 2);
+    expect(all[0]).toMatchObject({ button: `b${n - 1}`, runId: HISTORY_SIZE }); // the newest stay…
+    expect(store.runs({ button: 'b0' })).toEqual([]); // …the oldest with output went…
+    expect(store.runs({ button: 'quiet' }).length).toBe(1); // …but not a record without any
   });
 
   test('setConfig: changing a running button keeps the current run, new settings apply next time', () => {

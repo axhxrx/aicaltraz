@@ -12,7 +12,7 @@ import type { RunState } from '../src/core/machine.ts';
 import type { RunRecord } from '../src/core/protocol.ts';
 import { HOST_FULL, MAX_CLIENTS_PER_ADDRESS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
 import { BucketMap, ThrottledLog, TokenBucket } from '../src/server/limits.ts';
-import { clip, LATCHED_MAX, parseDirective, sanitize, startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec, type RunUpdate } from '../src/server/runner.ts';
+import { clip, LATCHED_MAX, parseDirective, sanitize, sanitizeLog, startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec, type RunUpdate } from '../src/server/runner.ts';
 import { matchesStop, runEndLine, START_LIMITS, StateStore, STOP_REASONS, type PressOptions, type StateStoreOptions } from '../src/server/state-store.ts';
 import { cleanupTmp, eventually, padConfig, TestClient, tmpDir, waitFor, writeExecutable, writeJson } from './helpers.ts';
 
@@ -25,6 +25,8 @@ class FakeRun implements RunHandle {
   readonly pid = undefined;
   kills = 0;
   finished = false;
+  /** The action exited, its output is still draining: a kill no longer reaches anything. */
+  draining = false;
   readonly done: Promise<RunOutcome>;
   private resolve!: (o: RunOutcome) => void;
   constructor(
@@ -35,11 +37,11 @@ class FakeRun implements RunHandle {
   }
   kill() {
     this.kills++;
-    return !this.finished;
+    return !this.finished && !this.draining;
   }
   forceKill() {}
   alive() {
-    return !this.finished;
+    return !this.finished && !this.draining;
   }
   dying() {
     return false;
@@ -196,6 +198,73 @@ describe('stops + action none', () => {
   });
 });
 
+describe('emergency stops: a `none` button with `stops` is never refused', () => {
+  const stopPad = (n: number) =>
+    padConfig(
+      [
+        ...Array.from({ length: n }, (_, i) => ({ id: `b${i}`, x: i % 6, y: Math.floor(i / 6), action: shell('x') })),
+        { id: 'done', x: 4, y: 3, action: { type: 'none' as const } }, // runs nothing, stops nothing
+        { id: 'off', label: 'All off', x: 5, y: 3, stops: ['*'], action: { type: 'none' as const } },
+      ],
+      { cols: 6, rows: 4 },
+    );
+
+  test('at maxRunning "All off" still starts and stops everything; `none` never counts toward maxRunning nor is refused by it', async () => {
+    const { store, runOf, press } = fakeStore(stopPad(3), { limits: { burst: 1e9, perSec: 0, maxRunning: 2, sourceBurst: 1e9, sourcePerSec: 0 } });
+    press('p', 'b0');
+    press('p', 'b1');
+    expect(press('p', 'b2')).toMatchObject({ result: 'ignored', refused: 'busy' });
+    expect(press('p', 'done').result).toBe('started');
+    expect(store.running).toBe(2); // the `none` run isn't one
+    expect(press('p', 'off').result).toBe('started');
+    for (const k of ['p/b0', 'p/b1']) {
+      expect(runOf(k)!.kills).toBe(1);
+      expect(store.get(k)).toMatchObject({ phase: 'running', cancelling: true });
+    }
+    await waitFor(() => store.get('p/off')?.phase === 'success', 1000, 'All off to finish');
+    expect(store.get('p/off')).toMatchObject({ text: 'Stopped 2' });
+  });
+
+  test('after a device used up its presses, and all devices theirs, "All off" still gets through; with nothing (new) to stop it is an ordinary press', async () => {
+    const { store, runOf, press } = fakeStore(stopPad(10), { limits: { burst: 1e9, perSec: 0, maxRunning: 1e9, sourceBurst: 10, sourcePerSec: 0 } });
+    const device = store.newSource('ws 10.0.0.5', '10.0.0.5');
+    for (let i = 0; i < 10; i++) expect(press('p', `b${i}`, { source: device }).result).toBe('started');
+    expect(press('p', 'done', { source: device })).toMatchObject({ result: 'ignored', refused: 'rate' }); // no `stops`: limited like any press
+    expect(press('p', 'off', { source: device }).result).toBe('started');
+    for (let i = 0; i < 10; i++) expect(runOf(`p/b${i}`)!.kills).toBe(1);
+    await waitFor(() => store.get('p/off')?.phase === 'success', 1000, 'All off to finish');
+    expect(store.get('p/off')).toMatchObject({ text: 'Stopped 10' });
+    // They're all on their way down: pressing it again stops nothing new, so a flood of it is still limited.
+    expect(press('p', 'off', { source: device })).toMatchObject({ result: 'ignored', refused: 'rate' });
+
+    // The limit over all devices together.
+    const all = fakeStore(stopPad(4), { limits: { burst: 3, perSec: 0, maxRunning: 1e9, sourceBurst: 1e9, sourcePerSec: 0 } });
+    for (let i = 0; i < 3; i++) all.press('p', `b${i}`, { source: all.store.newSource(`ws 10.0.1.${i}`) });
+    expect(all.press('p', 'b3')).toMatchObject({ result: 'ignored', refused: 'rate' });
+    expect(all.press('p', 'off').result).toBe('started');
+    for (let i = 0; i < 3; i++) expect(all.runOf(`p/b${i}`)!.kills).toBe(1);
+  });
+
+  test("a stop that lands while a run's output is still draining (its process exited) still drops the run's queued re-run", async () => {
+    const { store, runs, runOf, press } = fakeStore(twoPads());
+    press('lights', 'fill');
+    expect(press('lights', 'fill').result).toBe('queued');
+    const fill = runOf('lights/fill')!;
+    fill.draining = true;
+    expect(press('lights', 'off').result).toBe('started');
+    // Too late to cancel (it ends as what it was), not too late to drop what was queued behind it.
+    expect(store.get('lights/fill')).toMatchObject({ phase: 'running' });
+    expect(store.get('lights/fill')).not.toHaveProperty('queued');
+    expect(store.get('lights/fill')).not.toHaveProperty('cancelling');
+    fill.exit({ exitCode: 0, text: 'filled' });
+    expect(store.get('lights/fill')).toMatchObject({ phase: 'success', text: 'filled' });
+    expect(store.get('lights/fill')).not.toHaveProperty('queued');
+    await Bun.sleep(1200); // past REQUEUE_GAP_MS
+    expect(runs.length).toBe(1);
+    expect(store.get('lights/fill')?.phase).toBe('success');
+  });
+});
+
 describe('kill reasons', () => {
   test('RunRecord.error says who stopped a run: a device, another button, a config change, the shutdown, the timeout', async () => {
     const { store, runOf, press } = fakeStore({
@@ -223,7 +292,17 @@ describe('kill reasons', () => {
     press('p', 'stop');
     runOf('p/s')!.exit({ exitCode: null });
     const removed = runOf('p/gone')!;
-    store.setConfig(Config.parse(padConfig([{ id: 'c', x: 0, y: 0, action: shell('x') }, { id: 't', x: 0, y: 1, timeoutMs: 300, action: shell('x') }, { id: 'z', x: 1, y: 1, action: shell('x') }])));
+    store.setConfig(
+      Config.parse(
+        padConfig([
+          { id: 'c', x: 0, y: 0, action: shell('x') },
+          { id: 's', x: 1, y: 0, action: shell('x') },
+          { id: 'stop', label: 'Stop s', x: 2, y: 0, stops: ['p/s'], action: { type: 'none' } },
+          { id: 't', x: 0, y: 1, timeoutMs: 300, action: shell('x') },
+          { id: 'z', x: 1, y: 1, action: shell('x') },
+        ]),
+      ),
+    );
     removed.exit({ exitCode: null });
     runOf('p/t')!.exit({ exitCode: null, reason: 'timeout' });
     const z = runOf('p/z')!;
@@ -250,6 +329,44 @@ describe('kill reasons', () => {
     expect(runEndLine('p/a', rec({ reason: 'spawn', error: 'command not found: /x/light.sh' }), out({ exitCode: null, text: 'command not found: light.sh' }))).toBe(
       '✗ p/a #3 1.2s could not start: command not found: /x/light.sh',
     );
+  });
+
+  test('a label is display text: its escape sequences and controls reach neither "Stopped by", RunRecord.error nor the log', async () => {
+    const evil = '\u001b[41mEVIL\u001b[0m\u001b]0;pwned\u0007 ‮X‬\nOff\u009b2J';
+    const { store, runOf, press, logs } = fakeStore(
+      padConfig([
+        { id: 'slow', x: 0, y: 0, action: shell('x') },
+        { id: 'off', label: evil, x: 1, y: 0, stops: ['p/slow'], action: { type: 'none' } },
+        { id: 'blank', label: '\u001b[0m\u0007', x: 2, y: 0, stops: ['p/slow'], action: { type: 'none' } },
+      ]),
+      { onRunEnd: (key, r, o, run) => logs.push(runEndLine(key, r, o, run.stopSource)) },
+    );
+    press('p', 'slow');
+    press('p', 'off');
+    runOf('p/slow')!.exit({ exitCode: null, signal: 'SIGTERM' });
+    expect(store.get('p/slow')).toMatchObject({ phase: 'failure', reason: 'cancelled', text: 'Stopped by EVIL X Off' });
+    expect(store.runs({ button: 'slow' })[0]).toMatchObject({ error: 'stopped by EVIL X Off' });
+    // Nothing left of it but the words: the id when that's all there is.
+    press('p', 'slow');
+    press('p', 'blank');
+    runOf('p/slow')!.exit({ exitCode: null, signal: 'SIGTERM' });
+    expect(store.get('p/slow')).toMatchObject({ text: 'Stopped by blank' });
+    expect(store.runs({ button: 'slow' })[0]).toMatchObject({ error: 'stopped by blank' });
+    await Bun.sleep(10);
+    expect(logs).toContainEqual(expect.stringMatching(/^■ p\/slow #1 [\d.]+s stopped by EVIL X Off$/));
+    expect(logs).toContainEqual(expect.stringMatching(/^■ p\/slow #2 [\d.]+s stopped by blank$/));
+    for (const l of logs) expect(l).not.toMatch(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/);
+  });
+
+  test('host log lines carry no escape sequences or controls, whatever the run, the config or a file said', () => {
+    const rec = (o: Partial<RunRecord>): RunRecord => ({ runId: 3, pad: 'p', button: 'a', startedAt: 0, stdout: '', stderr: '', ...o });
+    const out = (o: Partial<RunOutcome> = {}): RunOutcome => ({ exitCode: 0, signal: null, stdout: '', stderr: '', durationMs: 1234, ...o });
+    expect(runEndLine('p/a', rec({ reason: 'spawn', error: 'command not found: /x/\u001b]0;t\u0007l\u009b31m.sh' }), out({ exitCode: null }))).toBe(
+      '✗ p/a #3 1.2s could not start: command not found: /x/l.sh',
+    );
+    expect(runEndLine('p/a', rec({ reason: 'exit' }), out({ text: 'ok\u001b[2J\r\n12:00:00 ✓ fake' }))).toBe('✓ p/a #3 1.2s: ok  12:00:00 ✓ fake');
+    expect(runEndLine('p/a', rec({ reason: 'cancelled', error: 'stopped by ‮All off' }), out({ exitCode: null }))).toBe('■ p/a #3 1.2s stopped by All off');
+    expect(sanitizeLog('config file is invalid:\n  \u001b[31mpad\u001b[0m "x"\u0007\n  ok')).toBe('config file is invalid:\n  pad "x"\n  ok');
   });
 });
 
@@ -513,6 +630,32 @@ describe('over the wire', () => {
     const runs = (await (await fetch(`http://127.0.0.1:${host.port}/api/runs?pad=lights&button=fill`, { headers: { authorization: `Bearer ${host.secrets.adminToken}` } })).json()) as RunRecord[];
     expect(runs[0]).toMatchObject({ reason: 'cancelled', error: 'stopped by All off', command: "/bin/sh -c 'sleep 30'", cwd: host.config.dir });
     expect(host.state.latched()).toEqual({ 'lights/key': 'ON 80%' }); // device state outlives the run
+  });
+
+  test("the host log passes on no escape sequences from labels, paths or files (a reload's warnings neither)", async () => {
+    const evil = '\u001b[41mEVIL\u001b[0m\u001b]0;pwned\u0007';
+    const cfg = padConfig([
+      { id: 'slow', x: 0, y: 0, action: sh('sleep 30') },
+      { id: 'lbl', label: evil, x: 1, y: 0, stops: ['p/slow'], action: { type: 'none' } },
+      { id: 'missing', x: 2, y: 0, action: { type: 'exec', command: `/nonexistent/${evil}x.sh` } },
+    ]);
+    const { dir, ws, logs } = await realHost(cfg);
+    const c = await ws();
+    c.send({ t: 'press', id: '1', pad: 'p', button: 'slow' });
+    await c.next('ack', (m) => m.id === '1');
+    c.send({ t: 'press', id: '2', pad: 'p', button: 'lbl' });
+    c.send({ t: 'press', id: '3', pad: 'p', button: 'missing' });
+    await c.next('state', (m) => m.key === 'p/slow' && m.state.phase === 'failure', 5000);
+    await c.next('state', (m) => m.key === 'p/missing' && m.state.phase === 'failure', 5000);
+    // A hand edit: reloaded, and its warnings logged.
+    cfg.pads[0]!.name = 'Pad 2';
+    writeJson(join(dir, 'buttpad.config.json'), cfg);
+    await eventually(async () => logs.some((l) => l.startsWith('⚠ ')), 5000, 'the reload warnings');
+    await eventually(async () => logs.some((l) => l.startsWith('■ p/slow')), 5000, 'the stop line');
+    expect(logs).toContainEqual(expect.stringMatching(/^■ p\/slow #1 [\d.]+s stopped by EVIL$/));
+    expect(logs).toContainEqual(expect.stringMatching(/^✗ p\/missing #1 [\d.]+s could not start: command not found: \/nonexistent\/EVILx\.sh$/));
+    expect(logs).toContainEqual('⚠ pad "p" › button "missing": command not found: /nonexistent/EVILx.sh');
+    for (const l of logs) expect(l).not.toMatch(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/);
   });
 
   test('a cancel from a device is logged with where it came from', async () => {

@@ -13,12 +13,14 @@
  * Every socket has its own pending presses and timers (Conn), and every handler first checks that
  * its socket is still the current one: a stale socket's late events can't touch a newer one.
  *
- * Every press carries `at`: when it was made, in the host's clock (the offset is learned from each
- * hello's serverNow, corrected for the link's one-way delay as the handshake measured it, and kept
- * with a clock the device's clock setting can't move, lib/clock.ts). A press that sat in a dead
- * link for seconds is dropped by the host (`expired`) instead of running late. One that comes back
- * `expired` within a second of going out can't have been held up: the offset is wrong (the host's
- * clock was set, say), so a new socket (and hello) gets a fresh one.
+ * Every press carries `at`: when it was made (the gesture's own time), in the host's clock. The
+ * offset is learned from each hello's serverNow, which the host stamps when it takes the socket (so
+ * it is taken as of the socket's opening, not as of the hello's arrival: a big config over a slow
+ * link takes seconds more), corrected for the link's one-way delay as the handshake measured it,
+ * and kept with a clock the device's clock setting can't move (lib/clock.ts). A press that sat in
+ * a dead link (or a stalled page) for seconds is dropped by the host (`expired`) instead of running
+ * late. One that comes back `expired` within a second of being made can't have been held up: the
+ * offset is wrong (the host's clock was set, say), so a new socket (and hello) gets a fresh one.
  */
 import type { Config } from '../../core/config.ts';
 import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
@@ -43,7 +45,7 @@ const HELLO_TIMEOUT = 5000;
 const HELLO_TIMEOUT_MAX = 60_000;
 /** Offline and someone touched a button: a connection attempt older than this is given up for a new one. */
 const KICK_STALE_CONNECT = 1500;
-/** A press answered `expired` quicker than this wasn't held up anywhere: the clock offset is off. */
+/** A press answered `expired` quicker than this after it was made wasn't held up anywhere: the clock offset is off. */
 const FRESH_PRESS_MS = 1000;
 /** Visible and not a single frame for this long → probe. */
 const IDLE_PROBE = 5000;
@@ -175,8 +177,9 @@ export class WsBackend implements Backend {
   }
 
   /**
-   * How long the hello took to get here, from its serverNow: about half a round trip. Opening the
-   * socket took about two (TCP connect, then the upgrade), so a quarter of that (at most 1 s).
+   * How long the upgrade's answer took to get here from when the host stamped serverNow: about half
+   * a round trip. Opening the socket took about two (TCP connect, then the upgrade), so a quarter of
+   * that (at most 1 s).
    */
   private oneWay(c: Conn): number {
     const opening = (c.upAt || c.greetedAt) - c.openedAt;
@@ -335,8 +338,10 @@ export class WsBackend implements Backend {
           config: m.config,
           rev: m.rev,
           states: m.states,
-          // serverNow is a moment old by the time it gets here.
-          clockSkew: wall() - (m.serverNow + this.oneWay(c)),
+          // The host stamps serverNow when it takes the socket, and the hello can take seconds more
+          // (a big config, a slow link): the offset is as of the socket's opening (its upgrade
+          // answer), a moment after the stamp.
+          clockSkew: wall() - (mono() - (c.upAt || mono())) - (m.serverNow + this.oneWay(c)),
           host: m.host,
           retryAt: null,
           // A v1 host has no latched state.
@@ -387,8 +392,11 @@ export class WsBackend implements Backend {
     if (c?.greeted && c.ws.readyState !== WebSocket.OPEN) this.lost(c);
     if (this.snapshot.get().status !== 'online' || this.conn !== c || !c?.greeted) return Promise.reject(new PressError(false, 'not connected to the host'));
     const id = `${Date.now().toString(36)}${(++this.seq).toString(36)}`;
-    // When it was made, in the host's clock: the host drops it if it got there too late.
-    const msg: ClientMsg = { t: 'press', id, pad, button, at: Math.round(wall() - this.snapshot.get().clockSkew), ...(opts.confirm ? { confirm: true } : {}) };
+    // When it was made (the gesture's time: a stalled page gets here late), in the host's clock:
+    // the host drops it if it got there too late.
+    const made = Math.min(mono(), opts.at ?? Infinity);
+    const at = Math.round(wall() - (mono() - made) - this.snapshot.get().clockSkew);
+    const msg: ClientMsg = { t: 'press', id, pad, button, at, ...(opts.confirm ? { confirm: true } : {}) };
     return new Promise((resolve, reject) => {
       try {
         c.ws.send(JSON.stringify(msg));
@@ -400,8 +408,8 @@ export class WsBackend implements Backend {
         resolve: (ack) => {
           opts.onAck?.(ack);
           resolve(ack.result);
-          // Too old by the host's clock, yet it took no time at all: our idea of the host's clock is off.
-          if (ack.result === 'expired' && mono() - sentAt < FRESH_PRESS_MS && this.conn === c) {
+          // Too old by the host's clock, yet made just now: our idea of the host's clock is off.
+          if (ack.result === 'expired' && mono() - made < FRESH_PRESS_MS && this.conn === c) {
             console.warn('[buttpad] a fresh press was dropped as too old: the clock offset is off; reconnecting for a new one');
             this.lost(c);
           }

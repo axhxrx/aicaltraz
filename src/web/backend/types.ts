@@ -56,6 +56,12 @@ export const TOO_LARGE = 'config too large (max 1 MB)';
 export interface PressOpts {
   /** The user went through the button's confirm step (the host requires it for `confirm` buttons). */
   confirm?: boolean;
+  /**
+   * When the press was made: mono() (lib/env.ts), the clock of input events' own time stamps. A
+   * stalled page sends it late; the press still says when the user made it (the `at` it carries,
+   * in the host's clock), so the host drops it if that was too long ago. Absent: now.
+   */
+  at?: number;
   /** Runs when the press is on the wire. */
   onSent?: () => void;
   /** The host's whole answer, right before the promise resolves with its `result`. */

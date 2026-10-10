@@ -11,9 +11,11 @@
  *
  * Which runs are this device's: only the ones an ack says it started (or queued). A run that
  * shows up with no ack of ours behind it is another device's: no outcome buzz, a small mark.
+ * Run ids that go backwards (a host that started over without its state file, the demo's Reset)
+ * mean the runs remembered here are gone: that memory starts over.
  */
 import type { LastResult, RunState } from '../../core/machine.ts';
-import type { PressResult, WireButton } from '../../core/protocol.ts';
+import { PRESS_MAX_AGE_MS, type PressResult, type WireButton } from '../../core/protocol.ts';
 import { PressError, type PressAck } from '../backend/types.ts';
 import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
@@ -32,7 +34,11 @@ export const CONFIRM_MIN_MS = 400;
 export const ROUGH = { tapMinMs: 80, cooldownMs: 800, drift: 1.5 };
 /** Two keydowns closer than this are a bouncing key, not a double press. */
 const KEY_DOUBLE_MIN_MS = 60;
-/** After NO RESPONSE, a host state showing that the press did run counts as ours for this long. */
+/**
+ * After NO RESPONSE, a host state showing that the press did run counts as ours for this long (a
+ * run that started more than PRESS_MAX_AGE_MS after the press was made never does: the host drops
+ * a press that old).
+ */
 const OUTCOME_WINDOW_MS = 30_000;
 const FLASH_MS = 1200;
 const SHORT_FLASH_MS = 700;
@@ -57,6 +63,14 @@ export type FlashKind = 'busy' | 'cooldown' | 'later' | 'already' | 'queued' | '
 
 /** How the press that asked for a confirmation was made: the CONFIRM face says it the same way. */
 export type Via = 'key' | 'hold' | 'tap' | 'double';
+
+/**
+ * What a key press did (a key for a button on another pad says it in a toast): sent; confirm (the
+ * confirm step: press again); again (the first press of a double); cooldown (too soon after the
+ * last fire, ignored); busy (the last press is still on its way); offline (not connected); cleared
+ * (it cleared a result kept on screen); none (a bounce, a finger on the button).
+ */
+export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'offline' | 'cleared' | 'none';
 
 /**
  * A result this device shows on its own, on top of what the host says:
@@ -108,16 +122,41 @@ export interface ControllerCtx {
   /** The button as the config says now (live, not a copy from the last render). */
   button(): WireButton;
   host(): RunState;
+  /** Add to a host timestamp to get a local (wall()) one (Snapshot.clockSkew). */
+  skew(): number;
   online(): boolean;
   rough(): boolean;
-  /** Sends a press. `onAck` gets the host's answer; the promise rejects with a PressError when there is none. */
-  press(opts: { confirm: boolean; onSent(): void; onAck(ack: PressAck): void }): Promise<unknown>;
+  /**
+   * Sends a press made at `at` (mono(): the gesture's own time, which a stalled page may have left
+   * behind). `onAck` gets the host's answer; the promise rejects with a PressError when there is none.
+   */
+  press(opts: { confirm: boolean; at: number; onSent(): void; onAck(ack: PressAck): void }): Promise<unknown>;
   /** The link looks dead, or someone touched a button while offline: check / reconnect now. */
   kick(): void;
-  /** May a contact start a press here at `t` (rough mode: one button at a time per pad; a palm)? */
+  /**
+   * A contact landed here at `t`: may it start a press (rough mode: one button at a time per pad;
+   * a palm)? Every contact counts for palm detection, also the ones refused.
+   */
   mayStart(t: number): boolean;
-  /** A press began at `t` (palm detection). */
-  started(t: number): void;
+}
+
+/** A press that went out: what NO RESPONSE needs to tell, later, whether a run was its doing. */
+interface Sent {
+  /** The run the host showed when it went out. */
+  baseRunId: number;
+  /** wall() when it was made, and the clock offset it went out with: its `at` was made - skew. */
+  made: number;
+  skew: number;
+  /** Pressed on a running queue button: what it starts is the re-run after that run. */
+  queue: boolean;
+}
+
+/** NO RESPONSE: if the host turns out to have run the press, show that (onHost). */
+interface Outcome extends Sent {
+  /** wall() it stops counting. */
+  until: number;
+  /** queue: the run it would wait for ended (or is being cancelled) with a re-run still coming. */
+  requeued: boolean;
 }
 
 const idle = (): Local => ({
@@ -190,13 +229,19 @@ export class ButtonController {
   private tapConfirmed = false;
   private tapWindow: Local['confirm'] = null;
   /** A press that got no answer: if the host turns out to have run it, show that. */
-  private outcome: { baseRunId: number; until: number } | null = null;
+  private outcome: Outcome | null = null;
   /** The press NO RESPONSE is about: its answer may still come (a link that recovers delivers it late). */
   private lateSeq = 0;
   /** Own runs whose outcome has been cued (and kept on screen, if it failed). */
   private handled: number[] = [];
   /** Runs that showed up while a press of ours was unanswered: ours or not, the ack will say. */
   private unclaimed: number[] = [];
+  /**
+   * A `queued` ack: the re-run after run `behind` is ours, unless that run ends (or is cancelled)
+   * without it (All off, a cancel, a host restart). `seen`: the state when the ack came, which on a
+   * host predates the press (its state broadcast follows the ack): not a sign of anything.
+   */
+  private queuedBehind: { behind: number; seen: RunState | undefined } | null = null;
   private lastRunId = -1;
 
   setCtx(ctx: ControllerCtx): void {
@@ -236,6 +281,12 @@ export class ButtonController {
     this.unclaimed = this.unclaimed.filter((r) => r !== runId);
   }
 
+  /** A `queued` ack: the run after `behind` is ours, as long as it is still coming (followQueued). */
+  private claimQueued(behind: number) {
+    this.claim(behind + 1);
+    this.queuedBehind = { behind, seen: this.ctx?.host() };
+  }
+
   private cooldown(): number {
     const b = this.ctx?.button();
     return Math.max(b?.cooldownMs ?? 0, this.ctx?.rough() ? ROUGH.cooldownMs : 0);
@@ -267,8 +318,14 @@ export class ButtonController {
    * runs into ours and others', cues and keeps the outcome of ours.
    */
   onHost(host: RunState, live = true): void {
+    // Run ids went backwards: the host started over (no state file; the demo's Reset).
+    if (host.runId < this.lastRunId) this.forget(host);
     const s = this.l.sending;
     if (s?.acked && host.runId > s.baseRunId) this.patch({ sending: null });
+    this.followQueued(host);
+    const o = this.outcome;
+    if (o && wall() > o.until) this.outcome = null;
+    else if (o) this.resolve(o, host);
     if (host.runId > this.lastRunId && host.phase !== 'ready') {
       // A run we didn't see coming: whose is it? An unanswered press of ours may have started it.
       const fresh = host.runId;
@@ -278,28 +335,77 @@ export class ButtonController {
       }
     }
     this.lastRunId = Math.max(this.lastRunId, host.runId);
-
-    const o = this.outcome;
-    if (o && wall() > o.until) this.outcome = null;
-    else if (o && host.runId > o.baseRunId) {
-      // The press that got no answer did reach the host: show what it did, not NO RESPONSE.
-      this.outcome = null;
-      const ran = host.phase === 'ready' ? host.last?.runId ?? host.runId : host.runId;
-      this.claim(ran);
-      if (this.l.result?.kind === 'noresponse') this.patch({ result: null });
-      // Already back to READY: show how it ended (or, if the host no longer knows, that it ran).
-      if (host.phase === 'ready' && !(host.last && host.last.runId === ran && !host.last.ok)) {
-        this.markHandled(ran);
-        const holdMs = this.ctx?.button().resultHoldMs ?? 2500;
-        const last = host.last?.runId === ran ? host.last : undefined;
-        this.setResult({ kind: 'ran', runId: ran, at: wall(), until: wall() + Math.max(holdMs, 1500), ...(last ? { last } : {}) });
-        if (last) cue(last.ok ? 'success' : last.reason === 'interrupted' ? 'unknown' : 'failure');
-      }
-    }
-    // A result kept on screen gives way to a newer run (NO RESPONSE's newer run is its outcome, above).
+    // A result kept on screen gives way to a newer run (NO RESPONSE only once that run turned out
+    // not to be its outcome, above).
     const r = this.l.result;
-    if (r && host.runId > r.runId && r.kind !== 'noresponse') this.patch({ result: null });
+    if (r && host.runId > r.runId && (r.kind !== 'noresponse' || !this.outcome)) this.patch({ result: null });
     this.settle(host);
+  }
+
+  /**
+   * NO RESPONSE: does the host's state show that the press did reach it? A newer run is its doing,
+   * unless that run started more than PRESS_MAX_AGE_MS after the press was made (the host drops a
+   * press that old, so that's someone else's), or, for a press on a running queue button, it is the
+   * re-run after the run it pressed on, and that run ended with the re-run still coming.
+   */
+  private resolve(o: Outcome, host: RunState) {
+    if (host.runId === o.baseRunId) {
+      // The run a queue press would wait for: is a re-run coming after it?
+      if (o.queue && (host.phase !== 'running' || host.cancelling)) o.requeued = host.phase !== 'ready' && !!host.queued;
+      return;
+    }
+    if (host.runId < o.baseRunId) return;
+    this.outcome = null;
+    const ran = host.phase === 'ready' ? host.last?.runId ?? host.runId : host.runId;
+    const late = host.phase !== 'ready' && host.startedAt + o.skew > o.made + PRESS_MAX_AGE_MS + 1;
+    if (late && !(o.queue && o.requeued && ran === o.baseRunId + 1)) return;
+    // The press that got no answer did reach the host: show what it did, not NO RESPONSE.
+    this.claim(ran);
+    if (this.l.result?.kind === 'noresponse') this.patch({ result: null });
+    // Already back to READY: show how it ended (or, if the host no longer knows, that it ran).
+    if (host.phase === 'ready' && !(host.last && host.last.runId === ran && !host.last.ok)) {
+      this.markHandled(ran);
+      const holdMs = this.ctx?.button().resultHoldMs ?? 2500;
+      const last = host.last?.runId === ran ? host.last : undefined;
+      this.setResult({ kind: 'ran', runId: ran, at: wall(), until: wall() + Math.max(holdMs, 1500), ...(last ? { last } : {}) });
+      if (last) cue(last.ok ? 'success' : last.reason === 'interrupted' ? 'unknown' : 'failure');
+    }
+  }
+
+  /**
+   * A re-run this device queued: is it still coming? Not once the run it waits for ends, or is
+   * being cancelled, without it (All off, a cancel, a host restart): then the run after that one,
+   * whoever starts it, isn't this device's.
+   */
+  private followQueued(host: RunState) {
+    const q = this.queuedBehind;
+    if (!q || host === q.seen) return;
+    if (host.runId > q.behind) this.queuedBehind = null;
+    else if (host.runId === q.behind && (host.phase === 'ready' || (!host.queued && (host.phase !== 'running' || host.cancelling)))) {
+      this.patch({ own: this.l.own.filter((r) => r !== q.behind + 1) });
+      this.queuedBehind = null;
+    }
+  }
+
+  /**
+   * Run ids started over: the runs remembered here are gone, and their ids will name new ones. A
+   * result kept on screen stays until touched (the next run supersedes it, as usual); one that a
+   * newer run had superseded already doesn't come back.
+   */
+  private forget(host: RunState) {
+    const { result: r, sending } = this.l;
+    const shown = !!r && r.runId >= this.lastRunId && (r.until === undefined || wall() < r.until);
+    this.handled = [];
+    this.unclaimed = [];
+    this.outcome = null;
+    this.queuedBehind = null;
+    this.lastRunId = host.runId;
+    this.patch({ own: [], others: [], ...(sending ? { sending: { ...sending, baseRunId: Math.min(sending.baseRunId, host.runId) } } : {}) });
+    if (r && shown) this.setResult({ ...r, runId: host.runId });
+    else if (r) {
+      this.clear('result');
+      this.patch({ result: null });
+    }
   }
 
   private markHandled(runId: number) {
@@ -405,9 +511,7 @@ export class ButtonController {
       this.patch({ input: 'arming', armAt: now - Math.max(0, mono() - t), armMs: b.holdMs });
       this.after('hold', Math.max(0, t + b.holdMs - mono()), () => this.holdDue(next, false));
     } else if (!dismissed) this.patch({ input: 'pressed' });
-    // Last: this may turn out to be one contact of a palm, and get dropped right here.
-    ctx.started(t);
-    return this.g === next;
+    return true;
   }
 
   /**
@@ -421,11 +525,12 @@ export class ButtonController {
     this.fireGesture(g);
   }
 
-  private fireGesture(g: Gesture) {
+  /** The press fired: made when the hold reached holdMs, or when the tap's last contact lifted (`t`). */
+  private fireGesture(g: Gesture, t = mono()) {
     g.fired = true;
     this.clear('hold');
     this.patch({ input: 'idle' });
-    this.fire(g.trigger === 'hold' ? 'hold' : g.trigger, g.confirmed, g);
+    this.fire(g.trigger === 'hold' ? 'hold' : g.trigger, g.confirmed, g.trigger === 'hold' ? g.t0 + g.holdMs : t, g);
   }
 
   /**
@@ -480,7 +585,7 @@ export class ButtonController {
     // A graze isn't a tap; a thumb resting on a tap button and lifting later isn't either.
     if (held < g.tapMinMs) return this.cancelGesture(g, 'quiet');
     if (held > TAP_MAX_MS) return this.cancelGesture(g, 'buzz');
-    if (g.trigger === 'tap' || g.second) return this.fireGesture(g);
+    if (g.trigger === 'tap' || g.second) return this.fireGesture(g, t);
     // First tap of a double: wait for the second.
     [this.tapAt, this.tapConfirmed, this.tapWindow] = [t, g.confirmed, g.window];
     this.patch({ input: 'double' });
@@ -500,42 +605,47 @@ export class ButtonController {
   /**
    * A mapped key went down at `t` (auto-repeat already filtered out). Keys don't hold: clickers
    * send keydown and keyup together, so hold and tap buttons fire right away, and a double fires
-   * on the second keydown within DOUBLE_TAP_MS. Confirm and cooldown still apply.
+   * on the second keydown within DOUBLE_TAP_MS. Confirm and cooldown still apply. A result kept on
+   * screen takes the key (it only clears it), unless the button is `offscreen` (on another pad):
+   * then nobody sees that result to clear, and the key press is a press. Says what it did.
    */
-  key(t = mono()): void {
+  key(t = mono(), offscreen = false): KeyResult {
     const ctx = this.ctx;
-    if (!ctx) return;
+    if (!ctx) return 'none';
     unlockAudio();
     if (!ctx.online()) {
       this.deny();
       ctx.kick();
-      return;
+      return 'offline';
     }
     // A finger is on it already.
-    if (this.g) return;
+    if (this.g) return 'none';
     const now = wall();
-    // A result kept on screen: this key press is for it.
     if (resultShown(this.l, ctx.host(), now)) {
       this.clear('result');
       this.patch({ result: null });
-      haptic('touch');
-      return;
+      // A result kept on screen: this key press is for it.
+      if (!offscreen) {
+        haptic('touch');
+        return 'cleared';
+      }
     }
     const c = this.l.confirm && this.l.confirm.until > now ? this.l.confirm : null;
     // A key that bounces (or chatters) right after CONFIRM came up doesn't confirm.
-    if (c && now - Math.max(0, mono() - t) - c.at < Math.max(CONFIRM_MIN_MS, this.cooldown())) return;
-    if (ctx.button().trigger !== 'double') return this.fire('key', !!c);
+    if (c && now - Math.max(0, mono() - t) - c.at < Math.max(CONFIRM_MIN_MS, this.cooldown())) return 'none';
+    if (ctx.button().trigger !== 'double') return this.fire('key', !!c, t);
     if (this.tapAt > 0 && t - this.tapAt <= DOUBLE_TAP_MS) {
       // A bouncing key: not a second press.
-      if (t - this.tapAt < KEY_DOUBLE_MIN_MS) return;
+      if (t - this.tapAt < KEY_DOUBLE_MIN_MS) return 'none';
       this.tapAt = 0;
       this.clear('double');
       this.patch({ input: 'idle' });
-      return this.fire('key', this.tapConfirmed);
+      return this.fire('key', this.tapConfirmed, t);
     }
     [this.tapAt, this.tapConfirmed, this.tapWindow] = [t, !!c, null];
     this.patch({ input: 'double' });
     this.after('double', DOUBLE_TAP_MS, () => this.patch({ input: 'idle' }));
+    return 'again';
   }
 
   private deny() {
@@ -545,20 +655,21 @@ export class ButtonController {
 
   // ---- firing ---------------------------------------------------------------------------------
 
-  private fire(via: Via, confirmed: boolean, g?: Gesture) {
+  /** A press fired (made at `at`, mono()): send it, or ask for the confirm step, or say why not. */
+  private fire(via: Via, confirmed: boolean, at: number, g?: Gesture): KeyResult {
     const ctx = this.ctx;
-    if (!ctx) return;
+    if (!ctx) return 'none';
     // Pressed again right after a fire: a bounce, a chattering key. Ignored, without a buzz.
     if (mono() - this.lastFire < this.cooldown()) {
       this.restoreWindow(g?.window ?? null);
       this.flash('cooldown', SHORT_FLASH_MS);
-      return;
+      return 'cooldown';
     }
     // The last press is still on its way: say so, rather than buzz "fired" and drop this one.
     if (this.l.sending) {
       this.flash('busy');
       cue('busy');
-      return;
+      return 'busy';
     }
     const button = ctx.button();
     const host = ctx.host();
@@ -567,18 +678,22 @@ export class ButtonController {
     if (g?.idle0 && host.phase === 'running' && host.runId > g.runId0 && !this.isOwn(host.runId)) {
       this.flash('already');
       cue('busy');
-      return;
+      return 'none';
     }
     const now = wall();
     this.lastFire = mono();
     this.patch({ firedAt: now });
     const starts = host.phase !== 'running' || button.whileRunning === 'queue';
-    if (button.confirm && starts && !confirmed) return this.askConfirm(via);
+    if (button.confirm && starts && !confirmed) {
+      this.askConfirm(via);
+      return 'confirm';
+    }
     this.clear('confirm');
     if (this.l.confirm) this.patch({ confirm: null });
     cue('fire');
     this.sentVia = via;
-    this.send(button.confirm && confirmed);
+    this.send(button.confirm && confirmed, at);
+    return 'sent';
   }
 
   private askConfirm(via: Via) {
@@ -589,11 +704,18 @@ export class ButtonController {
     this.after('confirm', ms, () => this.patch({ confirm: null }));
   }
 
-  private send(confirm: boolean) {
+  private send(confirm: boolean, at: number) {
     const ctx = this.ctx;
     if (!ctx) return;
     const seq = ++this.sendSeq;
-    const baseRunId = ctx.host().runId;
+    const host = ctx.host();
+    const baseRunId = host.runId;
+    const press: Sent = {
+      baseRunId,
+      made: wall() - Math.max(0, mono() - at),
+      skew: ctx.skew(),
+      queue: host.phase === 'running' && ctx.button().whileRunning === 'queue',
+    };
     this.outcome = null;
     this.lateSeq = 0;
     this.unclaimed = [];
@@ -605,17 +727,18 @@ export class ButtonController {
     ctx
       .press({
         confirm,
+        at,
         onSent: () => {
           if (seq !== this.sendSeq || sent) return;
           sent = true;
           // The 2 s NO RESPONSE clock starts when the press is on the wire.
-          this.after('ack', ACK_TIMEOUT_MS, () => seq === this.sendSeq && this.noResponse(baseRunId));
+          this.after('ack', ACK_TIMEOUT_MS, () => seq === this.sendSeq && this.noResponse(press));
         },
         onAck: (ack) => (seq === this.sendSeq ? this.onAck(ack, baseRunId) : seq === this.lateSeq && this.onLateAck(ack)),
       })
       .catch((e: unknown) => {
         if (seq !== this.sendSeq || !this.l.sending || this.l.sending.acked) return;
-        if (sent && !(e instanceof PressError && !e.sent)) this.noResponse(baseRunId);
+        if (sent && !(e instanceof PressError && !e.sent)) this.noResponse(press);
         else this.notSent('not connected to the host');
       });
   }
@@ -632,7 +755,7 @@ export class ButtonController {
   }
 
   /** Sent and not answered: it may or may not have run. The host's state will tell (onHost). */
-  private noResponse(baseRunId: number) {
+  private noResponse(press: Sent) {
     const s = this.l.sending;
     if (!s || s.acked) return;
     this.clear('ack');
@@ -640,8 +763,8 @@ export class ButtonController {
     this.lateSeq = this.sendSeq;
     this.sendSeq++;
     this.patch({ sending: null });
-    this.setResult({ kind: 'noresponse', runId: baseRunId, at: now });
-    this.outcome = { baseRunId, until: now + OUTCOME_WINDOW_MS };
+    this.setResult({ kind: 'noresponse', runId: press.baseRunId, at: now });
+    this.outcome = { ...press, until: now + OUTCOME_WINDOW_MS, requeued: false };
     // Not the failure buzz: we don't know that it failed.
     cue('unknown');
     this.ctx?.kick();
@@ -661,10 +784,16 @@ export class ButtonController {
     if (ack.result === 'expired') {
       this.outcome = null;
       this.setResult({ kind: 'notsent', runId: this.l.result.runId, at: wall(), text: 'too late — not sent' });
-    } else if (ack.runId !== undefined && (ack.result === 'started' || ack.result === 'queued')) {
-      this.claim(ack.result === 'queued' ? ack.runId + 1 : ack.runId);
+    } else if (ack.runId !== undefined && ack.result === 'started') {
+      this.claim(ack.runId);
       const host = this.ctx?.host();
       if (host) this.onHost(host);
+    } else if (ack.runId !== undefined && ack.result === 'queued') {
+      // It queued a re-run: that's ours while it's still coming (followQueued), whatever else runs.
+      this.outcome = null;
+      this.claimQueued(ack.runId);
+      this.clear('result');
+      this.patch({ result: null });
     }
   }
 
@@ -695,8 +824,8 @@ export class ButtonController {
         break;
       }
       case 'queued':
-        // The re-run it queued is ours (it starts after the one running now).
-        this.claim((ack.runId ?? host?.runId ?? baseRunId) + 1);
+        // The re-run it queued is ours (it starts after the one running now), while it's coming.
+        this.claimQueued(ack.runId ?? host?.runId ?? baseRunId);
         settleUnclaimed();
         this.patch({ sending: null });
         break;

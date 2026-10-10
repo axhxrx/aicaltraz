@@ -4,13 +4,13 @@
  * as interrupted; a graceful shutdown records what it stopped.
  */
 import { afterAll, afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, readFileSync, statSync, writeFileSync, type Stats } from 'node:fs';
 import { join } from 'node:path';
 import { Config, type ConfigInput } from '../src/core/config.ts';
 import type { RunState } from '../src/core/machine.ts';
 import type { RunRecord, ServerMsg } from '../src/core/protocol.ts';
 import { startHost, type Host } from '../src/server/host.ts';
-import { SAVE_INTERVAL_MS, STATE_FILE, type PersistedState } from '../src/server/persist.ts';
+import { notPrivate, SAVE_INTERVAL_MS, STATE_FILE, type PersistedState } from '../src/server/persist.ts';
 import { processFingerprint } from '../src/server/proc.ts';
 import type { RunHandle, RunHooks, RunOutcome, RunSpec, RunUpdate } from '../src/server/runner.ts';
 import { INTERRUPTED_TEXT, StateStore, type StateStoreOptions } from '../src/server/state-store.ts';
@@ -110,6 +110,11 @@ function storeAt(dir: string, buttons: Buttons, opts: Partial<StateStoreOptions>
 }
 
 const readState = (path: string) => readJson<PersistedState>(path);
+/** A state file as the host writes it (mode 0600): private, so its runs in flight are trusted. */
+function writeState(path: string, state: unknown) {
+  writeJson(path, state);
+  chmodSync(path, 0o600);
+}
 
 describe('across restarts (in-process)', () => {
   test('run ids continue; the last result (READY.last) and latched state come back', async () => {
@@ -182,7 +187,7 @@ describe('across restarts (in-process)', () => {
         { key: 'p/b', runId: 2, pid, pgid: pid, startedAt: Date.now() - 120_000 }, // no fingerprint: never signalled
       ],
     };
-    writeJson(join(dir, STATE_FILE), state);
+    writeState(join(dir, STATE_FILE), state);
     const { store, logs } = storeAt(dir, [
       { id: 'a', x: 0, y: 0, action: shell('x') },
       { id: 'b', x: 1, y: 0, action: shell('x') },
@@ -304,6 +309,123 @@ describe('across restarts (in-process)', () => {
     store.press('p', 'a');
     await store.shutdown(20);
     expect(writes).toBe(0);
+  });
+});
+
+describe.skipIf(!posix)('a state file someone else could have written', () => {
+  /** What anyone who can write the file can put there: a fingerprint is computed from world-readable /proc (`ps` elsewhere). */
+  const forged = (pid: number): PersistedState => ({
+    version: 1,
+    savedAt: Date.now(),
+    buttons: { 'p/a': { lastRunId: 4, latched: 'ON' } },
+    live: [{ key: 'p/a', runId: 5, pid, pgid: pid, startedAt: Date.now() - 1000, fingerprint: processFingerprint(pid)! }],
+  });
+  const buttons: Buttons = [{ id: 'a', x: 0, y: 0, resultHoldMs: 10_000, action: shell('x') }];
+
+  test('private = owned by this user, mode 0600 or stricter, in a folder no one else can write', () => {
+    const dir = tmpDir('buttpad-persist-');
+    const path = join(dir, STATE_FILE);
+    const uid = process.geteuid!();
+    const st = (mode: number, owner = uid) => ({ uid: owner, mode: 0o100000 | mode }) as Stats;
+    expect(notPrivate(path, st(0o600))).toBeUndefined();
+    expect(notPrivate(path, st(0o400))).toBeUndefined();
+    for (const mode of [0o644, 0o640, 0o604, 0o660, 0o606]) expect(notPrivate(path, st(mode))).toBe(`its mode is 0${mode.toString(8)}, not 0600`);
+    expect(notPrivate(path, st(0o600, uid + 1))).toBe(`it is owned by uid ${uid + 1}, not by this host's user (uid ${uid})`);
+    for (const mode of [0o770, 0o757, 0o777, 0o1777]) {
+      chmodSync(dir, mode);
+      expect(notPrivate(path, st(0o600))).toBe(`its folder ${dir} is group- or world-writable (mode 0${(mode & 0o777).toString(8)})`);
+    }
+    chmodSync(dir, 0o755);
+    expect(notPrivate(path, st(0o600))).toBeUndefined();
+    chmodSync(dir, 0o700);
+  });
+
+  test('its runs in flight are never signalled (a fingerprint is no secret); ids and results still count; the next save is private', async () => {
+    const variants: [string, (dir: string, path: string) => void, string][] = [
+      ['mode 0644', (_dir, path) => chmodSync(path, 0o644), 'its mode is 0644, not 0600'],
+      ['mode 0660', (_dir, path) => chmodSync(path, 0o660), 'its mode is 0660, not 0600'],
+      ['a group-writable folder', (dir) => chmodSync(dir, 0o770), 'is group- or world-writable (mode 0770)'],
+      ['a world-writable folder', (dir) => chmodSync(dir, 0o777), 'is group- or world-writable (mode 0777)'],
+    ];
+    // Only root can give a file away.
+    if (process.geteuid?.() === 0) variants.push(['another owner', (_dir, path) => chownSync(path, 65534, 65534), "it is owned by uid 65534, not by this host's user (uid 0)"]);
+    for (const [what, loosen, why] of variants) {
+      const dir = tmpDir('buttpad-persist-');
+      const path = join(dir, STATE_FILE);
+      const pid = sleeper();
+      writeState(path, forged(pid));
+      loosen(dir, path);
+      const { store, logs } = storeAt(dir, buttons);
+      await Bun.sleep(300);
+      expect({ what, alive: isAlive(pid) }).toEqual({ what, alive: true });
+      expect(logs).toEqual([
+        expect.stringContaining(why),
+        `■ p/a #5 was interrupted when the previous host stopped (pid ${pid} left alone: the state file is not private)`,
+      ]);
+      expect(logs[0]).toStartWith(`state: ${path} is not private (`);
+      expect(logs[0]).toContain(why);
+      expect(logs[0]).toEndWith('): someone else could have written it, so the runs it lists as still running are left alone');
+      // Shown as interrupted, like any run the previous host lost; ids, results and latched state are kept.
+      expect(store.get('p/a')).toMatchObject({ phase: 'failure', runId: 5, reason: 'interrupted', text: INTERRUPTED_TEXT });
+      expect(store.runs()[0]).toMatchObject({ runId: 5, reason: 'interrupted', error: `interrupted: the host stopped while it ran (pid ${pid} left alone: the state file is not private)` });
+      expect(store.latched()).toEqual({ 'p/a': 'ON' });
+      expect(store.press('p', 'a')).toMatchObject({ result: 'started', runId: 6 });
+      await store.shutdown(20);
+      // Saved again by this host: 0600, and the forged entry is gone.
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(readState(path).live).toEqual([]);
+      chmodSync(dir, 0o700);
+    }
+    // The same file, private: the forged entry would have been obeyed (it names a live process by its real fingerprint).
+    const dir = tmpDir('buttpad-persist-');
+    const pid = sleeper();
+    writeState(join(dir, STATE_FILE), forged(pid));
+    const { store, logs } = storeAt(dir, buttons);
+    await waitFor(() => !isAlive(pid), 3000, 'the private file to be obeyed');
+    expect(logs).toEqual([`■ p/a #5 was interrupted when the previous host stopped (still running as pid ${pid}: stopping it)`]);
+    await store.shutdown(20);
+  }, 30_000);
+
+  test('its entries stay inert once saved again (by a save before recover(), say the exit handler of a host that then crashed)', async () => {
+    const dir = tmpDir('buttpad-persist-');
+    const path = join(dir, STATE_FILE);
+    const pid = sleeper();
+    writeState(path, forged(pid));
+    chmodSync(path, 0o644);
+    const first = new StateStore(Config.parse(padConfig(buttons)), { baseDir: dir, statePath: path, cancelGraceMs: 0 });
+    first.forceKillAll(); // saves, without recover()
+    await first.shutdown(20);
+    // Private now (this host wrote it), and still listing the run — without what would get it signalled.
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    const live = readState(path).live;
+    expect(live).toEqual([expect.objectContaining({ key: 'p/a', runId: 5, pid })]);
+    expect(live[0]).not.toHaveProperty('fingerprint');
+    const next = storeAt(dir, buttons);
+    await Bun.sleep(300);
+    expect(isAlive(pid)).toBe(true);
+    expect(next.logs).toEqual([`■ p/a #5 was interrupted when the previous host stopped (pid ${pid} is another process now: left alone)`]);
+    await next.store.shutdown(20);
+  });
+
+  test("keys that aren't pad/button ids, and parse errors, never reach the log raw", async () => {
+    const dir = tmpDir('buttpad-persist-');
+    const path = join(dir, STATE_FILE);
+    const pid = sleeper();
+    writeState(path, {
+      version: 1,
+      buttons: { 'p/a': { lastRunId: 2 }, 'p/\u001b[31ma': { lastRunId: 9 }, 'p/a‮': { lastRunId: 9 } },
+      live: [{ key: 'p/\u001b]0;pwned\u0007a', runId: 3, pid, pgid: pid, startedAt: Date.now(), fingerprint: processFingerprint(pid) }],
+    });
+    const one = storeAt(dir, buttons);
+    await Bun.sleep(300);
+    expect(one.logs).toEqual([]); // the entry with that key was dropped: nothing to report, nothing signalled
+    expect(isAlive(pid)).toBe(true);
+    expect(one.store.get('p/a')).toEqual({ phase: 'ready', runId: 2 });
+    await one.store.shutdown(20);
+    writeFileSync(path, '{"version": 1, "buttons": \u001b]0;pwned\u0007}');
+    const two = storeAt(dir, buttons);
+    expect(two.logs).toEqual([`state: can't use ${path} (invalid JSON (JSON Parse error: Unrecognized token '')); starting fresh`]);
+    await two.store.shutdown(20);
   });
 });
 

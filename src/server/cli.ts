@@ -7,6 +7,7 @@ import QRCode from 'qrcode';
 import { configWarnings } from './config-warnings.ts';
 import { errnoText } from './errors.ts';
 import { startHost, VERSION, type Host } from './host.ts';
+import { sanitizeLog } from './runner.ts';
 
 export const USAGE = `Usage: buttpad [options]
 
@@ -129,7 +130,7 @@ async function printBanner(host: Host, out: (s: string) => void, qr: boolean) {
   if (host.created.rotatedTokens) out(`Rotated the tokens in ${host.secretsPath}: previously paired devices must pair again.`);
   if (host.created.fixedSecretsMode) out(`Tightened ${host.secretsPath} permissions to 0600.`);
   out(`Listening on ${host.scheme}://${host.hostname}:${host.port}`);
-  for (const w of configWarnings(cfg, host.config.dir)) out(`⚠  ${w}`);
+  for (const w of configWarnings(cfg, host.config.dir)) out(`⚠  ${sanitizeLog(w)}`);
 
   const hosts = pairingHosts(host.hostname);
   const url = (h: string, token: string) => pairingUrl(host.scheme, h, host.port, token);
@@ -240,7 +241,8 @@ export async function main(argv: string[]): Promise<void> {
     // ListenError, WriteError and the like already say what happened in words; a bare errno gets them.
     const msg = e instanceof Error ? e.message : String(e);
     const file = /^E[A-Z]+: .*'([^']+)'$/.exec(msg)?.[1];
-    process.stderr.write(`buttpad: ${/^E[A-Z]+: /.test(msg) ? `${errnoText(e)}${file ? `: ${file}` : ''}` : msg}\n`);
+    // It may quote the config file (an invalid config's errors): no escape sequences to the terminal.
+    process.stderr.write(`buttpad: ${sanitizeLog(/^E[A-Z]+: /.test(msg) ? `${errnoText(e)}${file ? `: ${file}` : ''}` : msg)}\n`);
     process.exit(1);
   }
   g.__buttpadHost = host;
