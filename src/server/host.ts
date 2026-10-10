@@ -18,6 +18,8 @@ export const VERSION: string = pkg.version;
 const MAX_BODY = 1024 * 1024;
 /** WebSocket connections, all roles together; more are refused with 503. */
 export const MAX_CLIENTS = 64;
+/** Of those, slots only admin connections may use. */
+export const ADMIN_RESERVED = 8;
 
 export interface HostOptions {
   configPath: string;
@@ -184,7 +186,11 @@ export async function startHost(opts: HostOptions): Promise<Host> {
         if (!sameOrigin(req)) return json({ error: 'cross-origin WebSocket refused' }, 403);
         const role = auth(new URL(req.url).searchParams.get('token'));
         if (!role) return unauthorized();
-        if (clients.size >= MAX_CLIENTS) {
+        // Press tokens get handed out freely (QR codes), so they can't take the slots admins need.
+        const full =
+          clients.size >= MAX_CLIENTS ||
+          (role === 'press' && [...clients].filter((c) => c.data.role === 'press').length >= MAX_CLIENTS - ADMIN_RESERVED);
+        if (full) {
           if (!refusingClients) log(`refusing WebSocket connections: ${clients.size} open (max ${MAX_CLIENTS})`);
           refusingClients = true;
           return json({ error: `too many connections (max ${MAX_CLIENTS})` }, 503);

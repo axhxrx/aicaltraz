@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { ConfigInput } from '../src/core/config.ts';
 import type { RunRecord } from '../src/core/protocol.ts';
 import { revOf } from '../src/server/config-store.ts';
-import { MAX_CLIENTS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
+import { ADMIN_RESERVED, MAX_CLIENTS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
 import { CANCEL_GRACE_MS } from '../src/server/state-store.ts';
 import { cleanupTmp, eventually, isAlive, readJson, TestClient, tmpDir, waitFor, writeExecutable, writeJson } from './helpers.ts';
 
@@ -155,6 +155,13 @@ describe('auth', () => {
     await expect(TestClient.connect(`ws://127.0.0.1:${host.port}/ws?token=${press}`)).rejects.toThrow();
     open[0]!.close();
     await eventually(async () => (await rawUpgrade(host.port, `/ws?token=${press}`)).startsWith('HTTP/1.1 101'), 3000, 'a free slot');
+  });
+
+  test(`press tokens can't take the last ${ADMIN_RESERVED} connection slots from admins`, async () => {
+    const { host, ws, press, admin } = await setup();
+    await Promise.all(Array.from({ length: MAX_CLIENTS - ADMIN_RESERVED }, () => ws(press)));
+    expect(await rawUpgrade(host.port, `/ws?token=${press}`)).toStartWith('HTTP/1.1 503');
+    expect(await rawUpgrade(host.port, `/ws?token=${admin}`)).toStartWith('HTTP/1.1 101');
   });
 
   test('Bun dev mode (HMR socket, source maps) is off unless asked for', async () => {
