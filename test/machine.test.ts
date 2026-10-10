@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { initialState, transition, type MachineEvent, type MachineOpts, type RunState } from '../src/core/machine.ts';
+import { initialState, REQUEUE_GAP_MS, transition, type MachineEvent, type MachineOpts, type RunState } from '../src/core/machine.ts';
 
 const opts = (whileRunning: MachineOpts['whileRunning'] = 'ignore', resultHoldMs = 2500): MachineOpts => ({ whileRunning, resultHoldMs });
 
@@ -130,16 +130,33 @@ describe('exit', () => {
       expect(transition(cancelling, e, opts('cancel'))[0]).toMatchObject({ phase: 'failure', reason: 'cancelled' });
   });
 
-  test('queued run restarts immediately with runId+1 instead of finishing', () => {
-    const [next, effects] = transition({ ...queued, progress: 80, status: 'x' }, exit({ exitCode: 1 }), opts('queue'));
-    expect(next).toEqual({ phase: 'running', runId: 4, startedAt: 9000 });
+  test('queued run: its result shows (marked queued), then the re-run starts after REQUEUE_GAP_MS', () => {
+    const [shown, effects] = transition({ ...queued, progress: 80, status: 'x' }, exit({ exitCode: 1, text: 'disk full' }), opts('queue'));
+    expect(shown).toEqual({ phase: 'failure', runId: 3, startedAt: 1000, endedAt: 9000, exitCode: 1, text: 'disk full', reason: 'exit', queued: true });
+    expect(effects).toEqual([{ type: 'scheduleRequeue', runId: 3, afterMs: REQUEUE_GAP_MS }]);
+    // reset can't swallow a pending re-run
+    expect(transition(shown, { type: 'reset', runId: 3 }, opts('queue'))[0]).toBe(shown);
+    const [rerun, effects2] = transition(shown, { type: 'requeue', runId: 3, now: 9800 }, opts('queue'));
+    expect(rerun).toEqual({ phase: 'running', runId: 4, startedAt: 9800 });
+    expect(effects2).toEqual([{ type: 'start', runId: 4 }]);
+  });
+
+  test('a press during the requeue gap starts the run; the stale requeue is then ignored', () => {
+    const [shown] = transition(queued, exit(), opts('queue'));
+    const [pressed, effects] = transition(shown, { type: 'press', now: 9100 }, opts('queue'));
+    expect(pressed).toEqual({ phase: 'running', runId: 4, startedAt: 9100 });
     expect(effects).toEqual([{ type: 'start', runId: 4 }]);
+    expect(transition(pressed, { type: 'requeue', runId: 3, now: 9800 }, opts('queue'))[0]).toBe(pressed);
   });
 
   test('queued wins over cancelling (a queue press after a cancel, across a config change)', () => {
-    const [next, effects] = transition({ ...running, queued: true, cancelling: true }, exit(), opts('cancel'));
-    expect(next).toMatchObject({ phase: 'running', runId: 4 });
-    expect(effects).toEqual([{ type: 'start', runId: 4 }]);
+    const [shown, effects] = transition({ ...running, queued: true, cancelling: true }, exit(), opts('cancel'));
+    expect(shown).toMatchObject({ phase: 'failure', reason: 'cancelled', queued: true });
+    expect(effects).toEqual([{ type: 'scheduleRequeue', runId: 3, afterMs: REQUEUE_GAP_MS }]);
+  });
+
+  test('a queue press when already queued returns the same state (host answers ignored)', () => {
+    expect(transition(queued, { type: 'press', now: 5 }, opts('queue'))[0]).toBe(queued);
   });
 
   test('ignores a stale runId and non-running phases', () => {
@@ -157,12 +174,19 @@ describe('exit', () => {
 });
 
 describe('reset', () => {
-  test('success/failure → ready, keeping runId', () => {
+  test('success/failure → ready, keeping runId and the result as `last`', () => {
     for (const s of [success, failure]) {
       const [next, effects] = transition(s, { type: 'reset', runId: 3 }, opts());
-      expect(next).toEqual({ phase: 'ready', runId: 3 });
+      const last = s.phase === 'success'
+        ? { runId: 3, ok: true, endedAt: s.endedAt, ...(s.text !== undefined ? { text: s.text } : {}) }
+        : { runId: 3, ok: false, reason: s.reason, endedAt: s.endedAt, ...(s.text !== undefined ? { text: s.text } : {}) };
+      expect(next).toEqual({ phase: 'ready', runId: 3, last });
       expect(effects).toEqual([]);
     }
+  });
+
+  test('requeue only acts on a queued result with the same runId', () => {
+    for (const s of [ready, running, success, failure]) expect(transition(s, { type: 'requeue', runId: 3, now: 1 }, opts())[0]).toBe(s);
   });
 
   test('stale reset (a newer run started meanwhile) is ignored', () => {
@@ -186,6 +210,8 @@ test('every event × phase never throws and only emits known effects', () => {
     { type: 'exit', runId: 9, now: 2, exitCode: 0 },
     { type: 'reset', runId: 3 },
     { type: 'reset', runId: 9 },
+    { type: 'requeue', runId: 3, now: 3 },
+    { type: 'requeue', runId: 9, now: 3 },
   ];
   for (const s of Object.values(phases))
     for (const e of events)
@@ -193,7 +219,7 @@ test('every event × phase never throws and only emits known effects', () => {
         const [next, effects] = transition(s, e, opts(mode));
         expect(['ready', 'running', 'success', 'failure']).toContain(next.phase);
         expect(next.runId === s.runId || next.runId === s.runId + 1).toBe(true);
-        for (const eff of effects) expect(['start', 'kill', 'scheduleReset']).toContain(eff.type);
+        for (const eff of effects) expect(['start', 'kill', 'scheduleReset', 'scheduleRequeue']).toContain(eff.type);
       }
 });
 
@@ -210,7 +236,7 @@ test('full lifecycle: press → progress → exit → reset → press', () => {
   expect(s).toEqual({ phase: 'failure', runId: 1, startedAt: 10, endedAt: 30, exitCode: null, reason: 'cancelled', text: undefined });
   expect(effects).toEqual([{ type: 'scheduleReset', runId: 1, afterMs: 100 }]);
   [s] = transition(s, { type: 'reset', runId: 1 }, o);
-  expect(s).toEqual({ phase: 'ready', runId: 1 });
+  expect(s).toEqual({ phase: 'ready', runId: 1, last: { runId: 1, ok: false, reason: 'cancelled', endedAt: 30 } });
   [s, effects] = transition(s, { type: 'press', now: 40 }, o);
   expect(s).toEqual({ phase: 'running', runId: 2, startedAt: 40 });
 });

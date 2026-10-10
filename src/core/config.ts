@@ -25,22 +25,28 @@ export const ShellAction = z.strictObject({
   type: z.literal('shell'),
   /** Passed to the shell as a single command string (`sh -c` / `cmd /c`). */
   script: z.string().min(1),
-  /** Shell binary. Defaults to $SHELL, else /bin/sh (POSIX) or cmd.exe (Windows). */
+  /** Shell binary. Defaults to /bin/sh (POSIX) or %ComSpec%/cmd.exe (Windows) — never $SHELL, so behavior doesn't depend on how the host was started. */
   shell: z.string().optional(),
   cwd: z.string().optional(),
   env: env.optional(),
 });
 
-export const Action = z.discriminatedUnion('type', [ExecAction, ShellAction]);
+/** Runs nothing and succeeds at once: for buttons that only `stops` others. */
+export const NoneAction = z.strictObject({ type: z.literal('none') });
+
+export const Action = z.discriminatedUnion('type', [ExecAction, ShellAction, NoneAction]);
 
 export const Trigger = z.enum(['hold', 'tap', 'double']);
 
 /** What a press does while the action is already running. */
 export const WhileRunning = z.enum(['ignore', 'cancel', 'queue']);
 
+/** `pad/button`, `pad/*` or `*`. */
+export const STOP_PATTERN = /^(\*|[\w-]+\/(\*|[\w-]+))$/;
+
 export const Button = z.strictObject({
   id: z.string().min(1).regex(/^[\w-]+$/, 'letters, digits, _ and - only'),
-  label: z.string().default(''),
+  label: z.string().trim().max(200).default(''),
   /** Any CSS color. The ready-state background. */
   color: z.string().default('#2f6fde'),
   /** Grid placement, 0-based cell coords, spans in cells. */
@@ -55,10 +61,14 @@ export const Button = z.strictObject({
   whileRunning: WhileRunning.default('ignore'),
   /** Require a second press within confirmWindowMs before firing. */
   confirm: z.boolean().default(false),
-  confirmWindowMs: z.int().min(500).default(3000),
-  timeoutMs: z.int().min(100).default(30_000),
+  confirmWindowMs: z.int().min(500).max(60_000).default(3000),
+  timeoutMs: z.int().min(100).max(86_400_000).default(120_000),
   /** How long SUCCESS/FAILURE stays on screen before going back to READY. */
-  resultHoldMs: z.int().min(0).default(2500),
+  resultHoldMs: z.int().min(0).max(60_000).default(2500),
+  /** After this button fires, presses on this device are ignored for this long (key chatter, bounces). */
+  cooldownMs: z.int().min(0).max(10_000).default(400),
+  /** Running buttons this one cancels before its own action starts (itself excluded). */
+  stops: z.array(z.string().regex(STOP_PATTERN, 'use pad/button, pad/* or *')).optional(),
   /** Keyboard key (KeyboardEvent.key) that presses this button, for BLE remotes etc. */
   key: z.string().optional(),
   action: Action,
@@ -66,7 +76,7 @@ export const Button = z.strictObject({
 
 export const Pad = z.strictObject({
   id: z.string().min(1).regex(/^[\w-]+$/, 'letters, digits, _ and - only'),
-  name: z.string().min(1),
+  name: z.string().trim().min(1).max(60),
   cols: z.int().min(1).max(12).default(2),
   rows: z.int().min(1).max(12).default(2),
   buttons: z.array(Button).default([]),
@@ -111,6 +121,7 @@ export const Config = z
 
 export type ExecAction = z.infer<typeof ExecAction>;
 export type ShellAction = z.infer<typeof ShellAction>;
+export type NoneAction = z.infer<typeof NoneAction>;
 export type Action = z.infer<typeof Action>;
 export type Button = z.infer<typeof Button>;
 export type Pad = z.infer<typeof Pad>;

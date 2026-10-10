@@ -3,9 +3,9 @@
  * HTTP endpoints are documented in docs/DESIGN.md.
  */
 import type { Action, Button, Config, Pad } from './config.ts';
-import type { RunState } from './machine.ts';
+import type { FailureReason, RunState } from './machine.ts';
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** press: can see pads and press buttons. admin: can also see actions and edit config. */
 export type Role = 'press' | 'admin';
@@ -18,8 +18,15 @@ export type WireConfig = Omit<Config, 'pads'> & { pads: WirePad[] };
 /** Keyed by buttonKey(padId, buttonId) = `${padId}/${buttonId}`. */
 export type StateMap = Record<string, RunState>;
 
-/** How the host handled a press. */
-export type PressResult = 'started' | 'ignored' | 'cancelling' | 'queued' | 'unknown-button';
+/**
+ * How the host handled a press.
+ * - expired: the press is older than PRESS_MAX_AGE_MS by the host's clock (sat in a dead link); dropped.
+ * - needs-confirm: the button has `confirm` and the press didn't carry `confirm: true`; nothing ran.
+ */
+export type PressResult = 'started' | 'ignored' | 'cancelling' | 'queued' | 'unknown-button' | 'expired' | 'needs-confirm';
+
+/** A press whose `at` is older than this when the host handles it is dropped as `expired`. */
+export const PRESS_MAX_AGE_MS = 3000;
 
 export interface HostInfo {
   name: string;
@@ -39,10 +46,15 @@ export type ServerMsg =
       /** Host clock (ms epoch), so clients can compute elapsed time with an offset. */
       serverNow: number;
       host: HostInfo;
+      /** Latched device state per button key (`@state` lines), e.g. "REC ●". */
+      latched: Record<string, string>;
     }
   | { t: 'config'; config: WireConfig; rev: string }
   | { t: 'state'; key: string; state: RunState }
-  | { t: 'ack'; id: string; key: string; result: PressResult }
+  /** `runId`: for started/queued/cancelling, the run the press started, queued behind or is cancelling. */
+  | { t: 'ack'; id: string; key: string; result: PressResult; runId?: number }
+  /** A button's latched device state changed (`@state text`); null = cleared (`@state` alone). */
+  | { t: 'latched'; key: string; text: string | null }
   /** Config file on disk was edited by hand and is invalid; the host keeps running the old one. Admins only. */
   | { t: 'configError'; errors: string[] }
   | { t: 'error'; message: string };
@@ -53,6 +65,10 @@ export type ClientMsg = {
   id: string;
   pad: string;
   button: string;
+  /** When the user fired it, in the HOST's clock (client clock + offset learned from hello.serverNow). */
+  at?: number;
+  /** The user went through the button's confirm step. Required for `confirm` buttons. */
+  confirm?: boolean;
 };
 
 /** PUT /api/config (admin). */
@@ -81,7 +97,12 @@ export interface RunRecord {
   startedAt: number;
   endedAt?: number;
   exitCode?: number | null;
-  reason?: 'exit' | 'timeout' | 'spawn' | 'cancelled';
+  reason?: FailureReason;
+  /** Why it couldn't start (spawn failure), or how it was stopped ("stopped by All off", "button removed"). */
+  error?: string;
+  /** What ran: argv or `shell -c script`, and the resolved working folder. */
+  command?: string;
+  cwd?: string;
   /** Tails, capped (see DESIGN.md). */
   stdout: string;
   stderr: string;
