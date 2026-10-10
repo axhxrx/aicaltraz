@@ -76,8 +76,9 @@ export interface LocalResult {
   at: number;
   /** wall() it goes away by itself; absent: when touched. */
   until?: number;
-  /** failure / interrupted: the host's word on it. */
+  /** failure / interrupted: the host's word on it (`fromLast`: rebuilt from READY's `last`, which has no exit code). */
   host?: Extract<RunState, { phase: 'failure' }>;
+  fromLast?: true;
   /** ran: how it ended, if the host still knows. */
   last?: LastResult;
   /** notsent: why. */
@@ -329,7 +330,7 @@ export class ButtonController {
       reason: o.reason ?? 'exit',
       ...(o.text !== undefined ? { text: o.text } : {}),
     };
-    this.setResult({ kind: o.reason === 'interrupted' ? 'interrupted' : 'failure', runId: o.runId, at: wall(), host: state });
+    this.setResult({ kind: o.reason === 'interrupted' ? 'interrupted' : 'failure', runId: o.runId, at: wall(), host: state, ...(o.state ? {} : { fromLast: true as const }) });
   }
 
   // ---- input ----------------------------------------------------------------------------------

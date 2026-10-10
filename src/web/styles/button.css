@@ -378,8 +378,10 @@
 .bp-btn[data-visual='running'] .bp-base {
   filter: brightness(0.86);
 }
-/* What is running stays the headline; the clock comes second. Never below a readable size. */
-.bp-btn[data-visual='running'] .bp-label {
+/* What is running stays the headline; the clock comes second (it is capped at 90% of the label's
+   size: it carries the label's fit variables for that). Never below a readable size. */
+.bp-btn[data-visual='running'] :is(.bp-label, .bp-num) {
+  --fit-w: var(--iw);
   --fit-h: calc(var(--ih) * 0.4);
   --fit-max: 30cqh;
   --fit-min: min(16px, 9cqh);
@@ -557,7 +559,7 @@
   padding: 0.32em 0.7em;
   border-radius: 99px;
   font-weight: 900;
-  font-size: clamp(9px, 4.4cqmin, 20px);
+  font-size: clamp(9px, 5.2cqmin, 22px);
   letter-spacing: 0.05em;
   line-height: 1;
   background: color-mix(in srgb, var(--ink) 18%, transparent);
@@ -778,13 +780,18 @@
     height: calc(var(--side) * 0.7);
     justify-self: center;
   }
-  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted'], [data-visual='offline']) .bp-label {
+  .bp-btn:is([data-visual='success'], [data-visual='offline']) .bp-label {
     --fit-h: calc(var(--ih) * 0.26);
     --fit-max: 26cqh;
   }
+  /* A failure's reason is the biggest text on it; the label says which button, smaller. */
+  .bp-btn:is([data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-label {
+    --fit-h: calc(var(--ih) * 0.17);
+    --fit-max: 17cqh;
+  }
   .bp-btn[data-visual] .bp-content > .bp-headline {
-    --fit-h: calc(var(--ih) * 0.42);
-    --fit-max: 26cqh;
+    --fit-h: calc(var(--ih) * 0.5);
+    --fit-max: 28cqh;
   }
   .bp-btn[data-visual='offline'] .bp-offline-was {
     --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
@@ -801,7 +808,8 @@
     grid-column: 1;
     --fit-w: calc(var(--iw) * 0.62);
   }
-  .bp-btn[data-visual='running'] .bp-label {
+  .bp-btn[data-visual='running'] .bp-content > :is(.bp-label, .bp-num) {
+    --fit-w: calc(var(--iw) * 0.62);
     --fit-h: calc(var(--ih) * 0.42);
     --fit-max: 36cqh;
   }
@@ -809,6 +817,7 @@
     grid-column: 2;
     grid-row: 1 / span 3;
     align-self: center;
+    --fit-w: calc((100cqw - 2 * var(--pad)) * 0.62);
     --iw: calc((100cqw - 2 * var(--pad)) * 0.32);
     --line-max: calc(var(--ih) * 0.44);
   }
@@ -880,6 +889,8 @@
     max-width: calc(var(--nw) - var(--gapw));
     --iw: calc(var(--nw) - var(--gapw));
     --line-max: var(--ih);
+    /* One row: the clock has its own share; no cap by the label. */
+    --fit-min: 999px;
   }
   .bp-btn[data-visual] .bp-content > .bp-headline {
     flex: none;

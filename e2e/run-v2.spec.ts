@@ -326,8 +326,12 @@ test('?pad matches a name in any case; a pad that is missing (from the start, or
   await edit(page, 'cfg.pads.splice(2, 1)');
   await expect(page.getByTestId('pad-missing')).toContainText('Pad “crew” no longer exists');
   await expect(page.locator('.bp-btn')).toHaveCount(0);
-  // Keys don't make it some other pad's remote either... unless a key is unique and says so (toast).
   await expect(page.getByTestId('pad-missing')).toContainText('locked');
+  // Nor does its remote become another pad's: a key unique elsewhere presses nothing.
+  const presses = await trackPresses(page);
+  await page.keyboard.press('p');
+  await page.waitForTimeout(300);
+  expect(await presses()).toEqual([]);
 });
 
 test('rough mode: one button at a time, firmer taps, a longer cooldown', async ({ page, hasTouch }) => {

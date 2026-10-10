@@ -203,10 +203,10 @@ export class RunSession {
    * several other pads have it, nothing (a toast says so). `onKey` runs when a key fires a button
    * (the app closes its menu: keys keep working while it's open). Returns the cleanup.
    */
-  listenKeys(onKey: () => void): () => void {
+  listenKeys(onKey: () => void, enabled: () => boolean = () => true): () => void {
     const held = new Set<string>();
     const down = (e: KeyboardEvent) => {
-      if (e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
+      if (!enabled() || e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
       if ((e.key === 'Enter' || e.key === ' ') && control(e.target)) return;
       const cfg = this.prev.config;
       if (!cfg) return;

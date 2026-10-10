@@ -335,10 +335,10 @@ test('the demo answers presses like the host: cancelling while cancelling, ignor
     return out;
   });
   expect(acks).toEqual(['started', 'cancelling', 'cancelling']);
-  // Bursts of 20 starts, then 10/s: 21 at once → the last one is refused.
+  // Bursts of 10 starts per connection, then 5/s: 11 at once → the last one is refused.
   await page.waitForTimeout(2100);
-  const burst = await demo(page).run((b) => Promise.all(Array.from({ length: 21 }, (_, i) => b.press('many', `m${i}`))));
-  expect(burst.filter((r) => r === 'started')).toHaveLength(20);
+  const burst = await demo(page).run((b) => Promise.all(Array.from({ length: 11 }, (_, i) => b.press('many', `m${i}`))));
+  expect(burst.filter((r) => r === 'started')).toHaveLength(10);
   expect(burst.filter((r) => r === 'ignored')).toHaveLength(1);
 });
 

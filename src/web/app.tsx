@@ -156,8 +156,10 @@ function Connected(p: { backend: Backend; opts: AppOptions; onPair(t: string): v
   const toast = useStore(session.toast);
   useEffect(() => startKeepAwake(), []);
   const editing = mode === 'edit' && role === 'admin';
+  // A kiosk locked to a pad that's gone has no buttons, and its remote presses none elsewhere either.
+  const keysOff = useRef(false);
   // Keys work for every pad, and while the menu is open (a key that presses a button closes it).
-  useEffect(() => (editing ? undefined : session.listenKeys(() => setMenu(false))), [session, editing]);
+  useEffect(() => (editing ? undefined : session.listenKeys(() => setMenu(false), () => !keysOff.current)), [session, editing]);
   // Unsaved edits kept on this device from an earlier editor (a reload, a new token…): offered back.
   const kept = useMemo(() => {
     if (role !== 'admin' || opts.lock || mode !== 'run') return null;
@@ -169,6 +171,7 @@ function Connected(p: { backend: Backend; opts: AppOptions; onPair(t: string): v
   if (!config) return <ConnectingScreen status={status} hostFull={hostFull} onRepair={p.onForget} />;
   const found = resolvePad(config.pads, choice, shown.current);
   const pad = typeof found === 'string' ? null : found;
+  keysOff.current = !pad && opts.lock;
   if (pad) shown.current = { id: pad.id, name: pad.name };
   const choose = (id: string) => {
     shown.current = config.pads.find((x) => x.id === id) ?? shown.current;
@@ -218,6 +221,11 @@ function Connected(p: { backend: Backend; opts: AppOptions; onPair(t: string): v
           <button type="button" class="bp-banner-x" aria-label="Hide" onClick={() => setHideStorage(true)}>
             <Close />
           </button>
+        </div>
+      )}
+      {hostFull && status !== 'online' && !editing && (
+        <div class="bp-banner" role="alert" data-testid="host-full">
+          <b>Host is full (too many devices connected)</b> — it turns new devices away until one disconnects. This one keeps trying.
         </div>
       )}
       {configErrors && role === 'admin' && !editing && (

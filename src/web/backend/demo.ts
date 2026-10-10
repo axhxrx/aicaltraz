@@ -20,8 +20,12 @@ import { DEMO_CONFIG } from './demo-config.ts';
 import { simulate, type SimHandle } from './demo-script.ts';
 import { CANCEL_GRACE_MS, emptySnapshot, PressError, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
 
-/** As on the host: presses that start or queue a run, over all buttons: bursts of 20, then 10/s; 32 at once. */
-const LIMITS = { burst: 20, perSec: 10, maxRunning: 32 };
+/**
+ * As on the host for one connection (src/server/limits.ts): presses that start or queue a run,
+ * over all buttons, bursts of 10, then 5/s (the host's global 40 then 20/s takes more than one
+ * device); 32 runs at once.
+ */
+const LIMITS = { burst: 10, perSec: 5, maxRunning: 32 };
 
 interface Run {
   handle: SimHandle;

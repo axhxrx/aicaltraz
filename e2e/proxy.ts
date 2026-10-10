@@ -10,6 +10,8 @@ interface Link {
   upstream: net.Socket | null;
   frozen: boolean;
   openedAt: number;
+  /** A WebSocket (its first chunk was `GET /ws…`). */
+  ws: boolean;
 }
 
 export interface Proxy {
@@ -19,6 +21,10 @@ export interface Proxy {
   readonly accepted: number;
   /** One-way delay for every chunk, both directions. */
   latency: number;
+  /** Extra delay for chunks from the browser to the host only (a press that is slow to arrive, its answer not). */
+  upLatency: number;
+  /** Extra delay for WebSocket links only, both directions (a slow hello; the page itself loads fast). */
+  wsLatency: number;
   /** pass: forward. blackhole: accept new connections and never forward a byte. */
   setMode(mode: 'pass' | 'blackhole'): void;
   /** WebSocket upgrades go nowhere (black-holed), plain HTTP passes. */
@@ -47,7 +53,7 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
   };
   const server = net.createServer((client) => {
     accepted++;
-    const l: Link = { client, upstream: null, frozen: mode === 'blackhole', openedAt: Date.now() };
+    const l: Link = { client, upstream: null, frozen: mode === 'blackhole', openedAt: Date.now(), ws: false };
     links.add(l);
     client.on('error', () => {});
     client.on('close', () => {
@@ -71,19 +77,30 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
             setTimeout(() => kill(l), 150);
             return;
           }
-          if (p.latency) setTimeout(() => !l.frozen && to.write(d), p.latency);
+          const delay = p.latency + (dir === 'up' ? p.upLatency : 0) + (l.ws ? p.wsLatency : 0);
+          if (delay) setTimeout(() => !l.frozen && to.write(d), delay);
           else to.write(d);
         });
       if (first) up.write(first);
       pipe(client, up, 'up');
       pipe(up, client, 'down');
     };
-    if (!p.blackholeWs) return connect();
-    // Decide on the first chunk: WebSocket upgrades go nowhere, plain HTTP passes.
+    if (!p.blackholeWs && !p.wsLatency) return connect();
+    // Decide on the first chunk: WebSocket upgrades go nowhere (or slowly), plain HTTP passes.
     client.once('data', (first: Buffer) => {
-      if (first.toString('latin1').startsWith('GET /ws')) {
+      l.ws = first.toString('latin1').startsWith('GET /ws');
+      if (l.ws && p.blackholeWs) {
         l.frozen = true;
         return void client.on('data', () => {});
+      }
+      if (l.ws && p.wsLatency) {
+        // Hold the rest (if any) until the upgrade request has gone through.
+        client.pause();
+        return void setTimeout(() => {
+          if (l.frozen) return;
+          connect(first);
+          client.resume();
+        }, p.wsLatency);
       }
       connect(first);
     });
@@ -97,6 +114,8 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
       return accepted;
     },
     latency: 0,
+    upLatency: 0,
+    wsLatency: 0,
     blackholeWs: false,
     cutNewAfterMs: 0,
     setMode: (m) => void (mode = m),

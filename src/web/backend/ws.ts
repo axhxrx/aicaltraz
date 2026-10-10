@@ -14,9 +14,11 @@
  * its socket is still the current one: a stale socket's late events can't touch a newer one.
  *
  * Every press carries `at`: when it was made, in the host's clock (the offset is learned from each
- * hello's serverNow, and kept with a clock the device's clock setting can't move, lib/clock.ts).
- * A press that sat in a dead link for seconds is dropped by the host (`expired`) instead of
- * running late.
+ * hello's serverNow, corrected for the link's one-way delay as the handshake measured it, and kept
+ * with a clock the device's clock setting can't move, lib/clock.ts). A press that sat in a dead
+ * link for seconds is dropped by the host (`expired`) instead of running late. One that comes back
+ * `expired` within a second of going out can't have been held up: the offset is wrong (the host's
+ * clock was set, say), so a new socket (and hello) gets a fresh one.
  */
 import type { Config } from '../../core/config.ts';
 import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
@@ -41,6 +43,8 @@ const HELLO_TIMEOUT = 5000;
 const HELLO_TIMEOUT_MAX = 60_000;
 /** Offline and someone touched a button: a connection attempt older than this is given up for a new one. */
 const KICK_STALE_CONNECT = 1500;
+/** A press answered `expired` quicker than this wasn't held up anywhere: the clock offset is off. */
+const FRESH_PRESS_MS = 1000;
 /** Visible and not a single frame for this long → probe. */
 const IDLE_PROBE = 5000;
 /** How long a probe waits for a frame. */
@@ -67,8 +71,9 @@ interface Pending {
 interface Conn {
   ws: WebSocket;
   greeted: boolean;
-  /** mono() when it was opened, and of the hello. */
+  /** mono() when it was created, when it opened (the upgrade's answer), and of the hello. */
   openedAt: number;
+  upAt: number;
   greetedAt: number;
   /** mono() of the last frame from the host. */
   lastFrame: number;
@@ -153,7 +158,7 @@ export class WsBackend implements Backend {
     } catch {
       return this.scheduleRetry(null);
     }
-    const c: Conn = { ws, greeted: false, openedAt: mono(), greetedAt: 0, lastFrame: mono(), pending: new Map(), pings: 0, probeDeadline: 0, probeSentAt: 0 };
+    const c: Conn = { ws, greeted: false, openedAt: mono(), upAt: 0, greetedAt: 0, lastFrame: mono(), pending: new Map(), pings: 0, probeDeadline: 0, probeSentAt: 0 };
     this.conn = c;
     c.helloTimer = setTimeout(
       () => {
@@ -165,7 +170,17 @@ export class WsBackend implements Backend {
     ws.onmessage = (ev) => {
       if (this.conn === c) this.onFrame(c, ev.data);
     };
+    ws.onopen = () => void (c.upAt = mono());
     ws.onclose = () => this.lost(c);
+  }
+
+  /**
+   * How long the hello took to get here, from its serverNow: about half a round trip. Opening the
+   * socket took about two (TCP connect, then the upgrade), so a quarter of that (at most 1 s).
+   */
+  private oneWay(c: Conn): number {
+    const opening = (c.upAt || c.greetedAt) - c.openedAt;
+    return Math.min(1000, Math.max(0, opening / 4));
   }
 
   private onFrame(c: Conn, data: unknown) {
@@ -229,6 +244,7 @@ export class WsBackend implements Backend {
     const { ws } = c;
     ws.onmessage = null;
     ws.onclose = null;
+    ws.onopen = null;
     clearTimeout(c.helloTimer);
     clearTimeout(c.idleTimer);
     clearTimeout(c.probeTimer);
@@ -280,7 +296,10 @@ export class WsBackend implements Backend {
   private async probeHttp(failed = false) {
     const live = () => this.disposed || this.snapshot.get().status === 'online';
     try {
+      const t0 = mono();
       const r = await this.http('GET', '/api/state');
+      // serverNow was taken about half the round trip ago.
+      const half = Math.min(1000, (mono() - t0) / 2);
       if (r.status === 401 || r.status === 403) {
         clearTimeout(this.retryTimer);
         if (this.conn) this.drop(this.conn);
@@ -296,7 +315,7 @@ export class WsBackend implements Backend {
       const j = (await r.json()) as { states?: StateMap; serverNow?: number };
       // The socket got there first: its picture is the fresher one.
       if (live() || !j.states) return;
-      this.patch({ states: j.states, ...(typeof j.serverNow === 'number' ? { clockSkew: wall() - j.serverNow } : {}) });
+      this.patch({ states: j.states, ...(typeof j.serverNow === 'number' ? { clockSkew: wall() - (j.serverNow + half) } : {}) });
       if (this.snapshot.get().config) return;
       const rc = await this.http('GET', '/api/config');
       const jc = rc.ok ? ((await rc.json()) as { config?: WireConfig; rev?: string }) : null;
@@ -316,7 +335,8 @@ export class WsBackend implements Backend {
           config: m.config,
           rev: m.rev,
           states: m.states,
-          clockSkew: wall() - m.serverNow,
+          // serverNow is a moment old by the time it gets here.
+          clockSkew: wall() - (m.serverNow + this.oneWay(c)),
           host: m.host,
           retryAt: null,
           // A v1 host has no latched state.
@@ -375,14 +395,19 @@ export class WsBackend implements Backend {
       } catch (e) {
         return reject(new PressError(false, e instanceof Error ? e.message : String(e)));
       }
+      const sentAt = mono();
       c.pending.set(id, {
         resolve: (ack) => {
           opts.onAck?.(ack);
           resolve(ack.result);
+          // Too old by the host's clock, yet it took no time at all: our idea of the host's clock is off.
+          if (ack.result === 'expired' && mono() - sentAt < FRESH_PRESS_MS && this.conn === c) {
+            console.warn('[buttpad] a fresh press was dropped as too old: the clock offset is off; reconnecting for a new one');
+            this.lost(c);
+          }
         },
         reject,
       });
-      const sentAt = mono();
       opts.onSent?.();
       // No ack, and not one frame since: check the link now rather than at the next idle probe.
       setTimeout(() => this.conn === c && c.pending.has(id) && c.lastFrame < sentAt && this.probe(c, QUICK_PROBE_TIMEOUT), PRESS_DOUBT_AFTER);

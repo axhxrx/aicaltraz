@@ -135,8 +135,11 @@ export function ago(ms: number): string {
 
 type Part = Partial<ButtonVM> & { visual: Visual };
 
-/** A failure, by why it failed: the reason as the headline, the code as the small print (D2). */
-function failure(s: Extract<RunState, { phase: 'failure' }>): Part {
+/**
+ * A failure, by why it failed: the reason as the headline, the code as the small print.
+ * `noCode`: the exit code isn't known (rebuilt from READY's `last`).
+ */
+function failure(s: Extract<RunState, { phase: 'failure' }>, noCode = false): Part {
   const text = s.text?.trim() || undefined;
   switch (s.reason) {
     case 'cancelled':
@@ -148,7 +151,7 @@ function failure(s: Extract<RunState, { phase: 'failure' }>): Part {
     case 'spawn':
       return { visual: 'failure', title: text ?? "CAN'T START", detail: text ? "CAN'T START" : undefined, code: "CAN'T START" };
     default: {
-      const code = s.exitCode === null ? 'KILLED' : `EXIT ${s.exitCode}`;
+      const code = noCode ? 'FAILED' : s.exitCode === null ? 'KILLED' : `EXIT ${s.exitCode}`;
       return { visual: 'failure', title: text ?? code, detail: text ? code : undefined, code };
     }
   }
@@ -189,7 +192,8 @@ function localView(r: LocalResult, skew: number): Part {
     case 'failure':
     case 'interrupted': {
       const h = r.host!;
-      return { ...failure(h), startedAt: h.startedAt + skew, endedAt: h.endedAt + skew, elapsedMs: h.endedAt - h.startedAt, sticky: true };
+      const times = r.fromLast ? { endedAt: h.endedAt + skew } : { startedAt: h.startedAt + skew, endedAt: h.endedAt + skew, elapsedMs: h.endedAt - h.startedAt };
+      return { ...failure(h, r.fromLast), ...times, sticky: true };
     }
     case 'noresponse':
       return { visual: 'unknown', title: 'NO RESPONSE', detail: 'The host didn’t answer in 2 s', code: 'NO RESPONSE', endedAt: r.at, sticky: true };

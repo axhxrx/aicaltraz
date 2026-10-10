@@ -134,12 +134,21 @@ export function TopBar(p: {
 }) {
   const current = p.pads.find((x) => x.id === p.padId);
   const menu = useDeliberate(p.onMenu, p.lock ? LOCK_MENU_MS : 0);
+  // The strip narrows when a wider badge (OFFLINE) comes up: keep the active tab in view.
+  const strip = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const el = strip.current;
+    if (!el || typeof ResizeObserver !== 'function') return;
+    const ro = new ResizeObserver(() => el.querySelector<HTMLElement>('[aria-selected="true"]')?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' }));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [p.showTabs]);
   const sleepy = useSleepy();
   const label = p.status === 'online' && p.demo ? 'DEMO' : (p.status === 'offline' || p.status === 'connecting') && p.hostFull ? 'HOST FULL' : CONN[p.status];
   return (
     <header class="bp-bar">
       {p.showTabs ? (
-        <nav class="bp-tabs" role="tablist" data-scroll-x>
+        <nav ref={strip} class="bp-tabs" role="tablist" data-scroll-x>
           {p.pads.map((pad) => (
             <Tab key={pad.id} pad={pad} active={pad.id === p.padId} mark={p.marks[pad.id]} onPad={p.onPad} />
           ))}

@@ -53,11 +53,15 @@ function Fit({ text, class: cls, weight = 900, lines }: { text: string; class: s
 
 const Sub = ({ text, class: cls = '' }: { text: string; class?: string }) => <Fit class={`bp-sub${cls ? ` ${cls}` : ''}`} text={text} weight={700} lines={2} />;
 
-/** One line that shrinks to fit the width: clock, %, pill. */
-function Line({ text, class: cls, extraEm = 0, trackEm = 0 }: { text: string; class: string; extraEm?: number; trackEm?: number }) {
+/**
+ * One line that shrinks to fit the width: clock, %, pill. `under`: never bigger than `scale` × the
+ * size that text gets as a label (the element carries the label's --fit-* variables, CSS).
+ */
+function Line({ text, class: cls, extraEm = 0, trackEm = 0, under }: { text: string; class: string; extraEm?: number; trackEm?: number; under?: string }) {
   useFontEpoch();
+  const size = lineFontSize(text, extraEm, trackEm);
   return (
-    <div class={cls} style={{ fontSize: lineFontSize(text, extraEm, trackEm) }}>
+    <div class={cls} style={{ fontSize: under ? `min(${size}, calc(${fitFontSize(under)} * 0.9))` : size }}>
       {text}
     </div>
   );
@@ -154,7 +158,7 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
       return (
         <>
           {label}
-          <Line class="bp-num" text={det ? `${Math.round(vm.progress!)}%` : elapsed} />
+          <Line class="bp-num" text={det ? `${Math.round(vm.progress!)}%` : elapsed} under={vm.label || undefined} />
           {sub && <Sub text={sub} />}
           {pill && <Line class={`bp-pill${vm.cancelling ? ' is-cancelling' : ''}`} text={pill} extraEm={1.9} trackEm={0.07} />}
           {vm.sendingOverlay && <Dots />}

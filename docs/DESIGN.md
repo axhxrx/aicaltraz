@@ -296,11 +296,14 @@ runs):
 
 - Token from `location.hash` `#token=…` → `localStorage` (`buttpad.token`), then strip the hash
   with `history.replaceState`. No token → pairing screen: explain how to pair (scan the QR the
-  host prints / open the pairing URL), with a paste field.
+  host prints / open the pairing URL), with a paste field. Storage blocked (private mode, site data
+  blocked): the token is kept in memory for the tab, and the pad says pairing won't be remembered.
 - WS with auto-reconnect (backoff 0, 250 ms → 5 s). The backoff starts over only after a
   connection held 10 s: a host or proxy that drops every socket right after `hello` is not
-  hammered. Reconnect gets a fresh `hello`; state is authoritative from the host, so a reload or
-  flaky Wi-Fi never loses track of a running action.
+  hammered. A socket waits 5 s for its `hello`, then 10, 20… (≤ 60 s) after each one that timed
+  out: a big config over a slow link gets through. Reconnect gets a fresh `hello`; state is
+  authoritative from the host, so a reload or flaky Wi-Fi never loses track of a running action.
+  Offline, a touch on a button tries to connect at once (not at the next retry, seconds away).
 - Liveness: a link can die without a TCP close, and the host sends no heartbeats, so the client
   asks. A socket quiet for 5 s (page visible) gets `{"t":"ping"}`; the host answers a type it
   doesn't know with `error`, and any frame counts as the answer. Nothing back in 3 s (1.5 s when
@@ -311,32 +314,68 @@ runs):
   can't touch the current one.
 - Startup: alongside the first socket, `GET /api/state` (and `/api/config` when no layout is
   cached): a rejected token shows at once, and a socket that hangs doesn't show a running action
-  as READY. While offline the last-known states stay on screen (see OFFLINE).
-- A press goes out at once or not at all, never queued for later (a press that fires late is
-  worse than none): NOT SENT if it never left the device, NO RESPONSE if it was sent and no ack
-  came within 2 s of sending. If the host's state later shows the button's `runId` went past
-  the one seen at press time, the press did run: the button shows that (RUNNING, SUCCESS,
-  FAILURE, or "IT RAN" when it already finished), not NO RESPONSE. (A press frame the OS had
-  already handed to TCP can still arrive if the link recovers before the connection times out;
-  only the host could drop such stale presses, which would need a timestamp in the protocol.)
+  as READY. While offline the last-known states stay on screen (see OFFLINE). A socket that never
+  got its hello is followed by a plain `GET /ws?token=…`, which answers what the upgrade got: 503 →
+  "Host is full (too many devices connected)" instead of "Can't reach the host" (426 = there's room).
+- Clocks: everything the client times itself (elapsed counters, confirm windows, countdowns,
+  cooldowns) runs on `wall()` (`src/web/lib/clock.ts`): epoch ms that follow `performance.now()`, so
+  setting the device's clock moves no counter; after a stretch in the background it catches up with
+  `Date.now()` (a sleeping device may pause `performance.now()`). The host-clock offset is learned
+  from every `hello.serverNow` (and `/api/state`'s), corrected by the one-way delay the socket's
+  opening measured.
+- A press goes out at once or not at all, never queued for later, and carries `at` (when it was
+  made, host clock) and, after the confirm step, `confirm: true`. NOT SENT if it never left the
+  device, NO RESPONSE if it was sent and no ack came within 2 s; a late `expired` answer (the host
+  dropped it: it sat in a dead link > 3 s) turns NO RESPONSE into NOT SENT "too late — not sent",
+  and it never runs. If the host's state later shows the press did run (`runId` past the one seen
+  at press time, or a late `started` ack), the button shows that (RUNNING, SUCCESS, FAILURE, or,
+  when it already finished, its outcome from READY's `last`: "IT RAN" only if the host no longer
+  knows), not NO RESPONSE. A press answered `expired` within 1 s can't have been held up: the
+  offset is wrong (the host's clock was set), so the socket is renewed for a fresh hello.
+- Whose run is it: only a run an ack's `runId` says this device started (or queued) is "ours"
+  (v1 hosts without `runId`: the next run). Its outcome gets the success/failure buzz; a failure
+  stays on screen (see Button states). A run seen starting with no ack of ours behind it is another
+  device's: a small OTHER DEVICE mark, no buzz. A press that loses a race to another device's press
+  (ack `ignored` while their run starts) says ALREADY RUNNING.
 - 401 → "token rejected" screen with re-pair option. "Pair again" in the menu takes a second tap,
   and isn't there under `?lock`.
 - **Backend interface**: the UI talks to an abstract backend with two implementations:
   `ws` (the host) and `demo` (in-browser: runs `machine.ts` locally with simulated actions, config
-  in localStorage). `?demo` selects demo. Demo exists so the UI can be tried on a phone with no
-  host, and so the UI can be built/tested independently.
+  in localStorage, the host's rules: acks with `runId`, `expired`/`needs-confirm`, already-queued
+  `ignored`, the 800 ms requeue gap, `stops`/`none`, `@state`, the per-connection rate limit of
+  bursts of 10 then 5/s; its controls simulate an outage, a lost ack, a press held up on the way,
+  a host restart). `?demo` selects demo. Demo exists so the UI can be tried on a phone with no host,
+  and so the UI can be built/tested independently.
 
 ### Run mode (the default, locked-down)
 
 - Full viewport (`100dvh`, safe-area insets), no scroll, no zoom, no text selection, no
   long-press callout/context menu, no pull-to-refresh (`touch-action: none`,
   `overscroll-behavior: none`, `-webkit-touch-callout: none`, `user-select: none`).
-- CSS grid `cols`×`rows`; buttons placed by `x,y,w,h`. Small gap. Labels sized with container
-  query units so they're as large as the button allows. Label color auto black/white by button
-  color luminance.
-- Thin top bar: pad tabs (hidden when only 1 pad or `?lock`), connection dot, menu (fullscreen,
-  wake lock status, device settings, edit mode if admin). `?pad=ID` opens that pad; last pad
-  remembered per device.
+- CSS grid `cols`×`rows`; buttons placed by `x,y,w,h`. Small gap; each button's hit area takes
+  the half of the gap next to it (no dead touches). Labels sized with container query units so
+  they're as large as the button allows (the measuring is capped: a label thousands of characters
+  long can't stall the page). Label ink black or white, whichever has the higher WCAG contrast
+  (white on orange is 2.9:1, black 7.2:1). A color that doesn't paint an opaque button on its own
+  (`transparent`, `currentColor`, `var(…)`, half-transparent, invalid) is painted as the default.
+- Thin top bar: pad tabs (hidden when only 1 pad or `?lock`), connection indicator (LIVE dot;
+  OFFLINE / CONNECTING / HOST FULL in words; DEMO in the demo, never a green dot), menu
+  (fullscreen, keep-awake status, device settings, edit mode if admin). Tabs scroll sideways when
+  they don't fit, the active one kept in view (also when a wider badge comes up); a tab shows a dot
+  when something on its pad is running (white ring) or failed (red). Tabs and the menu button take
+  a deliberate touch: ≥ 80 ms down without sliding (a 60 ms glove brush does nothing; mouse clicks
+  and the keyboard as usual), and act on the tap's own click, so that click can't land on what
+  opened. Keep-awake off (or not holding the screen) shows SCREEN MAY SLEEP in the bar.
+- Which pad: `?pad=` names one by id or name, any case; `?lock` without `?pad` is the first pad
+  (not the one this device remembers); otherwise the last pad picked here. A pad that isn't there
+  — asked for by the link, or deleted while on screen (renamed: followed by id, or by name if only
+  its id changed) — gets a "Pad “X” no longer exists" screen (with the pads to pick from, unless
+  locked), never another pad's buttons. A locked screen in that state ignores keys too.
+- `?lock` (kiosk, handlebar mount): no tabs, no edit entry, no "Pair again"; the menu opens only
+  on a ~1 s press of its button (a ring fills meanwhile), never from the keyboard.
+- Device settings (menu, per device): sounds, haptics, keep awake, and **rough mode** for gloves
+  and vibrating mounts: one button at a time per pad (a second contact on another button while one
+  is down is ignored), taps need 80 ms of contact, a cooldown of at least 800 ms, 1.5× `driftPx`.
 
 ### Button states (the important part)
 
@@ -345,31 +384,63 @@ peripheral vision, or with color blindness. Big and bold beats subtle.
 
 | State | Where | Look |
 |---|---|---|
-| READY | host | solid button color, huge label, still |
+| READY | host | solid button color, huge label, still; a corner mark says how the last run ended (`last`: "✓ 12 s ago", "✗ 3 m ago", ■ stopped, ! interrupted) |
 | ARMING | client | bright fill rising bottom→top over `holdMs`; label stays; at 100%: pop |
-| CONFIRM | client | (confirm buttons) after first fire: flashing amber border + "AGAIN TO CONFIRM", times out after `confirmWindowMs`. A press begun inside the window confirms, even if it completes after it |
-| SENDING | client | from fire until the host acks (normally ms); if no ack in 2 s → FAILURE "NO RESPONSE". Pressing again meanwhile → BUSY (nothing is dropped silently) |
-| RUNNING | host | diagonal stripes scrolling across the whole button + elapsed seconds; `@status` text; `@progress` → determinate fill instead of stripes; `cancel` buttons show "tap/hold to cancel" once a cancel would count (700 ms after the start, see State store) |
-| SUCCESS | host | full-bleed green flood, giant ✓, result text, small elapsed; a thin bar drains over `resultHoldMs` |
-| FAILURE | host | full-bleed red, giant ✗, slow pulse, result text / exit code / "TIMEOUT"/"CANCELLED"; drains like success |
-| OFFLINE | client | grey, dashed border, ⚠; the last-known state stays visible underneath (stripes or progress dimmed and still, a green/red tint for a result, "RUNNING · 12s" / "LAST RUN: EXIT 3"); presses do nothing except shake |
+| CONFIRM | client | (confirm buttons) after the first fire: flashing amber border + "HOLD / TAP / DOUBLE-TAP / PRESS AGAIN TO CONFIRM" (said the way the first press was made: PRESS for a key), times out after `confirmWindowMs`. A press begun inside the window confirms, even if it completes after it |
+| SENDING | client | from fire until the host acks (normally ms); no ack in 2 s → NO RESPONSE. Pressing again meanwhile → BUSY (nothing is dropped silently) |
+| RUNNING | host | diagonal stripes scrolling across the whole button; the label stays the big text (never below ~9% of the button's height), the elapsed clock second (at most 90% of the label's size); `@status` text; `@progress` → a determinate fill, with the stripes still moving, slower, underneath (2% must not look READY); `cancel` buttons show "tap/hold to cancel" once a cancel would count (700 ms after the start); "+1 QUEUED" |
+| SUCCESS | host | full-bleed green flood, giant ✓, result text, small elapsed; a thin bar drains over `resultHoldMs`; "NEXT RUN QUEUED" when a queued re-run starts in 800 ms |
+| FAILURE | host | full-bleed red, ✗, slow pulse; the reason is the headline (the result text, ≤ 2 lines, else TIMEOUT / CAN'T START / EXIT 3 / KILLED), the exit code small print. This device's own failure stays until touched |
+| STOPPED | host | slate, ■, still: cancelled on purpose (a cancel press, another button's `stops`, removed by a config change): no red, no failure buzz |
+| UNKNOWN | client | amber, "?", dashed frame: NO RESPONSE (sent, no answer: it may or may not have run); IT RAN (it ran, the outcome is lost) |
+| INTERRUPTED | host | amber with dark hazard stripes, lightning glyph, pulse: the host stopped (or crashed) while it ran |
+| OFFLINE | client | grey, dashed border, ⚠; the last-known state stays visible underneath (stripes or progress dimmed and still, a tint for a result, "LAST SEEN RUNNING · 12s" frozen at the last word from the host, "LAST RUN: EXIT 3"); presses do nothing except shake, and try to reconnect |
 
-Badges flash over any state: BUSY (pressed while running or sending), BUSY / TRY AGAIN (the host
-refused a start for now: rate limit, last run still dying), NOT SENT, IT RAN, NOT ON HOST.
+Latched device state (`@state`, e.g. "REC ●", "ON 80%") is a solid chip in the top corner in every
+state, offline too. A run another device started gets an OTHER DEVICE mark.
+
+Sticky results: a FAILURE (and INTERRUPTED, NO RESPONSE, NOT SENT) of this device's own press stays
+until touched ("TAP TO CLEAR" / "HOLD TO RETRY"). That touch only clears it: a tap or a key doesn't
+fire; a hold that completes is a retry. A newer run on the button supersedes it.
+
+Badges flash over the face (as a small chip over a result, so the result stays readable): BUSY
+(pressed while running or sending; briefly and without a buzz within the cooldown), BUSY / TRY
+AGAIN (the host refused a start for now), ALREADY RUNNING (someone else's run got there first),
+ALREADY QUEUED, SLIPPED / HOLD (TAP) AGAIN (released early or slid off), NOT ON HOST.
 
 Text is laid out where it was measured: labels break only at spaces and at the phrase boundaries
 `Intl.Segmenter` finds in CJK/Thai text (rendered as `<wbr>`, with `word-break: keep-all`, and
 `auto-phrase` where the browser has it), so a size computed for two lines is laid out on two.
 Short buttons (≤ 84 px) put their items in one row with fixed shares of the width, dropping the
-glyph and then the number/title when the button isn't wide enough.
+glyph and then the number/headline when the button isn't wide enough. Chips: the trigger
+("HOLD 1.5s" for holds of a second or more; "TAP AGAIN" while a double waits for its second tap)
+and the key, by name (VOL+, SPACE, ↑, PG↓, ⏯…); on narrow buttons they shrink (the key loses its
+keyboard glyph, the trigger its word) rather than spill out.
+
+Forced colors (Windows high contrast): every face gets an edge, its border style differs by state
+(dotted running, double success, thick failure, dashed stopped/unknown/offline), the hold fill,
+progress and stripes paint in the highlight color, and the state is also written out (RUNNING,
+DONE, FAILED…).
 
 Triggers:
 
-- `hold`: fires when held `holdMs`. Released early → back to READY (fill drains fast).
-  Finger moving more than `driftPx` from the start point → cancel.
-- `tap`: fires on pointer up if it didn't drift, and if it was down at most 1.5 s (a resting
-  thumb is not a tap).
+- `hold`: fires when held `holdMs`. Released early → back to READY (fill drains fast) with
+  SLIPPED — HOLD AGAIN and a soft buzz. Finger moving more than `driftPx` from the start point →
+  the same.
+- `tap`: fires on pointer up if it didn't drift, was down at least 40 ms (a graze isn't a tap) and
+  at most 1.5 s (a resting thumb is not a tap).
 - `double`: two taps within 400 ms.
+- Contacts landing on 3+ buttons within 60 ms are a palm or a sleeve: none of them fires.
+- Cooldown (`cooldownMs`, default 400): after a fire, presses of that button from this device are
+  ignored for that long (no fire buzz, a brief BUSY): key chatter, a bounce.
+- Confirm: the confirming press must begin after the first press fully ended and at least 400 ms
+  (or the cooldown) after CONFIRM appeared, by the event's own time: a chattering key or a pothole
+  bounce doesn't confirm. The host also refuses a confirm button's press without `confirm: true`
+  (`needs-confirm`): the client then asks for the confirm step.
+- A press begun while the button looked READY isn't sent if someone else's run started before it
+  fired (on a cancel button it would cancel theirs): ALREADY RUNNING.
+- A config change that moves, resizes or removes the button under a held finger (or a switch of
+  pad) cancels the press.
 - Timing goes by the input events' own timestamps, not by when a handler ran: on a stalled main
   thread a finger lifted before `holdMs` doesn't fire, one held past it does (a late hold timer
   first lets queued input land).
@@ -378,21 +449,30 @@ Triggers:
   mid-press doesn't change it.
 - Keyboard: `key` maps a KeyboardEvent.key to a button (BLE remotes/clickers pair as keyboards,
   and send keydown and keyup together). A mapped key fires on keydown for `hold` and `tap`
-  buttons alike (no hold); `double` = two keydowns within 400 ms; confirm still applies;
-  auto-repeat ignored. Enter/Space on a focused control stay with that control.
-- Multi-touch: each button tracks its own pointers; pressing two buttons at once works.
+  buttons alike (no hold); `double` = two keydowns within 400 ms (and not within 60 ms: a bounce);
+  confirm and cooldown still apply; auto-repeat ignored. Enter/Space on a focused control stay
+  with that control. Keys are global: the pad on screen first, else the one button on any other
+  pad with that key fires (a toast says "▶ PULL OVER (Ride)"); a key on several other pads does
+  nothing and says so. Keys keep working while the menu is open (the key closes it).
+- Every button has one controller for the whole session (`src/web/run/session.ts`), whichever pad
+  is on screen: a run's outcome still buzzes after switching pads.
+- Multi-touch: each button tracks its own pointers; pressing two buttons at once works (not in
+  rough mode).
 - Haptics: `navigator.vibrate` where it exists (touch, fire, confirm, success, failure, busy,
-  denied, a soft "cancelled" for a press that came to nothing, "unknown" for NO RESPONSE). iOS:
-  the first tick happens synchronously in the gesture handler. Optional sounds (device setting,
-  default off), unlocked on any user-activation event.
+  denied, a soft "cancelled" for a press that came to nothing, "unknown" for NO RESPONSE /
+  INTERRUPTED), only for this device's own runs. iOS (no vibrate: the system switch's tick): fired
+  1 tick, success 2, failure 3; the first tick happens synchronously in the gesture handler.
+  Optional sounds (device setting, default off), unlocked on any user-activation event.
 
 ### Keep awake
 
 Wake Lock API needs a secure context, which a LAN `http://` page isn't. So: use Wake Lock when
-available; otherwise fall back to a muted, inline, looping tiny video (the NoSleep trick). Show
-the keep-awake status in the menu. Re-acquire on `visibilitychange`. Until the screen is held,
-every user-activation event (a touch counts on its way up) starts the video synchronously inside
-the handler.
+available; otherwise fall back to a muted, inline, looping tiny video (the NoSleep trick). The
+menu says it in plain words ("Keeping the screen on (video trick — plain-HTTP pages can't use
+Wake Lock)", "Tap anywhere to keep the screen on", "Off: the screen may go dark and lock"); the
+bar shows SCREEN MAY SLEEP while it's off or not holding. Re-acquire on `visibilitychange`. Until
+the screen is held, every user-activation event (a touch counts on its way up) starts the video
+synchronously inside the handler.
 
 ### Edit mode (admin only)
 
