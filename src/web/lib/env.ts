@@ -116,12 +116,33 @@ const channel = typeof MessageChannel === 'function' ? new MessageChannel() : nu
 const queued: (() => void)[] = [];
 if (channel) channel.port1.onmessage = () => queued.shift()?.();
 
-/**
- * Run `fn` as a new task, after whatever is already queued. A timer that fires late (the main
- * thread was stalled) uses it to let queued input or socket messages land before it decides.
- */
+/** Run `fn` as a new task, after whatever is already queued. */
 export function nextTask(fn: () => void): void {
   if (!channel) return void setTimeout(fn, 0);
   queued.push(fn);
   channel.port2.postMessage(0);
+}
+
+/**
+ * Run `fn` once input and messages that queued up during a stall have landed: a timer that fires
+ * late uses it before it decides anything. One task isn't enough. After a long task Chromium hands
+ * queued touch input to the page after the next frame or two (measured: 2–15 ms after the stall,
+ * behind rAF callbacks, posted messages and setTimeout 0). So: two frames and at least `minMs`,
+ * then a task. Hidden pages get no frames, hence the fallback timeout.
+ */
+export function afterQueuedInput(fn: () => void, minMs = 80): void {
+  const start = mono();
+  let frames = 0;
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true;
+    nextTask(fn);
+  };
+  const frame = () => {
+    if (++frames < 2) return void requestAnimationFrame(frame);
+    setTimeout(go, Math.max(0, minMs - (mono() - start)));
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(frame);
+  setTimeout(go, minMs + 250);
 }

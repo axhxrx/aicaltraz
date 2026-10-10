@@ -52,6 +52,22 @@ test('press role has no Edit entry; admin does', async ({ page }) => {
   await expect(page.getByTestId('edit-mode')).toBeVisible();
 });
 
+test('"Pair again" takes a second tap to forget the token, and a locked pad (?lock) has none', async ({ page }) => {
+  await open(page, host.pressToken, '?pad=main&lock');
+  await page.getByTestId('menu-btn').click();
+  await expect(page.getByTestId('menu')).toBeVisible();
+  await expect(page.getByTestId('menu-repair')).toHaveCount(0);
+  await open(page);
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-repair').click();
+  // One tap only arms it: still paired.
+  await expect(page.getByTestId('menu-repair-confirm')).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('buttpad.token'))).toBe(host.pressToken);
+  await page.getByTestId('menu-repair-confirm').click();
+  await expect(page.getByTestId('pairing')).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem('buttpad.token'))).toBeNull();
+});
+
 test('hold to fire runs the script: status, then success with its output', async ({ page, hasTouch }) => {
   await open(page);
   const f = new Fingers(page, hasTouch);
@@ -98,8 +114,9 @@ test('ignored press while running flashes BUSY; cancel kills the run', async ({ 
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'running');
   await expect(btn(page, 'cancel')).toContainText('%');
-  // The host takes a cancel within CANCEL_GRACE_MS (700 ms) of the start as a double press.
-  await page.waitForTimeout(800);
+  // The host takes a cancel within CANCEL_GRACE_MS (700 ms) of the start as a double press; the
+  // hint only appears once a cancel would count.
+  await expect(btn(page, 'cancel')).toContainText('TAP TO CANCEL');
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'failure');
   await expect(btn(page, 'cancel')).toContainText('CANCELLED');
@@ -153,7 +170,7 @@ test('hand edits to the config file show up live; a broken file warns admins', a
   await open(page, host.adminToken);
   const original = readFileSync(host.configPath, 'utf8');
   const cfg = JSON.parse(original) as typeof FLOW_CONFIG;
-  cfg.pads[0]!.buttons[0]!.label = 'Renamed live';
+  cfg.pads[0]!.buttons![0]!.label = 'Renamed live';
   writeFileSync(host.configPath, JSON.stringify(cfg, null, 2));
   await expect(btn(page, 'hold')).toContainText('Renamed live', { timeout: 5000 });
 

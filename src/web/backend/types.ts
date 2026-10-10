@@ -9,6 +9,12 @@ import type { Store } from '../lib/store.ts';
 /** connecting: never reached the host yet. offline: lost it, retrying. unauthorized: token rejected. */
 export type ConnStatus = 'connecting' | 'online' | 'offline' | 'unauthorized';
 
+/**
+ * Host semantics (src/server/state-store.ts): a `cancel` press this soon after its run started is
+ * taken as a double press and ignored. The demo mirrors it; the UI holds back the cancel hint.
+ */
+export const CANCEL_GRACE_MS = 700;
+
 export interface Snapshot {
   status: ConnStatus;
   role: Role | null;

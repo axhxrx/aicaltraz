@@ -2,12 +2,13 @@
  * The pure visual of one button: a ButtonVM in, DOM out. No input handling of its own (handlers
  * are passed through), so edit mode can render the same face with a static READY vm.
  */
-import type { HTMLAttributes } from 'preact';
+import { Fragment, type HTMLAttributes } from 'preact';
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { inkFor } from '../lib/color.ts';
 import { fmtElapsed } from '../lib/env.ts';
-import { fitFontSize, lineFontSize, useFontEpoch } from '../lib/fit.ts';
+import { chunks, fitFontSize, langOf, lineFontSize, lineWidths, useFontEpoch } from '../lib/fit.ts';
 import { Check, Cross, DoubleTap, Hold, Keyboard, Lock, Tap, Warn } from '../ui/icons.tsx';
+import type { FlashKind } from './controller.ts';
 import type { ButtonVM } from './view.ts';
 
 export interface FaceProps extends Omit<HTMLAttributes<HTMLDivElement>, 'style' | 'class'> {
@@ -24,13 +25,23 @@ const calm = typeof matchMedia === 'function' ? matchMedia('(prefers-reduced-mot
 /** Pop/shake are decoration; the fill, flash and colors carry the meaning, so they stay. */
 const move = (el: HTMLElement | null, k: Keyframe[], o: KeyframeAnimationOptions) => !calm?.matches && el?.animate(k, o);
 
-/** Multi-line text sized to its box (see lib/fit.ts); `weight` must match the CSS. */
+/**
+ * Multi-line text sized to its box (see lib/fit.ts); `weight` must match the CSS. It is laid out
+ * from the same chunks it was measured with: a space or a <wbr> between two, and no other breaks
+ * (CSS keep-all), so the browser wraps it the way the size was computed for (CJK included).
+ */
 function Fit({ text, class: cls, weight = 900, lines }: { text: string; class: string; weight?: number; lines?: number }) {
   useFontEpoch();
-  if (!text.trim()) return null;
+  const parts = useMemo(() => chunks(text), [text]);
+  if (!parts.length) return null;
   return (
-    <div class={cls} style={{ fontSize: fitFontSize(text, weight, lines) }}>
-      {text}
+    <div class={cls} lang={langOf(text)} style={{ fontSize: fitFontSize(text, weight, lines) }}>
+      {parts.map((c, i) => (
+        <Fragment key={i}>
+          {i === 0 ? null : c.spaced ? ' ' : <wbr />}
+          {c.text}
+        </Fragment>
+      ))}
     </div>
   );
 }
@@ -126,14 +137,25 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
           {vm.text && <Sub text={vm.text} />}
         </>
       );
-    case 'offline':
+    case 'offline': {
+      // What the host was last seen doing (its look stays underneath, dimmed and still).
+      const was =
+        vm.under === 'running'
+          ? `RUNNING · ${vm.progress !== undefined ? `${Math.round(vm.progress)}%` : fmtElapsed(now - (vm.startedAt ?? now))}`
+          : vm.under === 'success'
+            ? 'LAST RUN OK'
+            : vm.under === 'failure'
+              ? `LAST RUN: ${vm.title ?? 'FAILED'}`
+              : null;
       return (
         <>
           <Warn class="bp-icon" />
           {label}
           <div class="bp-sub bp-offline-tag">OFFLINE</div>
+          {was && <Line class="bp-sub bp-offline-was" text={was} trackEm={0.06} />}
         </>
       );
+    }
   }
 }
 
@@ -145,7 +167,17 @@ const Dots = () => (
   </div>
 );
 
-const BADGE: Record<string, string> = { busy: 'BUSY', unknown: 'NOT ON HOST' };
+/** Flash badges: [big word, smaller second line]. */
+const BADGE: Partial<Record<FlashKind, [string, string?]>> = {
+  busy: ['BUSY'],
+  later: ['BUSY', 'TRY AGAIN'],
+  unknown: ['NOT ON HOST'],
+  notsent: ['NOT SENT'],
+  ran: ['IT RAN'],
+};
+const SHAKES: FlashKind[] = ['busy', 'later', 'denied', 'notsent'];
+/** As big as the button allows: the word (plus padding) fits 88% of the width. */
+const badgeSize = (word: string) => `clamp(12px, min(17cqh, calc(88cqw / ${((lineWidths(word)[0] ?? 3) + 1.1 + 0.04 * word.length).toFixed(3)})), 110px)`;
 
 export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
   const face = useRef<HTMLDivElement>(null);
@@ -190,9 +222,9 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
     }
   }, [vm.firedAt]);
 
-  // BUSY / pressed while offline: shake.
+  // BUSY / pressed while offline / not sent: shake.
   useLayoutEffect(() => {
-    if (vm.flash && (vm.flash.kind === 'busy' || vm.flash.kind === 'denied')) move(face.current, SHAKE, { duration: 420, easing: 'ease-out' });
+    if (vm.flash && SHAKES.includes(vm.flash.kind)) move(face.current, SHAKE, { duration: 420, easing: 'ease-out' });
   }, [vm.flash?.at]);
 
   // Countdown bars: start where the host (or the confirm window) says they started.
@@ -204,22 +236,27 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
   }, [v, vm.endedAt, vm.confirmUntil]);
 
   const ink = inkFor(vm.color);
+  // Offline: the last-known state's layers stay, under the OFFLINE look.
+  const u = v === 'offline' ? vm.under : v;
+  const badge = vm.flash ? BADGE[vm.flash.kind] : undefined;
   return (
     <div
       class={`bp-btn${cls ? ` ${cls}` : ''}`}
       data-visual={v}
+      data-under={v === 'offline' ? vm.under : undefined}
       data-testid={`btn-${vm.id}`}
       data-flash={vm.flash?.kind}
       role="button"
-      aria-label={`${vm.label || vm.id}: ${v}`}
+      aria-label={`${vm.label || vm.id}: ${v}${v === 'offline' && vm.under && vm.under !== 'ready' ? ` (last seen ${vm.under})` : ''}`}
       style={{ '--bg': vm.color, '--ink': ink, ...style }}
       {...rest}
     >
       <div ref={face} class={`bp-face${vm.pressed ? ' is-pressed' : ''}`}>
         <div class="bp-base" />
-        {v === 'running' && vm.progress === undefined && <div class="bp-stripes" />}
-        {v === 'running' && vm.progress !== undefined && <div class="bp-prog" style={{ '--p': String(vm.progress / 100) }} />}
+        {u === 'running' && vm.progress === undefined && <div class="bp-stripes" />}
+        {u === 'running' && vm.progress !== undefined && <div class="bp-prog" style={{ '--p': String(vm.progress / 100) }} />}
         {(v === 'success' || v === 'failure') && <div key={`${v}${vm.endedAt}`} class="bp-flood" />}
+        {v === 'offline' && (u === 'success' || u === 'failure') && <div class={`bp-tint is-${u}`} />}
         {v === 'failure' && <div class="bp-pulse" />}
         <div ref={arm} class="bp-arm" />
         <div ref={flash} class="bp-flash" />
@@ -234,9 +271,10 @@ export function ButtonFace({ vm, now, class: cls, style, ...rest }: FaceProps) {
           </div>
         )}
         {drain && <div key={`${drain.kind}${vm.endedAt ?? vm.confirmUntil}`} class={`bp-drain bp-drain-${drain.kind}`} style={{ animationDuration: `${drain.duration}ms`, animationDelay: `${drain.delay}ms` }} />}
-        {vm.flash && BADGE[vm.flash.kind] && (
-          <div key={vm.flash.at} class="bp-badge">
-            {BADGE[vm.flash.kind]}
+        {vm.flash && badge && (
+          <div key={vm.flash.at} class="bp-badge" style={{ fontSize: badgeSize(badge[0]) }}>
+            {badge[0]}
+            {badge[1] && <small>{badge[1]}</small>}
           </div>
         )}
       </div>

@@ -9,7 +9,7 @@
 import type { RunState } from '../../core/machine.ts';
 import type { PressResult, WireButton } from '../../core/protocol.ts';
 import { PressError } from '../backend/types.ts';
-import { mono, nextTask } from '../lib/env.ts';
+import { afterQueuedInput, mono } from '../lib/env.ts';
 import { cue, haptic, unlockAudio } from '../lib/feedback.ts';
 import { createStore } from '../lib/store.ts';
 
@@ -186,17 +186,19 @@ export class ButtonController {
     if (b.trigger === 'hold') {
       haptic('touch');
       this.patch({ input: 'arming', armAt: now - Math.max(0, mono() - t), armMs: b.holdMs });
-      this.after('hold', Math.max(0, t + b.holdMs - mono()), () => this.holdDue(next, 0));
+      this.after('hold', Math.max(0, t + b.holdMs - mono()), () => this.holdDue(next, false));
     } else this.patch({ input: 'pressed' });
     return true;
   }
 
-  /** The hold timer. Late (a stalled main thread) → a pointerup may be queued behind it: yield first. */
-  private holdDue(g: Gesture, yields: number) {
+  /**
+   * The hold timer. Running late means the main thread stalled, and a pointerup from before
+   * holdMs may still be queued behind it: let queued input land first (up() then decides by the
+   * event's own time). A finger still down after that has held long enough.
+   */
+  private holdDue(g: Gesture, waited: boolean) {
     if (this.g !== g || g.fired) return;
-    const inputPending = (navigator as { scheduling?: { isInputPending?(): boolean } }).scheduling?.isInputPending?.() === true;
-    const late = mono() - (g.t0 + g.holdMs) > LATE_MS;
-    if (yields < 3 && (inputPending || (yields === 0 && late))) return nextTask(() => this.holdDue(g, yields + 1));
+    if (!waited && mono() - (g.t0 + g.holdMs) > LATE_MS) return afterQueuedInput(() => this.holdDue(g, true));
     this.fireGesture(g);
   }
 

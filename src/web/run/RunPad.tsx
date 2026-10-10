@@ -1,9 +1,10 @@
 /** Run mode: the pad grid, live buttons (pointer + keyboard), wired to a Backend. */
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { buttonKey } from '../../core/config.ts';
 import type { WireButton, WirePad } from '../../core/protocol.ts';
 import type { Backend } from '../backend/types.ts';
+import { eventTime } from '../lib/env.ts';
 import { useStore } from '../lib/store.ts';
 import { ButtonFace } from './ButtonFace.tsx';
 import { ButtonController } from './controller.ts';
@@ -41,7 +42,14 @@ function RunButton({ backend, padId, button, registry }: { backend: Backend; pad
   const link = useStore(backend.snapshot, (s) => s.status);
   const skew = useStore(backend.snapshot, (s) => s.clockSkew);
   const ctrl = useMemo(() => new ButtonController(), []);
-  ctrl.setCtx({ button, host, online: link === 'online', press: () => backend.press(padId, button.id), kick: () => backend.kick() });
+  ctrl.setCtx({
+    button,
+    // Live, not this render's copies: an ack or a dropped link lands between renders.
+    host: () => backend.snapshot.get().states[key] ?? READY,
+    online: () => backend.snapshot.get().status === 'online',
+    press: (onSent) => backend.press(padId, button.id, onSent),
+    kick: () => backend.kick(),
+  });
   const local = useStore(ctrl.local);
   useEffect(() => ctrl.onHost(host), [host]);
   useEffect(() => ctrl.onLink(link === 'online'), [link]);
@@ -64,10 +72,15 @@ function RunButton({ backend, padId, button, registry }: { backend: Backend; pad
       onPointerDown={(e) => {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
         e.preventDefault();
-        if (ctrl.down(src(e), e.clientX, e.clientY)) e.currentTarget.setPointerCapture(e.pointerId);
+        if (!ctrl.down(src(e), e.clientX, e.clientY, eventTime(e))) return;
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          /* the pointer is gone already (its up is queued right behind) */
+        }
       }}
-      onPointerMove={(e) => ctrl.move(src(e), e.clientX, e.clientY)}
-      onPointerUp={(e) => ctrl.up(src(e))}
+      onPointerMove={(e) => ctrl.move(src(e), e.clientX, e.clientY, eventTime(e))}
+      onPointerUp={(e) => ctrl.up(src(e), eventTime(e))}
       onPointerCancel={(e) => ctrl.abort(src(e))}
       onLostPointerCapture={(e) => ctrl.abort(src(e))}
     />
@@ -86,45 +99,45 @@ export function matchKey(buttons: WireButton[], key: string): WireButton | undef
 
 const typing = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('input:not([type=checkbox]):not([type=radio]), textarea, select, [contenteditable]');
+/** Enter/Space on a focused control (menu button, tabs) belong to that control. */
+const control = (t: EventTarget | null) => t instanceof Element && !!t.closest('button, a[href], summary, [role=switch], [role=tab]');
 
-/** BLE remotes/clickers pair as keyboards: keydown starts the press, keyup releases. */
+/**
+ * BLE remotes/clickers pair as keyboards, and send keydown and keyup in one go: a mapped key fires
+ * its button on keydown, hold and tap triggers alike (holding a key is no gesture; auto-repeat is
+ * ignored). A double fires on the second keydown within 400 ms. Confirm still applies.
+ */
 function useKeys(pad: WirePad, registry: Registry, enabled: boolean) {
+  // The latest pad, without re-subscribing on every config broadcast.
+  const padRef = useRef(pad);
+  padRef.current = pad;
   useEffect(() => {
     if (!enabled) return;
-    const held = new Map<string, string>();
+    const held = new Set<string>();
     const down = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
-      const b = matchKey(pad.buttons, e.key);
+      if ((e.key === 'Enter' || e.key === ' ') && control(e.target)) return;
+      const b = matchKey(padRef.current.buttons, e.key);
       if (!b) return;
       e.preventDefault();
-      if (e.repeat) return;
       const code = e.code || e.key;
-      if (held.has(code)) return;
-      held.set(code, b.id);
-      registry.get(b.id)?.down(`k${code}`, 0, 0);
+      if (e.repeat || held.has(code)) return;
+      held.add(code);
+      registry.get(b.id)?.key(eventTime(e));
     };
     const up = (e: KeyboardEvent) => {
-      const code = e.code || e.key;
-      const id = held.get(code);
-      if (id === undefined) return;
-      held.delete(code);
-      e.preventDefault();
-      registry.get(id)?.up(`k${code}`);
+      if (held.delete(e.code || e.key)) e.preventDefault();
     };
-    const blur = () => {
-      for (const [code, id] of held) registry.get(id)?.abort(`k${code}`);
-      held.clear();
-    };
+    const blur = () => held.clear();
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     window.addEventListener('blur', blur);
     return () => {
-      blur();
       window.removeEventListener('keydown', down);
       window.removeEventListener('keyup', up);
       window.removeEventListener('blur', blur);
     };
-  }, [pad, registry, enabled]);
+  }, [pad.id, registry, enabled]);
 }
 
 export function RunPad({ backend, pad, keys = true }: { backend: Backend; pad: WirePad; keys?: boolean }) {

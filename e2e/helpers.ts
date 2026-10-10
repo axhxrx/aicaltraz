@@ -8,6 +8,32 @@ export async function expectVisual(page: Page, id: string, visual: string, timeo
   await expect(btn(page, id)).toHaveAttribute('data-visual', visual, { timeout });
 }
 
+/** Records every backend.press() from now on; the returned getter lists the button ids so far. */
+export async function trackPresses(page: Page): Promise<() => Promise<string[]>> {
+  await page.evaluate(() => {
+    type P = (pad: string, id: string, onSent?: () => void) => Promise<unknown>;
+    const b = window.__buttpad!.backend as unknown as { press: P };
+    const orig = b.press.bind(b);
+    const w = window as unknown as { __presses: string[] };
+    w.__presses = [];
+    b.press = (pad, id, onSent) => (w.__presses.push(id), orig(pad, id, onSent));
+  });
+  return () => page.evaluate(() => (window as unknown as { __presses: string[] }).__presses.slice());
+}
+
+/** Before the app loads: navigator.vibrate records its patterns (window.__vib, as JSON strings). */
+export async function recordVibrations(page: Page): Promise<() => Promise<string[]>> {
+  await page.addInitScript(() => {
+    const w = window as unknown as { __vib: string[] };
+    w.__vib = [];
+    navigator.vibrate = ((p: VibratePattern) => (w.__vib.push(JSON.stringify(p)), true)) as Navigator['vibrate'];
+  });
+  return () => page.evaluate(() => (window as unknown as { __vib: string[] }).__vib.slice());
+}
+
+/** Haptic patterns (src/web/lib/feedback.ts), as recordVibrations() sees them. */
+export const VIB = { touch: '8', fire: '35', failure: '[320]', success: '[40,70,40]', busy: '[18,50,18,50,18]', denied: '[70,50,70]', cancel: '[12,120,12]', unknown: '[100,80,100,80,100]' };
+
 /** Seeds the demo backend's config (localStorage) before the app boots. */
 export async function seedDemo(page: Page, config: ConfigInput): Promise<void> {
   await page.addInitScript((cfg) => {
@@ -46,8 +72,9 @@ export class Fingers {
     return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   }
 
-  async down(buttonId: string, finger = 1): Promise<void> {
-    const p = await this.center(buttonId);
+  async down(buttonId: string, finger = 1, offset: Pt = { x: 0, y: 0 }): Promise<void> {
+    const c = await this.center(buttonId);
+    const p = { x: c.x + offset.x, y: c.y + offset.y };
     this.active.set(finger, p);
     if (this.touch) await this.send('touchStart');
     else {
@@ -79,6 +106,35 @@ export class Fingers {
     await this.down(buttonId);
     await this.page.waitForTimeout(ms);
     await this.up();
+  }
+
+  /**
+   * One finger down/up stamped with an explicit event time (epoch ms), whenever it actually gets
+   * there: for tests that stall the page's main thread and mustn't depend on Node's timers.
+   */
+  async downAt(buttonId: string, at: number): Promise<void> {
+    const p = await this.center(buttonId);
+    this.active.set(1, p);
+    await this.stamped('down', p, at);
+  }
+
+  async upAt(at: number): Promise<void> {
+    const p = this.active.get(1);
+    if (!p) throw new Error('no finger is down');
+    this.active.delete(1);
+    await this.stamped('up', p, at);
+  }
+
+  private async stamped(kind: 'down' | 'up', p: Pt, at: number) {
+    this.cdp ??= await this.page.context().newCDPSession(this.page);
+    const timestamp = at / 1000;
+    if (this.touch) {
+      const touchPoints = [{ id: 1, x: p.x, y: p.y, radiusX: 8, radiusY: 8, force: 1 }];
+      await this.cdp.send('Input.dispatchTouchEvent', { type: kind === 'down' ? 'touchStart' : 'touchEnd', touchPoints, timestamp });
+      return;
+    }
+    if (kind === 'down') await this.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, timestamp });
+    await this.cdp.send('Input.dispatchMouseEvent', { type: kind === 'down' ? 'mousePressed' : 'mouseReleased', x: p.x, y: p.y, button: 'left', buttons: kind === 'down' ? 1 : 0, clickCount: 1, timestamp });
   }
 
   async tap(buttonId: string): Promise<void> {

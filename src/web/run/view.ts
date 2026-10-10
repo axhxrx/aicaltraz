@@ -1,7 +1,7 @@
 /** Host state + client-local state → one visual state and the bits needed to draw it. */
 import type { RunState } from '../../core/machine.ts';
 import type { WireButton } from '../../core/protocol.ts';
-import type { ConnStatus } from '../backend/types.ts';
+import { CANCEL_GRACE_MS, type ConnStatus } from '../backend/types.ts';
 import type { FlashKind, Local } from './controller.ts';
 
 export type Visual = 'ready' | 'arming' | 'confirm' | 'sending' | 'running' | 'success' | 'failure' | 'offline';
@@ -37,6 +37,8 @@ export interface ButtonVM {
   resultHoldMs?: number;
   confirmUntil?: number;
   confirmMs?: number;
+  /** OFFLINE: what the host was last seen doing (ready, running, success, failure), shown underneath. */
+  under?: Visual;
 }
 
 export const READY: RunState = { phase: 'ready', runId: 0 };
@@ -49,6 +51,31 @@ function failureTitle(s: Extract<RunState, { phase: 'failure' }>): string {
   if (s.reason === 'cancelled') return 'CANCELLED';
   if (s.reason === 'spawn') return "CAN'T START";
   return s.exitCode === null ? 'KILLED' : `EXIT ${s.exitCode}`;
+}
+
+/** What the host says, as a visual (no client-local states). */
+function hostView(b: WireButton, host: RunState, skew: number, now: number): Partial<ButtonVM> & { visual: Visual } {
+  if (host.phase === 'running')
+    return {
+      visual: 'running',
+      startedAt: host.startedAt + skew,
+      progress: host.progress,
+      status: host.status,
+      // The host ignores a cancel this soon after the start (it would be a double press): don't offer one yet.
+      cancelHint: b.whileRunning === 'cancel' && !host.cancelling && now - (host.startedAt + skew) >= CANCEL_GRACE_MS,
+      cancelling: host.cancelling,
+      queued: host.queued,
+    };
+  if (host.phase === 'success' || host.phase === 'failure')
+    return {
+      visual: host.phase,
+      startedAt: host.startedAt + skew,
+      endedAt: host.endedAt + skew,
+      title: host.phase === 'failure' ? failureTitle(host) : undefined,
+      text: host.text,
+      resultHoldMs: b.resultHoldMs,
+    };
+  return { visual: 'ready' };
 }
 
 export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus, skew: number, now: number): ButtonVM {
@@ -69,13 +96,16 @@ export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus
     flash: l.flash,
     sendingOverlay: false,
   };
+  const fromHost = hostView(b, host, skew, now);
   // While first connecting the grid is just dimmed (no grey flash on every page load).
   if (link === 'offline' || link === 'unauthorized') {
-    vm.visual = 'offline';
-    vm.arming = null;
-    return vm;
+    // What the host was last seen doing stays visible under the OFFLINE look. A result runs out
+    // when it would have; a run can only be shown as last seen.
+    const over = (fromHost.visual === 'success' || fromHost.visual === 'failure') && now > (fromHost.endedAt ?? 0) + b.resultHoldMs;
+    const under = over ? { visual: 'ready' as const } : fromHost;
+    return { ...vm, ...under, cancelHint: false, visual: 'offline', under: under.visual, arming: null };
   }
-  const running = host.phase === 'running';
+  const running = fromHost.visual === 'running';
   if (l.sending && !running) {
     vm.visual = 'sending';
     return vm;
@@ -83,37 +113,17 @@ export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus
   if (l.noResponse && host.runId <= l.noResponse.baseRunId && !running) {
     return { ...vm, visual: 'failure', title: 'NO RESPONSE', text: 'The host didn’t answer in 2 s', startedAt: l.noResponse.at, endedAt: l.noResponse.at, resultHoldMs: l.noResponse.until - l.noResponse.at };
   }
-  if (host.phase === 'running') {
-    return {
-      ...vm,
-      visual: 'running',
-      sendingOverlay: !!l.sending,
-      startedAt: host.startedAt + skew,
-      progress: host.progress,
-      status: host.status,
-      cancelHint: b.whileRunning === 'cancel' && !host.cancelling,
-      cancelling: host.cancelling,
-      queued: host.queued,
-    };
-  }
+  if (running) return { ...vm, ...fromHost, sendingOverlay: !!l.sending };
   if (l.confirmUntil > now) return { ...vm, visual: 'confirm', confirmUntil: l.confirmUntil, confirmMs: b.confirmWindowMs };
-  if (host.phase === 'success' || host.phase === 'failure') {
-    return {
-      ...vm,
-      visual: host.phase,
-      startedAt: host.startedAt + skew,
-      endedAt: host.endedAt + skew,
-      title: host.phase === 'failure' ? failureTitle(host) : undefined,
-      text: host.text,
-      resultHoldMs: b.resultHoldMs,
-    };
-  }
+  if (fromHost.visual !== 'ready') return { ...vm, ...fromHost };
   if (vm.arming) vm.visual = 'arming';
   return vm;
 }
 
-/** Re-render cadence a VM needs for its clock (0 = none). */
+/** Re-render cadence a VM needs (0 = none): running clocks, the cancel hint's grace, offline results running out. */
 export function tickFor(vm: ButtonVM, now: number): number {
-  if (vm.visual !== 'running' || vm.startedAt === undefined) return 0;
+  const under = vm.visual === 'offline' ? vm.under : vm.visual;
+  if (vm.visual === 'offline' && (under === 'success' || under === 'failure')) return 500;
+  if (under !== 'running' || vm.startedAt === undefined) return 0;
   return now - vm.startedAt < 10_000 ? 100 : 500;
 }

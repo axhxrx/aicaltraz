@@ -109,21 +109,11 @@ test('confirm: first fire asks again, second fires; the window times out', async
   await expectVisual(page, 'confirm', 'success');
 });
 
-test('keyboard: keydown starts the hold, keyup releases; tap keys fire on keyup', async ({ page }) => {
-  await page.keyboard.down('h');
-  await expectVisual(page, 'hold', 'arming');
+test('keyboard: a mapped key fires on keydown, hold and tap buttons alike (clickers send down+up at once)', async ({ page }) => {
+  // An instant down/up on a hold button: no hold needed.
+  await page.keyboard.press('h');
   await expectVisual(page, 'hold', 'running');
-  await page.keyboard.up('h');
   await expectVisual(page, 'hold', 'success');
-
-  // Released early: no fire.
-  await expectVisual(page, 'hold', 'ready', 4000);
-  await page.keyboard.down('h');
-  await page.waitForTimeout(120);
-  await page.keyboard.up('h');
-  await page.waitForTimeout(600);
-  await expectVisual(page, 'hold', 'ready');
-
   await page.keyboard.press('t');
   await expectVisual(page, 'tap', 'running');
 });
@@ -155,7 +145,7 @@ test('multi-touch: lifting one finger only cancels its own button', async ({ pag
   await expectVisual(page, 'hold2', 'ready');
 });
 
-test('a second finger on the same button is ignored', async ({ page, hasTouch }) => {
+test('a second finger on the same button does not cancel the first one', async ({ page, hasTouch }) => {
   test.skip(!hasTouch, 'needs a touch screen');
   await f.down('hold', 1);
   await page.waitForTimeout(100);
@@ -227,11 +217,22 @@ test('offline: grey + dashed, presses only shake; recovers on reconnect', async 
   await expectVisual(page, 'tap', 'running');
 });
 
-test('a run keeps going while offline and is shown after reconnecting', async ({ page }) => {
+test('a run keeps going while offline: its last-known state stays visible, and shows again after reconnecting', async ({ page }) => {
   await f.tap('slow');
+  await f.tap('fail');
   await expectVisual(page, 'slow', 'running');
+  await expectVisual(page, 'fail', 'failure');
   await page.evaluate(() => (window.__buttpad!.backend as unknown as { setOnline(v: boolean): void }).setOnline(false));
   await expectVisual(page, 'slow', 'offline');
+  // OFFLINE on top, the running stripes (dimmed, still) and what it was doing underneath.
+  await expect(btn(page, 'slow')).toHaveAttribute('data-under', 'running');
+  await expect(btn(page, 'slow').locator('.bp-stripes')).toHaveCount(1);
+  await expect(btn(page, 'slow')).toContainText('OFFLINE');
+  await expect(btn(page, 'slow')).toContainText('RUNNING');
+  await expect(btn(page, 'fail')).toHaveAttribute('data-under', 'failure');
+  await expect(btn(page, 'fail')).toContainText('LAST RUN: EXIT 2');
+  // A result runs out (resultHoldMs 1500) as it would have: then it's just OFFLINE.
+  await expect(btn(page, 'fail')).toHaveAttribute('data-under', 'ready', { timeout: 3000 });
   await page.evaluate(() => (window.__buttpad!.backend as unknown as { setOnline(v: boolean): void }).setOnline(true));
   await expectVisual(page, 'slow', 'running');
 });

@@ -12,10 +12,8 @@ import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import { DEMO_CONFIG } from './demo-config.ts';
 import { simulate, type SimHandle } from './demo-script.ts';
-import { emptySnapshot, PressError, type Backend, type SaveResult, type Snapshot } from './types.ts';
+import { CANCEL_GRACE_MS, emptySnapshot, PressError, type Backend, type SaveResult, type Snapshot } from './types.ts';
 
-/** As on the host (src/server/state-store.ts): a cancel this soon after the start is a double press. */
-export const CANCEL_GRACE_MS = 700;
 /** As on the host: presses that start or queue a run, over all buttons: bursts of 20, then 10/s; 32 at once. */
 const LIMITS = { burst: 20, perSec: 10, maxRunning: 32 };
 

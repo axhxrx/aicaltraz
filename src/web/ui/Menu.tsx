@@ -1,6 +1,6 @@
 /** The menu sheet: fullscreen, keep-awake status, device settings, edit entry, pairing. */
 import type { ComponentChildren } from 'preact';
-import { useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import type { Backend } from '../backend/types.ts';
 import { DemoBackend } from '../backend/demo.ts';
 import { fullscreenSupported, isFullscreen, toggleFullscreen } from '../lib/env.ts';
@@ -37,6 +37,26 @@ function Toggle(p: { on: boolean; disabled?: boolean; onChange(v: boolean): void
     <button type="button" role="switch" class="bp-switch" aria-checked={p.on} aria-label={p.label} disabled={p.disabled} data-testid={p.testid} onClick={() => p.onChange(!p.on)}>
       <i />
     </button>
+  );
+}
+
+/** Forgetting the token is one stray tap away from a dead remote: it takes a second tap within 4 s. */
+function RepairRow(p: { onRepair(): void }) {
+  const [armed, setArmed] = useState(false);
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [armed]);
+  return (
+    <Row
+      icon={<Link />}
+      title={armed ? 'Tap again to forget the token' : 'Pair again'}
+      note={armed ? 'This device stops working as a remote until it is paired again' : "Forget this device's token"}
+      onClick={() => (armed ? p.onRepair() : setArmed(true))}
+      danger
+      testid={armed ? 'menu-repair-confirm' : 'menu-repair'}
+    />
   );
 }
 
@@ -106,7 +126,8 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
             <Row icon={<Bolt />} title="Reset demo pads" onClick={() => (demo.reset(), p.onClose())} testid="demo-reset" />
           </>
         )}
-        {p.backend.kind === 'ws' && <Row icon={<Link />} title="Pair again" note="Forget this device's token" onClick={p.onRepair} danger testid="menu-repair" />}
+        {/* Not on a locked (kiosk) pad: nobody there should be able to unpair it. */}
+        {p.backend.kind === 'ws' && !p.lock && <RepairRow onRepair={p.onRepair} />}
         <div class="bp-sheet-foot">Hold, tap or double-tap per the hint on each button. Keys on a paired keyboard or clicker work too.</div>
       </div>
     </div>

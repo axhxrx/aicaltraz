@@ -15,7 +15,7 @@
  */
 import type { Config } from '../../core/config.ts';
 import type { PressResult, RunRecord, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
-import { mono, nextTask } from '../lib/env.ts';
+import { afterQueuedInput, mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import { emptySnapshot, PressError, type Backend, type SaveResult, type Snapshot } from './types.ts';
@@ -192,7 +192,7 @@ export class WsBackend implements Backend {
     c.probeDeadline = deadline;
     c.probeTimer = setTimeout(
       // A stalled main thread fires this late, with the answer still queued: let it land first.
-      () => nextTask(() => this.conn === c && c.lastFrame < c.probeSentAt && this.lost(c)),
+      () => afterQueuedInput(() => this.conn === c && c.lastFrame < c.probeSentAt && this.lost(c)),
       timeout,
     );
   }

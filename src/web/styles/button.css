@@ -107,6 +107,8 @@
   text-align: center;
   color: var(--ink);
 }
+/* Fitted text breaks only where lib/fit.ts measured it may: at its spaces and <wbr>s (keep-all:
+   no breaks between CJK characters otherwise). anywhere stays as the emergency exit. */
 .bp-label,
 .bp-head {
   flex: none;
@@ -115,10 +117,16 @@
   line-height: 1.04;
   letter-spacing: -0.012em;
   text-wrap: balance;
+  word-break: keep-all;
   overflow-wrap: anywhere;
   --fit-w: var(--iw);
   --fit-h: calc(var(--ih) * 0.6);
   --fit-max: 44cqh;
+}
+@supports (word-break: auto-phrase) {
+  :is(.bp-label, .bp-head, .bp-sub):lang(ja) {
+    word-break: auto-phrase;
+  }
 }
 .bp-num {
   flex: none;
@@ -140,6 +148,7 @@
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  word-break: keep-all;
   overflow-wrap: anywhere;
   --fit-w: var(--iw);
   --fit-h: calc(var(--ih) * 0.17);
@@ -460,6 +469,38 @@
   letter-spacing: 0.14em;
   opacity: 0.85;
 }
+/* What the host was last seen doing, under the OFFLINE look: its layer dimmed and still, one line. */
+.bp-btn[data-visual='offline'] .bp-stripes {
+  opacity: 0.12;
+  animation: none;
+}
+.bp-btn[data-visual='offline'] .bp-prog::before {
+  opacity: 0.16;
+}
+.bp-btn[data-visual='offline'] .bp-prog::after {
+  opacity: 0.3;
+}
+.bp-tint {
+  position: absolute;
+  inset: 0;
+  opacity: 0.2;
+  pointer-events: none;
+}
+.bp-tint.is-success {
+  background: var(--ok);
+}
+.bp-tint.is-failure {
+  background: var(--bad);
+}
+.bp-sub.bp-offline-was {
+  display: block;
+  width: auto;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  opacity: 0.75;
+  --line-max: clamp(10px, min(5cqh, 4.6cqw), 22px);
+}
 
 /* ---- wide buttons (desktop rows, landscape phones): glyph or number beside the text ---- */
 
@@ -511,6 +552,9 @@
     --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
     --line-max: 24cqh;
   }
+  .bp-btn[data-visual='offline'] .bp-offline-was {
+    --iw: calc(100cqw - 2 * var(--pad) - var(--side) - 6cqh);
+  }
   .bp-btn[data-visual] .bp-content > .bp-sub {
     --fit-h: calc(var(--ih) * 0.24);
     --fit-max: 13cqh;
@@ -541,54 +585,74 @@
 
 /* ---- short buttons (many rows, landscape): one centered row, only what fits ---------- */
 
+/* Every item gets a fixed share of the row as its width (--ic: glyph + gap, --nw: number/title +
+   gap, the label the rest), and the font sizes are computed for those same widths: a label sized
+   for two lines is laid out on two, never squeezed onto one and clipped. */
 @container (max-height: 84px) {
   .bp-btn[data-visual] .bp-content {
+    --gapw: max(6px, 2.4cqw);
+    --icon: min(var(--ih), 14cqw);
+    --ic: 0px;
+    --nw: 0px;
     display: flex;
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: max(8px, 2.6cqw);
+    gap: var(--gapw);
     text-align: center;
   }
-  .bp-btn[data-visual] .bp-content > :is(.bp-sub, .bp-pill, .bp-time, .bp-hints) {
+  .bp-btn[data-visual] .bp-content > :is(.bp-sub, .bp-pill, .bp-time, .bp-hints, .bp-dots) {
     display: none;
   }
-  .bp-btn[data-visual] .bp-content > * {
-    --fit-w: calc(var(--iw) * 0.55);
+  .bp-btn[data-visual] .bp-content > :is(.bp-label, .bp-head) {
+    flex: none;
+    width: calc(var(--iw) - var(--ic) - var(--nw));
+    min-width: 0;
+    --fit-w: calc(var(--iw) - var(--ic) - var(--nw));
     --fit-h: var(--ih);
     --fit-max: var(--ih);
-  }
-  .bp-btn[data-visual='ready'] .bp-content > .bp-label,
-  .bp-btn[data-visual='arming'] .bp-content > .bp-label,
-  .bp-btn[data-visual='sending'] .bp-content > .bp-label {
-    --fit-w: var(--iw);
   }
   .bp-btn[data-visual] .bp-content > .bp-icon {
     flex: none;
     order: -1;
-    width: var(--ih);
-    height: var(--ih);
+    width: var(--icon);
+    height: var(--icon);
     margin: 0;
   }
   .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-title) {
-    --iw: calc((100cqw - 2 * var(--pad)) * 0.4);
+    flex: none;
+    max-width: calc(var(--nw) - var(--gapw));
+    --iw: calc(var(--nw) - var(--gapw));
     --line-max: var(--ih);
   }
   .bp-btn[data-visual='confirm'] .bp-content > .bp-label {
     display: none;
   }
-  .bp-btn[data-visual='confirm'] .bp-content > .bp-head {
-    --fit-w: var(--iw);
+  .bp-btn[data-visual='running'] .bp-content {
+    --nw: calc(var(--iw) * 0.36 + var(--gapw));
   }
-  .bp-btn[data-visual] .bp-content > .bp-label {
-    width: auto;
-    min-width: 0;
+  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='offline']) .bp-content {
+    --ic: calc(var(--icon) + var(--gapw));
   }
-  /* Label alone: it may shrink, so a label sized for two lines wraps instead of overflowing. */
-  .bp-btn:is([data-visual='ready'], [data-visual='arming'], [data-visual='sending']) .bp-content > .bp-label {
-    flex: 0 1 auto;
+  .bp-btn[data-visual='failure'] .bp-content {
+    --nw: calc(var(--iw) * 0.32 + var(--gapw));
   }
-  .bp-dots {
+}
+/* Not wide enough for the glyph too: color and motion say the state, the words get the room. */
+@container (max-height: 84px) and (max-aspect-ratio: 16 / 5) {
+  .bp-btn[data-visual] .bp-content {
+    --ic: 0px !important;
+  }
+  .bp-btn[data-visual] .bp-content > .bp-icon {
+    display: none;
+  }
+}
+/* Not even for the number/title: the label alone. */
+@container (max-height: 84px) and (max-aspect-ratio: 12 / 5) {
+  .bp-btn[data-visual] .bp-content {
+    --nw: 0px !important;
+  }
+  .bp-btn[data-visual] .bp-content > :is(.bp-num, .bp-title) {
     display: none;
   }
 }
@@ -625,12 +689,20 @@
   color: #fff;
   box-shadow: 0 0 0 0.07em #fff;
   font-weight: 900;
+  /* The face sets the real size from the word's width; this is the fallback. */
   font-size: clamp(16px, min(17cqh, 15cqw), 110px);
   letter-spacing: 0.04em;
   line-height: 1;
   white-space: nowrap;
+  text-align: center;
   animation: bp-badge 1.2s ease-out both;
   pointer-events: none;
+}
+.bp-badge small {
+  display: block;
+  margin-top: 0.3em;
+  font-size: 0.42em;
+  letter-spacing: 0.12em;
 }
 
 /* Grid while connecting: no interaction affordances. */
