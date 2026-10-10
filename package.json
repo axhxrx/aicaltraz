@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "bun --hot src/server/main.ts --config buttpad.config.json",
     "start": "bun src/server/main.ts --config buttpad.config.json",
+    "example": "bun src/server/main.ts --config examples/buttpad.example.json",
     "test": "bun test",
+    "e2e": "scripts/pw-env.sh npx playwright test -c e2e/playwright.config.ts",
     "typecheck": "tsc --noEmit",
     "schema": "bun scripts/emit-schema.ts",
     "compile": "bun build --compile src/server/main.ts --outfile dist/buttpad"
