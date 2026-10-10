@@ -414,12 +414,7 @@ button.ed-status:active {
   margin-top: 8px;
   border-top: 1px solid var(--line);
 }
-.ed-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.ed-section-head h3 {
+.ed-section-title {
   margin: 0 0 12px;
   font-weight: 900;
   font-size: 11px;

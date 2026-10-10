@@ -187,16 +187,12 @@ export function ButtonPanel(
           </>
         )}
         {p.tab === 'action' && <ActionFields ed={ed} a={b.action} errors={errors} id={id} />}
-        {p.tab === 'runs' && <RunsTab {...p} />}
+        {p.tab === 'runs' && <RunLog backend={p.backend} padId={p.pad.id} buttonId={b.id} onHost={!!p.hostButton} changed={p.changed} />}
       </div>
     </>
   );
 }
 
-
-function RunsTab(p: { backend: Backend; pad: Pad; b: Button; hostButton: Button | undefined; changed: boolean }) {
-  return <RunLog backend={p.backend} padId={p.pad.id} buttonId={p.b.id} onHost={!!p.hostButton} changed={p.changed} />;
-}
 
 function ActionFields({ ed, a, errors, id }: { ed: Editor; a: Action; errors: Map<string, string>; id(k: string): string }) {
   const err = (k: string) => errors.get(k);

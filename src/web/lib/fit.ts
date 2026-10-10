@@ -24,6 +24,106 @@ function measureEm(text: string, weight: number): number {
   return ctx.measureText(text).width / 100;
 }
 
+// ---- break opportunities ------------------------------------------------------------------------
+//
+// The measurement below and the browser's layout must agree on where a line may break, or a size
+// computed for two lines gets laid out on one (and overflows) or on three. So the labels are
+// rendered from the same chunks: between two chunks there is a space or a <wbr>, and the CSS
+// (`word-break: keep-all`) allows no other breaks inside CJK text. Scripts written without spaces
+// get their chunks from Intl.Segmenter (words), merged into phrases: 照明を | すべて | 消す.
+
+/** A run of text that stays on one line. A line may break before it: at a space if `spaced`. */
+export interface Chunk {
+  text: string;
+  spaced: boolean;
+}
+
+/** Scripts written without spaces between words. */
+const NO_SPACES = /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}\p{sc=Thai}\p{sc=Lao}\p{sc=Khmer}\p{sc=Myanmar}]/u;
+/** Japanese particles that belong with the word before them. */
+const PARTICLES = new Set(['を', 'は', 'が', 'に', 'で', 'と', 'の', 'へ', 'も', 'や', 'か', 'ね', 'よ', 'から', 'まで', 'より', 'だけ', 'など']);
+/** May not start a line (kinsoku): closing punctuation, small kana, ー, iteration marks. */
+const NO_START = /^[\p{Pe}\p{Pf}、。，．・：；？！ーぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶㇰ-ㇿ々ゝゞヽヾ]/u;
+/** May not end a line: opening punctuation. */
+const NO_END = /[\p{Ps}\p{Pi}]$/u;
+/** Without Intl.Segmenter: one CJK character (plus its marks) per part; anything else in runs. */
+const CJK_CHAR = /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}][\p{M}\u{FE00}-\u{FE0F}\u{E0100}-\u{E01EF}]*|(?:(?![\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}])[^])+/gu;
+
+type Seg = { segment: string; isWordLike?: boolean };
+interface SegmenterLike {
+  segment(s: string): Iterable<Seg>;
+}
+const segmenters = new Map<string, SegmenterLike | null>();
+
+function segmenter(locale: string): SegmenterLike | null {
+  if (!segmenters.has(locale)) {
+    const S = (Intl as unknown as { Segmenter?: new (l: string, o: { granularity: 'word' }) => SegmenterLike }).Segmenter;
+    let s: SegmenterLike | null = null;
+    try {
+      s = S ? new S(locale, { granularity: 'word' }) : null;
+    } catch {
+      s = null;
+    }
+    segmenters.set(locale, s);
+  }
+  return segmenters.get(locale)!;
+}
+
+const navLang = () => (typeof navigator !== 'undefined' && navigator.language) || 'en';
+
+/**
+ * The language to tag a label with, so the browser picks the right glyphs and (Chromium, `ja`)
+ * phrase-based line breaking. Kana means Japanese; Han alone is Japanese or Chinese, whichever
+ * this device uses (or left alone).
+ */
+export function langOf(text: string): string | undefined {
+  if (/[\p{sc=Hiragana}\p{sc=Katakana}]/u.test(text)) return 'ja';
+  if (/\p{sc=Han}/u.test(text)) return /^(ja|zh)\b/i.test(navLang()) ? navLang() : undefined;
+  if (/\p{sc=Thai}/u.test(text)) return 'th';
+  return undefined;
+}
+
+/** Splits one space-free token of a no-spaces script into phrases. */
+function phrases(token: string, locale: string): string[] {
+  const seg = segmenter(locale);
+  const parts: Seg[] = seg
+    ? [...seg.segment(token)]
+    : // Thai & co. without a segmenter: leave it whole (the browser still breaks it, only better).
+      /[\p{sc=Han}\p{sc=Hiragana}\p{sc=Katakana}]/u.test(token)
+      ? (token.match(CJK_CHAR) ?? [token]).map((segment) => ({ segment, isWordLike: /[\p{L}\p{N}]/u.test(segment) }))
+      : [{ segment: token, isWordLike: true }];
+  const out: string[] = [];
+  const push = (segment: string, isWordLike?: boolean) => {
+    const prev = out.at(-1);
+    const glue =
+      prev !== undefined && (NO_END.test(prev) || NO_START.test(segment) || PARTICLES.has(segment) || (isWordLike === false && !NO_END.test(segment)));
+    if (glue) out[out.length - 1] = prev + segment;
+    else out.push(segment);
+  };
+  for (const { segment, isWordLike } of parts) {
+    // A long katakana compound (スモークマシン) is one dictionary word: let it break like the
+    // browser's default would, between any two characters (ー and small kana stay attached).
+    if (/^[\p{sc=Katakana}ー]{6,}$/u.test(segment)) for (const ch of segment) push(ch, true);
+    else push(segment, isWordLike);
+  }
+  return out;
+}
+
+/**
+ * Where `text` may break: at spaces, after a hyphen inside a word ("Double-|tap"), and between
+ * the phrases of CJK/Thai text.
+ */
+export function chunks(text: string): Chunk[] {
+  const locale = langOf(text) ?? navLang();
+  const out: Chunk[] = [];
+  for (const word of text.trim().split(/\s+/)) {
+    if (!word) continue;
+    const parts = NO_SPACES.test(word) ? phrases(word, locale) : word.split(/(?<=\p{L}-)(?=\p{L})/u);
+    parts.forEach((p, i) => out.push({ text: p, spaced: i === 0 }));
+  }
+  return out;
+}
+
 /**
  * widths[k-1] = width (em) of the best k-line layout. Digits are measured as 0 (about the widest)
  * so ticking numbers neither grow the cache nor make the size jitter.
@@ -34,20 +134,15 @@ export function lineWidths(text: string, weight = 900): number[] {
   const hit = cache.get(id);
   if (hit) return hit;
   if (cache.size > 500) cache.clear();
-  // Break opportunities: spaces, and after a hyphen inside a word ("Double-|tap").
-  const chunks = norm
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .flatMap((word) => word.split(/(?<=\p{L}-)(?=\p{L})/u).map((part, i) => ({ part, spaced: i === 0 })));
-  if (!chunks.length) return [];
-  const w = chunks.map((c) => measureEm(c.part, weight));
+  const parts = chunks(norm);
+  if (!parts.length) return [];
+  const w = parts.map((c) => measureEm(c.text, weight));
   const space = measureEm(' ', weight);
-  const n = chunks.length;
+  const n = parts.length;
   // span(i, j) = width of chunks i..j-1 on one line
   const span = (i: number, j: number) => {
     let sum = 0;
-    for (let k = i; k < j; k++) sum += w[k]! + (k > i && chunks[k]!.spaced ? space : 0);
+    for (let k = i; k < j; k++) sum += w[k]! + (k > i && parts[k]!.spaced ? space : 0);
     return sum;
   };
   const out: number[] = [];

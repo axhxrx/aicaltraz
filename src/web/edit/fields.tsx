@@ -1,6 +1,6 @@
 /** Form controls for the editor panels: dark, 16px text (no iOS zoom), 44px+ touch targets. */
 import type { ComponentChildren } from 'preact';
-import { useEffect, useId, useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { inkFor, isValidColor, toRGB } from '../lib/color.ts';
 import { keyName } from '../run/view.ts';
 import { Close } from '../ui/icons.tsx';
@@ -10,22 +10,19 @@ import { PALETTE } from './ops.ts';
 export const typingIn = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('input:not([type=checkbox]):not([type=radio]):not([type=color]), textarea, select, [contenteditable]');
 
-export function Section(p: { title: string; children: ComponentChildren; aside?: ComponentChildren }) {
+export function Section(p: { title: string; children: ComponentChildren }) {
   return (
     <section class="ed-section">
-      <div class="ed-section-head">
-        <h3>{p.title}</h3>
-        {p.aside}
-      </div>
+      <h3 class="ed-section-title">{p.title}</h3>
       {p.children}
     </section>
   );
 }
 
 /** Label + control + hint/error. `for` links the label to a single input. */
-export function Field(p: { label: string; for?: string; hint?: ComponentChildren; error?: string; testid?: string; children: ComponentChildren; class?: string }) {
+export function Field(p: { label: string; for?: string; hint?: ComponentChildren; error?: string; testid?: string; children: ComponentChildren }) {
   return (
-    <div class={`ed-field${p.error ? ' is-bad' : ''}${p.class ? ` ${p.class}` : ''}`}>
+    <div class={`ed-field${p.error ? ' is-bad' : ''}`}>
       {p.for ? (
         <label class="ed-label" for={p.for}>
           {p.label}
@@ -207,21 +204,33 @@ const KEY_WORDS: Record<string, string> = { ' ': 'Space', Enter: 'Enter', ArrowU
 export function KeyCapture(p: { value: string | undefined; onChange(k: string | undefined): void; conflict?: string; testid: string }) {
   const [listening, setListening] = useState(false);
   const btn = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    if (!listening) return;
-    const fn = (e: KeyboardEvent) => {
+  const onChange = useRef(p.onChange);
+  onChange.current = p.onChange;
+  /** Ends listening; set while listening. */
+  const stop = useRef<(() => void) | null>(null);
+  // Listeners go on in the click itself (not an effect after paint), so even an instant key lands.
+  const start = () => {
+    const key = (e: KeyboardEvent) => {
       if (MODIFIERS.has(e.key)) return;
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (e.key !== 'Escape') p.onChange(e.key.length === 1 ? e.key.toLowerCase() : e.key);
-      setListening(false);
+      if (e.key !== 'Escape') onChange.current(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+      end();
     };
     // Safari doesn't focus buttons on click, so blur alone can't end listening.
-    const away = (e: PointerEvent) => !btn.current?.contains(e.target as Node) && setListening(false);
-    window.addEventListener('keydown', fn, true);
+    const away = (e: PointerEvent) => !btn.current?.contains(e.target as Node) && end();
+    const end = () => {
+      window.removeEventListener('keydown', key, true);
+      window.removeEventListener('pointerdown', away, true);
+      stop.current = null;
+      setListening(false);
+    };
+    window.addEventListener('keydown', key, true);
     window.addEventListener('pointerdown', away, true);
-    return () => (window.removeEventListener('keydown', fn, true), window.removeEventListener('pointerdown', away, true));
-  }, [listening]);
+    stop.current = end;
+    setListening(true);
+  };
+  useEffect(() => () => stop.current?.(), []);
   const v = p.value;
   return (
     <div class="ed-keycap-row">
@@ -231,8 +240,8 @@ export function KeyCapture(p: { value: string | undefined; onChange(k: string | 
         class={`ed-keycap${listening ? ' is-listening' : ''}`}
         data-testid={p.testid}
         aria-pressed={listening}
-        onClick={() => setListening((l) => !l)}
-        onBlur={() => setListening(false)}
+        onClick={() => (stop.current ? stop.current() : start())}
+        onBlur={() => stop.current?.()}
       >
         {listening ? (
           <span class="ed-keycap-wait">Press a key… (Esc cancels)</span>

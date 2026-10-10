@@ -98,6 +98,8 @@ test('ignored press while running flashes BUSY; cancel kills the run', async ({ 
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'running');
   await expect(btn(page, 'cancel')).toContainText('%');
+  // The host takes a cancel within CANCEL_GRACE_MS (700 ms) of the start as a double press.
+  await page.waitForTimeout(800);
   await f.tap('cancel');
   await expectVisual(page, 'cancel', 'failure');
   await expect(btn(page, 'cancel')).toContainText('CANCELLED');

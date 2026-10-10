@@ -1,7 +1,11 @@
 /** Haptics (navigator.vibrate, iOS switch-tick fallback) and optional WebAudio cues. */
 import { settings } from './settings.ts';
 
-export type Cue = 'touch' | 'fire' | 'confirm' | 'success' | 'failure' | 'busy' | 'denied';
+/**
+ * touch: a hold began. fire: the press goes out. cancel: a press came to nothing (released early,
+ * slid off). unknown: sent, but no answer (it may or may not have run).
+ */
+export type Cue = 'touch' | 'fire' | 'confirm' | 'success' | 'failure' | 'busy' | 'denied' | 'cancel' | 'unknown';
 
 const VIBES: Record<Cue, number | number[]> = {
   touch: 8,
@@ -11,7 +15,13 @@ const VIBES: Record<Cue, number | number[]> = {
   failure: [320],
   busy: [18, 50, 18, 50, 18],
   denied: [70, 50, 70],
+  // Soft and slow: "tick … tick".
+  cancel: [12, 120, 12],
+  unknown: [100, 80, 100, 80, 100],
 };
+
+/** Events that grant user activation (a touch only on its way up): audio and media may start inside them. */
+export const ACTIVATION_EVENTS = ['pointerdown', 'pointerup', 'touchend', 'mousedown', 'keydown', 'click'] as const;
 
 const canVibrate = typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
 // iOS Safari has no vibrate(), but toggling an <input switch> plays a system haptic tick (iOS 18+).
@@ -37,14 +47,16 @@ function iosTick(count: number) {
     // Clicking the label focuses the input; give focus back so key presses (BLE remotes) still land.
     if (document.activeElement instanceof HTMLInputElement && iosSwitch?.contains(document.activeElement)) document.activeElement.blur();
   };
-  for (let i = 0; i < count; i++) setTimeout(tick, i * 90);
+  // The first tick right here, inside the gesture handler: iOS only plays it within a user gesture.
+  tick();
+  for (let i = 1; i < count; i++) setTimeout(tick, i * 90);
 }
 
 export function haptic(cue: Cue): void {
   if (!settings.get().haptics) return;
   try {
     if (canVibrate) navigator.vibrate(VIBES[cue]);
-    else if (isIOS) iosTick(cue === 'success' || cue === 'confirm' || cue === 'denied' ? 2 : cue === 'busy' ? 3 : 1);
+    else if (isIOS) iosTick(cue === 'success' || cue === 'confirm' || cue === 'denied' ? 2 : cue === 'busy' || cue === 'unknown' ? 3 : 1);
   } catch {
     /* vibrate can throw before the first user activation */
   }
@@ -63,6 +75,10 @@ export function unlockAudio(): void {
   }
 }
 
+// Every activation event unlocks, not only a button's pointerdown (on touch screens that one
+// doesn't count as a user gesture yet: the pointerup does).
+if (typeof window !== 'undefined') for (const t of ACTIVATION_EVENTS) window.addEventListener(t, unlockAudio, { capture: true, passive: true });
+
 type Tone = [freq: number, startS: number, durS: number, type?: OscillatorType, gain?: number, endFreq?: number];
 const TONES: Record<Cue, Tone[]> = {
   touch: [[1400, 0, 0.012, 'square', 0.04]],
@@ -72,6 +88,8 @@ const TONES: Record<Cue, Tone[]> = {
   failure: [[220, 0, 0.42, 'sawtooth', 0.16, 140]],
   busy: [[330, 0, 0.06, 'square', 0.1], [330, 0.1, 0.06, 'square', 0.1]],
   denied: [[180, 0, 0.12, 'square', 0.1], [150, 0.15, 0.14, 'square', 0.1]],
+  cancel: [[700, 0, 0.06, 'triangle', 0.1, 380]],
+  unknown: [[440, 0, 0.09, 'square', 0.08], [440, 0.16, 0.09, 'square', 0.08], [440, 0.32, 0.09, 'square', 0.08]],
 };
 
 export function sound(cue: Cue): void {

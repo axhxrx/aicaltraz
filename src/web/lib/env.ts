@@ -98,3 +98,30 @@ export function fmtElapsed(ms: number): string {
   const ss = String(s % 60).padStart(2, '0');
   return m < 60 ? `${m}:${ss}` : `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${ss}`;
 }
+
+/** Monotonic ms (the clock of event timestamps). */
+export const mono = (): number => performance.now();
+
+/**
+ * When an input event happened, on the `mono()` clock. That's `timeStamp` in current browsers;
+ * an engine that stamps events with epoch ms (or not at all) gets "now".
+ */
+export function eventTime(e: { timeStamp: number }): number {
+  const now = mono();
+  const t = e.timeStamp;
+  return t > 0 && t <= now + 50 && now - t < 60_000 ? t : now;
+}
+
+const channel = typeof MessageChannel === 'function' ? new MessageChannel() : null;
+const queued: (() => void)[] = [];
+if (channel) channel.port1.onmessage = () => queued.shift()?.();
+
+/**
+ * Run `fn` as a new task, after whatever is already queued. A timer that fires late (the main
+ * thread was stalled) uses it to let queued input or socket messages land before it decides.
+ */
+export function nextTask(fn: () => void): void {
+  if (!channel) return void setTimeout(fn, 0);
+  queued.push(fn);
+  channel.port2.postMessage(0);
+}

@@ -1,16 +1,23 @@
 /**
  * In-browser backend: runs the real state machine (core/machine.ts) with simulated actions, so the
  * UI can be tried with no host. Config lives in localStorage. Mirrors host semantics: ack first,
- * then state; whileRunning; timeouts; cancel = kill; result text rules; last 20 runs per button.
+ * then state; whileRunning; timeouts; cancel = kill; result text rules; last 20 runs per button;
+ * and when a press gets `ignored` (cancel within 700 ms of the start, the start rate limit).
  */
 import { buttonKey, findButton, parseConfig, type Button, type Config } from '../../core/config.ts';
 import { initialState, transition, type Effect, type MachineEvent, type RunState } from '../../core/machine.ts';
 import type { PressResult, RunRecord } from '../../core/protocol.ts';
+import { mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import { DEMO_CONFIG } from './demo-config.ts';
 import { simulate, type SimHandle } from './demo-script.ts';
-import { emptySnapshot, type Backend, type SaveResult, type Snapshot } from './types.ts';
+import { emptySnapshot, PressError, type Backend, type SaveResult, type Snapshot } from './types.ts';
+
+/** As on the host (src/server/state-store.ts): a cancel this soon after the start is a double press. */
+export const CANCEL_GRACE_MS = 700;
+/** As on the host: presses that start or queue a run, over all buttons: bursts of 20, then 10/s; 32 at once. */
+const LIMITS = { burst: 20, perSec: 10, maxRunning: 32 };
 
 interface Run {
   handle: SimHandle;
@@ -19,6 +26,8 @@ interface Run {
   result?: string;
   timeout?: ReturnType<typeof setTimeout>;
   done: boolean;
+  /** mono() at start. */
+  t0: number;
   finish(exitCode: number | null, reason?: 'timeout'): void;
 }
 
@@ -59,6 +68,10 @@ export class DemoBackend implements Backend {
   private resets = new Map<string, ReturnType<typeof setTimeout>>();
   private online = true;
   private dropping = 0;
+  /** Presses whose ack was dropped: the link "drops" under them when going offline. */
+  private lostAcks = new Set<(e: Error) => void>();
+  private tokens = LIMITS.burst;
+  private tokensAt = mono();
   private disposed = false;
 
   constructor(private readonly opts: { exact: boolean } = { exact: false }) {
@@ -109,7 +122,7 @@ export class DemoBackend implements Backend {
     const record: RunRecord = { runId, pad, button: b.id, startedAt, stdout: '', stderr: '' };
     const list = [record, ...(this.history.get(key) ?? [])].slice(0, 20);
     this.history.set(key, list);
-    const run: Run = { handle: { kill() {} }, stdout: [], stderr: [], done: false, finish: (c, r) => finish(c, r) };
+    const run: Run = { handle: { kill() {} }, stdout: [], stderr: [], done: false, t0: mono(), finish: (c, r) => finish(c, r) };
     this.runs_.set(key, run);
     const finish = (exitCode: number | null, reason?: 'timeout') => {
       if (run.done) return;
@@ -152,26 +165,49 @@ export class DemoBackend implements Backend {
     setTimeout(() => run.finish(null), this.opts.exact ? 50 : 150 + Math.random() * 250);
   }
 
-  press(pad: string, button: string): Promise<PressResult> {
-    if (!this.online || this.disposed) return Promise.reject(new Error('offline'));
+  press(pad: string, button: string, onSent?: () => void): Promise<PressResult> {
+    if (!this.online || this.disposed) return Promise.reject(new PressError(false, 'not connected to the host'));
+    onSent?.();
     if (this.dropping > 0) {
       this.dropping--;
-      return new Promise(() => {});
+      // Lost on the way: no ack, ever (until the "link" drops: see setOnline).
+      return new Promise((_, reject) => void this.lostAcks.add(reject));
     }
     const latency = this.opts.exact ? 10 : 20 + Math.random() * 60;
     return new Promise((resolve, reject) => {
       setTimeout(() => {
-        if (!this.online) return reject(new Error('offline'));
+        if (!this.online || this.disposed) return reject(new PressError(true, 'the link to the host dropped before it answered'));
         const b = this.button(pad, button);
         if (!b) return resolve('unknown-button');
-        const s = this.states.get(buttonKey(pad, b.id)) ?? initialState();
-        const result: PressResult =
-          s.phase !== 'running' ? 'started' : b.whileRunning === 'cancel' ? (s.cancelling ? 'ignored' : 'cancelling') : b.whileRunning === 'queue' ? 'queued' : 'ignored';
+        const result = this.decide(buttonKey(pad, b.id), b);
+        // The host acks first, then broadcasts the state change (an ignored press changes nothing).
         resolve(result);
-        // The host acks first, then broadcasts the state change.
-        setTimeout(() => this.feed(pad, b, { type: 'press', now: Date.now() }), 0);
+        if (result !== 'ignored') this.feed(pad, b, { type: 'press', now: Date.now() });
       }, latency);
     });
+  }
+
+  /** The host's answer to a press (src/server/state-store.ts, press()). */
+  private decide(key: string, b: Button): PressResult {
+    const s = this.states.get(key) ?? initialState();
+    if (s.phase !== 'running') return this.runs_.size < LIMITS.maxRunning && this.takeStart() ? 'started' : 'ignored';
+    if (b.whileRunning === 'cancel') {
+      // A double press would start the run and cancel it right away. Already cancelling: says so again.
+      const run = this.runs_.get(key);
+      return !s.cancelling && run && mono() - run.t0 < CANCEL_GRACE_MS ? 'ignored' : 'cancelling';
+    }
+    if (b.whileRunning === 'queue') return s.queued || this.takeStart() ? 'queued' : 'ignored';
+    return 'ignored';
+  }
+
+  /** Token bucket for presses that start (or queue) a run. */
+  private takeStart(): boolean {
+    const now = mono();
+    this.tokens = Math.min(LIMITS.burst, this.tokens + ((now - this.tokensAt) / 1000) * LIMITS.perSec);
+    this.tokensAt = now;
+    if (this.tokens < 1) return false;
+    this.tokens--;
+    return true;
   }
 
   kick(): void {}
@@ -204,8 +240,11 @@ export class DemoBackend implements Backend {
   setOnline(online: boolean): void {
     if (online === this.online) return;
     this.online = online;
-    if (!online) this.snapshot.set((s) => ({ ...s, status: 'offline', retryAt: Date.now() + 1000 }));
-    else this.publish('online');
+    if (online) return this.publish('online');
+    this.snapshot.set((s) => ({ ...s, status: 'offline', retryAt: Date.now() + 1000 }));
+    const err = new PressError(true, 'the link to the host dropped before it answered');
+    for (const reject of this.lostAcks) reject(err);
+    this.lostAcks.clear();
   }
 
   isOnline(): boolean {
@@ -215,6 +254,23 @@ export class DemoBackend implements Backend {
   /** The next n presses vanish without an ack (to see "NO RESPONSE"). */
   dropAcks(n = 1): void {
     this.dropping = n;
+  }
+
+  /**
+   * The next press reaches the "host" and runs, but the link dies before the ack gets back (the
+   * page shows offline until setOnline(true)).
+   */
+  dropLinkOnNextPress(): void {
+    const press = this.press.bind(this);
+    this.press = (pad, button, onSent) => {
+      this.press = press;
+      if (!this.online) return press(pad, button, onSent);
+      onSent?.();
+      this.setOnline(false);
+      const b = this.button(pad, button);
+      if (b && this.decide(buttonKey(pad, b.id), b) !== 'ignored') this.feed(pad, b, { type: 'press', now: Date.now() });
+      return Promise.reject(new PressError(true, 'the link to the host dropped before it answered'));
+    };
   }
 
   /** Back to the starter pads. */

@@ -524,7 +524,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 </>
               ) : (
                 <span class="ed-hintbar-text">
-                  Tap <b>+</b> to add · drag to move · drag a corner to resize
+                  Tap <b>+</b> to add · drag to move · corner resizes
                 </span>
               )}
             </div>
