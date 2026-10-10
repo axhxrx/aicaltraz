@@ -37,15 +37,23 @@ Top findings and what happened to them:
 
 | Finding | Reported by | Status |
 |---|---|---|
-| A press made in a dead zone ran 14–45 s later, after the phone had said NO RESPONSE (TCP delivered it late) | ladder, rider, chaos | round 2 |
-| Results vanish after 2.5 s; failures go unseen; nothing survives a reconnect | ladder, rider, crew | round 2 |
-| Confirm/hold enforced only in the browser; press token can fire "Format card" via API | admin, crew | round 2 |
-| Remote key chatter double-sends; confirm beaten by chatter or a pothole bounce | rider | round 2 |
-| Saving an edit that removes/renames a running button kills it silently | crew, admin, edit review | round 2 |
-| Kiosk `?lock&pad=X` silently becomes another pad's remote when X is renamed/deleted | crew, chaos, rider | round 2 |
-| Host crash: orphaned action keeps running, next press runs a second copy, run ids restart | crew, chaos | round 2 |
-| Saving on a full disk truncated the config and reported success | chaos | round 2 |
-| ALL OFF can't stop other running actions | ladder | round 2 (`stops`) |
-| No persistent device state (is it recording? are lights on?) | rider, admin | round 2 (`@state`) |
+| A press made in a dead zone ran 14–45 s later, after the phone had said NO RESPONSE (TCP delivered it late) | ladder, rider, chaos | fixed (2c036fe) |
+| Results vanish after 2.5 s; failures go unseen; nothing survives a reconnect | ladder, rider, crew | fixed (2c036fe) |
+| Confirm/hold enforced only in the browser; press token can fire "Format card" via API | admin, crew | fixed (2c036fe) |
+| Remote key chatter double-sends; confirm beaten by chatter or a pothole bounce | rider | fixed (2c036fe) |
+| Saving an edit that removes/renames a running button kills it silently | crew, admin, edit review | fixed (2c036fe) |
+| Kiosk `?lock&pad=X` silently becomes another pad's remote when X is renamed/deleted | crew, chaos, rider | fixed (2c036fe) |
+| Host crash: orphaned action keeps running, next press runs a second copy, run ids restart | crew, chaos | fixed (2c036fe) |
+| Saving on a full disk truncated the config and reported success | chaos | fixed (2c036fe) |
+| ALL OFF can't stop other running actions | ladder | fixed: `stops` + `none` (2c036fe) |
+| No persistent device state (is it recording? are lights on?) | rider, admin | fixed: `@state` chips (2c036fe) |
 
-Full triage (every accepted item) lives in the fix-round commit messages.
+Round-1 fixes landed in 2c036fe (335 bun tests, 314 Playwright tests); the full list of accepted
+items is in that commit's message.
+
+## Round 2 (frozen build 2c036fe)
+
+In progress: a regression verifier re-running round-1 repro scripts, two new personas (a Tokyo
+stage manager calling cues with JP/EN labels and `stops`; a hobbyist on a Pi host and a slow,
+throttled phone doing everything from the phone), and adversarial security + correctness
+reviews of the round-2 code.
