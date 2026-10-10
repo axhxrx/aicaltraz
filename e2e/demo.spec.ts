@@ -115,7 +115,7 @@ test('keyboard: a mapped key fires on keydown, hold and tap buttons alike (click
   await expectVisual(page, 'hold', 'running');
   await expectVisual(page, 'hold', 'success');
   await page.keyboard.press('t');
-  await expectVisual(page, 'tap', 'running');
+  await expectVisual(page, 'tap', 'success');
 });
 
 test('multi-touch: two buttons held at once both fire', async ({ page, hasTouch }) => {

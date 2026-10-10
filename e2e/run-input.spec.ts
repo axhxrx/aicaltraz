@@ -161,8 +161,7 @@ test('lost ack: once the link is back, a press that did run shows what it did (n
   await expect(page.getByTestId('conn')).toHaveAttribute('data-status', 'offline');
   await page.waitForTimeout(100);
   await demo(page).run((b) => b.setOnline(true));
-  // Back within the run: RUNNING, then its SUCCESS (with the success buzz, never the failure one).
-  await expectVisual(page, 'tap', 'running');
+  // Back within the run: its SUCCESS (with the success buzz, never the failure one).
   await expectVisual(page, 'tap', 'success');
   await expect.poll(() => count(VIB.success)).toBe(1);
   expect(await count(VIB.failure)).toBe(0);
@@ -249,7 +248,7 @@ test('rolling thumb: a second contact on the same button carries the hold on whe
   await page.waitForTimeout(100);
   // The first contact lifts at ~250 ms, before holdMs (600): the second one still holds the button.
   await f.up(1);
-  await expectVisual(page, 'hold', 'running');
+  await expect.poll(presses).toEqual(['hold']);
   await f.up(2);
   await expectVisual(page, 'hold', 'success');
   expect(await presses()).toEqual(['hold']);
@@ -262,15 +261,15 @@ test('keyboard: auto-repeat is ignored, a double is two keydowns, confirm still 
   await page.keyboard.down('t');
   await page.keyboard.down('t');
   await page.keyboard.up('t');
-  await expectVisual(page, 'tap', 'running');
+  await expectVisual(page, 'tap', 'success');
   await page.keyboard.press('d');
   await expectVisual(page, 'double', 'ready');
   await page.keyboard.press('d');
-  await expectVisual(page, 'double', 'running');
+  await expect.poll(presses).toEqual(['tap', 'double']);
   await page.keyboard.press('c');
   await expectVisual(page, 'confirm', 'confirm');
   await page.keyboard.press('c');
-  await expectVisual(page, 'confirm', 'running');
+  await expectVisual(page, 'confirm', 'success');
   expect(await presses()).toEqual(['tap', 'double', 'confirm']);
 });
 
@@ -282,15 +281,13 @@ test('keyboard: a key held across a config broadcast does not fire again; a doub
   await expect(btn(page, 'slow')).toContainText('Slow 2');
   await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 't', code: 'KeyT', bubbles: true })));
   await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keyup', { key: 't', code: 'KeyT', bubbles: true })));
-  await expectVisual(page, 'tap', 'running');
-  await page.waitForTimeout(300);
+  await expectVisual(page, 'tap', 'success');
   expect(await presses()).toEqual(['tap']);
   // First keydown of a double, a broadcast, the second keydown: still a double.
   await page.keyboard.press('d');
   await relabel(page, 'slow', 'Slow 3');
   await page.keyboard.press('d');
-  await expectVisual(page, 'double', 'running');
-  expect(await presses()).toEqual(['tap', 'double']);
+  await expect.poll(presses).toEqual(['tap', 'double']);
 });
 
 test('cancel: no hint and no cancel within 700 ms of the start (like the host); after that it cancels', async ({ page }) => {

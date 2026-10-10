@@ -66,8 +66,9 @@ function playNow() {
 }
 
 /**
- * Until the screen is held: try again inside every user gesture. On every one, not just the first:
- * a touch's pointerdown isn't a user activation yet (its pointerup is).
+ * Until the screen is held (or keeping it awake is switched off): try again inside every user
+ * gesture. On every one, not just the first: a touch's pointerdown isn't a user activation yet
+ * (its pointerup is).
  */
 function armGesture() {
   if (gestureArmed) return;
@@ -78,7 +79,7 @@ function armGesture() {
     void acquire();
   };
   unsubscribe = awake.subscribe((s) => {
-    if (!s.active) return;
+    if (!s.active && wantAwake()) return;
     gestureArmed = false;
     for (const t of ACTIVATION_EVENTS) window.removeEventListener(t, go, true);
     unsubscribe();

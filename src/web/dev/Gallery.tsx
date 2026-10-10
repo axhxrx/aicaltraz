@@ -44,7 +44,7 @@ function tiles(now: number): [string, ButtonVM][] {
     ['RUNNING 42%', vmFor(b('progress', 'Backdrop sunset', '#7c3aed'), { visual: 'running', startedAt: now - 2100, progress: 42, status: 'fading in' })],
     ['SUCCESS', vmFor(b('success', 'Upload selects', '#2f6fde'), { visual: 'success', startedAt: now - 2300, endedAt: now - 120, text: '12 photos uploaded', resultHoldMs: LONG })],
     ['FAILURE', vmFor(b('failure', 'Card backup', '#f97316'), { visual: 'failure', startedAt: now - 1500, endedAt: now - 120, title: 'EXIT 3', text: 'card full: 0 bytes free', resultHoldMs: LONG })],
-    ['OFFLINE · WAS RUNNING', vmFor(b('offrun', 'Fog machine', '#7c3aed'), { visual: 'offline', under: 'running', startedAt: now - 12_300 })],
+    ['WAS RUNNING', vmFor(b('offrun', 'Fog machine', '#7c3aed'), { visual: 'offline', under: 'running', startedAt: now - 12_300 })],
     ['NO RESPONSE', vmFor(b('noresp', 'Fill light', '#2f6fde', { trigger: 'tap' }), { visual: 'failure', startedAt: now, endedAt: now - 120, title: 'NO RESPONSE', text: 'The host didn’t answer in 2 s', resultHoldMs: LONG })],
     ['BUSY', vmFor(b('busy', 'Render preview', '#0891b2'), { visual: 'running', startedAt: now - 8200, flash: { kind: 'busy', at: now } })],
     ['OFFLINE', vmFor(b('offline', 'Mark clip', '#2f6fde', { trigger: 'tap' }), { visual: 'offline' })],

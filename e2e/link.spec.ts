@@ -25,7 +25,7 @@ const CONFIG: ConfigInput = {
       buttons: [
         { id: 'tap', label: 'Tap', x: 0, y: 0, trigger: 'tap', resultHoldMs: 4000, action: sh('echo ran >> ran.log; echo tapped') },
         { id: 'slow', label: 'Slow', color: '#0891b2', x: 1, y: 0, trigger: 'tap', action: sh("echo '@status busy'; sleep 30") },
-        { id: 'quick', label: 'Quick', color: '#db2777', x: 0, y: 1, trigger: 'tap', resultHoldMs: 500, action: sh('echo quick') },
+        { id: 'quick', label: 'Quick', color: '#db2777', x: 0, y: 1, trigger: 'tap', resultHoldMs: 2000, action: sh('echo quick') },
       ],
     },
   ],

@@ -31,9 +31,14 @@ const STATES: ConfigInput = {
   ],
 };
 
-/** Each visible item of each button's content that sticks out of the content box (or is cut short). */
-const overflows = (page: Page) =>
-  page.evaluate(() =>
+/**
+ * Each visible item of each button's content that sticks out of the content box (or is cut short),
+ * measured at rest: entrance animations (the ✗ shaking in at 108%) finish first.
+ */
+const overflows = async (page: Page) => {
+  // (Not the drain bars: those run as long as resultHoldMs.)
+  await page.evaluate(() => Promise.all(document.getAnimations().filter((a) => Number(a.effect?.getComputedTiming().endTime) <= 2000).map((a) => a.finished.catch(() => {}))));
+  return page.evaluate(() =>
     [...document.querySelectorAll<HTMLElement>('.bp-btn')].flatMap((b) => {
       const c = b.querySelector('.bp-content')!;
       const box = c.getBoundingClientRect();
@@ -43,9 +48,10 @@ const overflows = (page: Page) =>
           const r = k.getBoundingClientRect();
           return r.left < box.left - 1 || r.right > box.right + 1 || r.top < box.top - 2 || r.bottom > box.bottom + 2 || k.scrollWidth > k.clientWidth + 2;
         })
-        .map((k) => `${b.dataset.visual}:${b.querySelector('.bp-label')?.textContent} → ${k.className}`);
+        .map((k) => `${b.dataset.visual}:${b.querySelector('.bp-label')?.textContent} → ${k.getAttribute('class')}`);
     }),
   );
+};
 
 for (const vp of [
   { width: 844, height: 390 },

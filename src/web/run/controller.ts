@@ -130,7 +130,11 @@ export class ButtonController {
   /** Host state changed: settle SENDING, resolve an unanswered press, cue when our run finishes. */
   onHost(host: RunState): void {
     const s = this.l.sending;
-    if (s && host.runId > s.baseRunId) this.patch({ sending: null });
+    if (s && host.runId > s.baseRunId) {
+      // The run it started showed up (before its ack, if the ack is late): it's ours either way.
+      if (!s.acked) this.mine = s.baseRunId;
+      this.patch({ sending: null });
+    }
     const o = this.outcome;
     if (o && Date.now() > o.until) this.outcome = null;
     else if (o && host.runId > o.baseRunId) {
