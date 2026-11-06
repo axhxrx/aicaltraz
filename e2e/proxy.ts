@@ -34,6 +34,12 @@ export interface Proxy {
   setMode(mode: 'pass' | 'blackhole'): void;
   /** WebSocket upgrades go nowhere (black-holed), plain HTTP passes. */
   blackholeWs: boolean;
+  /**
+   * Like a reverse proxy (or a preview pane) that passes requests on with its own `Host` (e.g. the
+   * host's address): request headers from the browser get `Host: <this>`. The page's Origin is the
+   * proxy's address all the same.
+   */
+  rewriteHost: string | null;
   /** Close every new connection this long after it opened (0 = off). */
   cutNewAfterMs: number;
   /** The next chunk from the browser is forwarded, then the link dies before anything comes back. */
@@ -56,6 +62,8 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
     l.upstream?.destroy();
     links.delete(l);
   };
+  /** rewriteHost: request headers carry the proxy's own idea of the Host. */
+  const rewrite = (d: Buffer) => (p.rewriteHost ? Buffer.from(d.toString('latin1').replace(/\r\nhost: [^\r]*\r\n/i, `\r\nHost: ${p.rewriteHost}\r\n`), 'latin1') : d);
   const server = net.createServer((client) => {
     accepted++;
     const l: Link = { client, upstream: null, frozen: mode === 'blackhole', openedAt: Date.now(), ws: false };
@@ -98,15 +106,16 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
             return;
           }
           if (dir === 'down' && hello) return holdHello(d);
+          if (dir === 'up') d = rewrite(d);
           const delay = p.latency + (dir === 'up' ? p.upLatency : 0) + (l.ws ? p.wsLatency : 0);
           if (delay) setTimeout(() => !l.frozen && to.write(d), delay);
           else to.write(d);
         });
-      if (first) up.write(first);
+      if (first) up.write(rewrite(first));
       pipe(client, up, 'up');
       pipe(up, client, 'down');
     };
-    if (!p.blackholeWs && !p.wsLatency && !p.helloDelayMs) return connect();
+    if (!p.blackholeWs && !p.wsLatency && !p.helloDelayMs && !p.rewriteHost) return connect();
     // Decide on the first chunk: WebSocket upgrades go nowhere (or slowly), plain HTTP passes.
     client.once('data', (first: Buffer) => {
       l.ws = first.toString('latin1').startsWith('GET /ws');
@@ -139,6 +148,7 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
     wsLatency: 0,
     helloDelayMs: 0,
     blackholeWs: false,
+    rewriteHost: null,
     cutNewAfterMs: 0,
     setMode: (m) => void (mode = m),
     cutAfterNextUp: () => void (cutNext = true),

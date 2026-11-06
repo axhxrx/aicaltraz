@@ -1,10 +1,6 @@
 {
   "$schema": "../schema/buttpad.config.schema.json",
   "version": 1,
-  "server": {
-    "host": "0.0.0.0",
-    "port": 8787
-  },
   "pads": [
     {
       "id": "lights",
@@ -21,14 +17,7 @@
           "w": 2,
           "holdMs": 400,
           "key": "1",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "all",
-              "on"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["all", "on"] }
         },
         {
           "id": "all-off",
@@ -37,18 +26,9 @@
           "x": 2,
           "y": 0,
           "confirm": true,
-          "stops": [
-            "lights/*"
-          ],
+          "stops": ["lights/*"],
           "key": "0",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "all",
-              "off"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["all", "off"] }
         },
         {
           "id": "key-80",
@@ -57,14 +37,7 @@
           "x": 0,
           "y": 1,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "key",
-              "80"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["key", "80"] }
         },
         {
           "id": "fill",
@@ -73,14 +46,7 @@
           "x": 1,
           "y": 1,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "fill",
-              "toggle"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["fill", "toggle"] }
         },
         {
           "id": "interview",
@@ -90,13 +56,7 @@
           "y": 1,
           "h": 2,
           "holdMs": 800,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/scene.sh",
-            "args": [
-              "interview"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/scene.sh", "args": ["interview"] }
         },
         {
           "id": "key-off",
@@ -105,14 +65,7 @@
           "x": 0,
           "y": 2,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "key",
-              "off"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["key", "off"] }
         },
         {
           "id": "back-30",
@@ -121,14 +74,7 @@
           "x": 1,
           "y": 2,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/light.sh",
-            "args": [
-              "back",
-              "30"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/light.sh", "args": ["back", "30"] }
         },
         {
           "id": "haze",
@@ -137,13 +83,7 @@
           "x": 0,
           "y": 3,
           "whileRunning": "cancel",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/haze.sh",
-            "args": [
-              "45"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/haze.sh", "args": ["45"] }
         },
         {
           "id": "stop-all",
@@ -153,12 +93,8 @@
           "y": 3,
           "w": 2,
           "trigger": "tap",
-          "stops": [
-            "*"
-          ],
-          "action": {
-            "type": "none"
-          }
+          "stops": ["*"],
+          "action": { "type": "none" }
         }
       ]
     },
@@ -176,13 +112,7 @@
           "y": 0,
           "w": 2,
           "holdMs": 600,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/camera.sh",
-            "args": [
-              "rec"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/camera.sh", "args": ["rec"] }
         },
         {
           "id": "snap",
@@ -192,13 +122,7 @@
           "y": 1,
           "trigger": "tap",
           "key": " ",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/camera.sh",
-            "args": [
-              "snap"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/camera.sh", "args": ["snap"] }
         },
         {
           "id": "battery",
@@ -207,13 +131,7 @@
           "x": 1,
           "y": 1,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/camera.sh",
-            "args": [
-              "battery"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/camera.sh", "args": ["battery"] }
         },
         {
           "id": "upload",
@@ -223,13 +141,7 @@
           "y": 2,
           "whileRunning": "cancel",
           "timeoutMs": 60000,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/camera.sh",
-            "args": [
-              "upload"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/camera.sh", "args": ["upload"] }
         },
         {
           "id": "format",
@@ -241,13 +153,7 @@
           "confirm": true,
           "confirmWindowMs": 4000,
           "resultHoldMs": 5000,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/camera.sh",
-            "args": [
-              "format"
-            ]
-          }
+          "action": { "type": "exec", "command": "./scripts/camera.sh", "args": ["format"] }
         }
       ]
     },
@@ -263,10 +169,8 @@
           "color": "#3a86ff",
           "x": 0,
           "y": 0,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/progress.sh"
-          }
+          "group": "long-runs",
+          "action": { "type": "exec", "command": "./scripts/progress.sh" }
         },
         {
           "id": "flaky",
@@ -275,10 +179,7 @@
           "x": 1,
           "y": 0,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/flaky.sh"
-          }
+          "action": { "type": "exec", "command": "./scripts/flaky.sh" }
         },
         {
           "id": "fail",
@@ -287,10 +188,7 @@
           "x": 2,
           "y": 0,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/fail.sh"
-          }
+          "action": { "type": "exec", "command": "./scripts/fail.sh" }
         },
         {
           "id": "slow",
@@ -299,10 +197,8 @@
           "x": 0,
           "y": 1,
           "whileRunning": "cancel",
-          "action": {
-            "type": "exec",
-            "command": "./scripts/slow.sh"
-          }
+          "group": "long-runs",
+          "action": { "type": "exec", "command": "./scripts/slow.sh" }
         },
         {
           "id": "timeout",
@@ -311,10 +207,7 @@
           "x": 1,
           "y": 1,
           "timeoutMs": 3000,
-          "action": {
-            "type": "exec",
-            "command": "./scripts/slow.sh"
-          }
+          "action": { "type": "exec", "command": "./scripts/slow.sh" }
         },
         {
           "id": "spawn-fail",
@@ -323,13 +216,7 @@
           "x": 2,
           "y": 1,
           "trigger": "tap",
-          "action": {
-            "type": "exec",
-            "command": "buttpad-no-such-tool",
-            "args": [
-              "--help"
-            ]
-          }
+          "action": { "type": "exec", "command": "buttpad-no-such-tool", "args": ["--help"] }
         },
         {
           "id": "queue",
@@ -351,10 +238,7 @@
           "x": 1,
           "y": 2,
           "trigger": "double",
-          "action": {
-            "type": "shell",
-            "script": "echo \"Double-tapped at $(date +%H:%M:%S)\""
-          }
+          "action": { "type": "shell", "script": "echo \"Double-tapped at $(date +%H:%M:%S)\"" }
         },
         {
           "id": "long-text",
@@ -378,10 +262,7 @@
           "w": 2,
           "trigger": "tap",
           "key": "PageDown",
-          "action": {
-            "type": "shell",
-            "script": "echo \"Next slide at $(date +%H:%M:%S)\""
-          }
+          "action": { "type": "shell", "script": "echo \"Next slide at $(date +%H:%M:%S)\"" }
         },
         {
           "id": "env",

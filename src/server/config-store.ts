@@ -48,19 +48,20 @@ const objects = (v: unknown): Obj[] => (Array.isArray(v) ? v.filter(isObj) : [])
 const isPrimitive = (v: unknown) => v === null || (typeof v !== 'object' && typeof v !== 'function');
 
 /**
- * `keys` (schema order) arranged like the author's `template` keys; a key the template lacks goes
- * before the first template key that comes after it in schema order (`timeoutMs` lands next to
- * `holdMs`, not after `action`).
+ * `keys` (schema order) arranged like the author's `template` keys. A key the template lacks goes
+ * right after the last of them (in the author's order) that comes before it in schema order —
+ * `timeoutMs` after `holdMs`, wherever the author put that — else before the first that comes after.
  */
 function arrange(keys: string[], template: Obj | undefined, schema: string[]): string[] {
-  if (!template) return keys;
   const rank = (k: string) => (schema.includes(k) ? schema.indexOf(k) : schema.length);
+  if (!template) return [...keys].sort((a, b) => rank(a) - rank(b));
   const out = Object.keys(template).filter((k) => keys.includes(k));
   for (const k of keys) {
     if (out.includes(k)) continue;
-    const at = out.findIndex((o) => rank(o) > rank(k));
-    if (at < 0) out.push(k);
-    else out.splice(at, 0, k);
+    const r = rank(k);
+    const after = out.findLastIndex((o) => rank(o) < r);
+    const before = out.findIndex((o) => rank(o) > r);
+    out.splice(after >= 0 ? after + 1 : before >= 0 ? before : out.length, 0, k);
   }
   return out;
 }
@@ -120,8 +121,11 @@ export function formatJson(v: unknown, indent = 0, lead = 0): string {
   }
   const entries = Object.entries(v as Obj).filter(([, x]) => x !== undefined);
   if (!entries.length) return '{}';
-  if (entries.every(([, x]) => isPrimitive(x) || (Array.isArray(x) && x.every(isPrimitive)))) {
-    const line = `{ ${entries.map(([k, x]) => `${JSON.stringify(k)}: ${Array.isArray(x) ? (x.length ? `[${x.map((y) => JSON.stringify(y)).join(', ')}]` : '[]') : JSON.stringify(x)}`).join(', ')} }`;
+  /** A value that sits on its parent's line: a string/number…, an array of those, `{}`. */
+  const flat = (x: unknown) => isPrimitive(x) || (Array.isArray(x) && x.every(isPrimitive)) || (isObj(x) && !Object.keys(x).length);
+  const oneLine = (x: unknown) => (Array.isArray(x) ? `[${x.map((y) => JSON.stringify(y)).join(', ')}]` : isObj(x) ? '{}' : JSON.stringify(x));
+  if (entries.every(([, x]) => flat(x))) {
+    const line = `{ ${entries.map(([k, x]) => `${JSON.stringify(k)}: ${oneLine(x)}`).join(', ')} }`;
     if (fits(line)) return line;
   }
   return `{\n${entries

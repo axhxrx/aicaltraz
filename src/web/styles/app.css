@@ -694,8 +694,23 @@ button.bp-row:active {
   font-size: 15px;
   color: var(--muted);
 }
-.bp-ghost.bp-code-entry {
-  margin: 4px 0 10px;
+/* Not paired: the code is the way in (from a LAN address or through a proxy alike), big. */
+.bp-cta.bp-code-cta {
+  width: 100%;
+  height: 72px;
+  margin: 10px 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  border-radius: 18px;
+  background: #2f6fde;
+  color: #fff;
+  font-size: 22px;
+}
+.bp-code-cta svg {
+  width: 30px;
+  height: 30px;
 }
 .bp-screen-actions {
   display: flex;

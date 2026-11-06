@@ -19,6 +19,8 @@ describe('parseCli', () => {
       port: undefined,
       rotateTokens: false,
       qr: true,
+      pairCode: true,
+      allowOrigins: [],
       readyJson: false,
       tls: undefined,
       dev: false,
@@ -39,6 +41,18 @@ describe('parseCli', () => {
   test('rejects bad input', () => {
     for (const argv of [['--port', 'abc'], ['--port', '70000'], ['--port', '-1'], ['--tls-cert', 'c.pem'], ['--bogus'], ['extra'], ['--host', '']])
       expect(() => parseCli(argv, {})).toThrow(UsageError);
+  });
+
+  test('--no-pair-code; --allow-origin (repeatable) and BUTTPAD_ALLOW_ORIGINS take exact origins only', () => {
+    expect(parseCli(['--no-pair-code'], {}).pairCode).toBe(false);
+    expect(
+      parseCli(['--allow-origin', 'https://preview.example.com', '--allow-origin=https://b.example:8443/', '--allow-origin', 'HTTPS://PREVIEW.example.com:443'], {
+        BUTTPAD_ALLOW_ORIGINS: ' http://192.168.1.20:8080 ,https://b.example:8443,',
+      }).allowOrigins,
+    ).toEqual(['https://preview.example.com', 'https://b.example:8443', 'http://192.168.1.20:8080']);
+    for (const bad of ['*', 'https://*.example.com', 'https://x.example/app', 'x.example', 'ftp://x.example', 'https://x.example?a=1', 'https://u:p@x.example', 'null', ''])
+      expect(() => parseCli(['--allow-origin', bad], {})).toThrow(/--allow-origin takes exact origins like https:\/\/buttpad\.example\.com/);
+    expect(() => parseCli([], { BUTTPAD_ALLOW_ORIGINS: 'https://ok.example,https://*.example' })).toThrow(/^BUTTPAD_ALLOW_ORIGINS takes exact origins .* got "https:\/\/\*\.example"$/);
   });
 });
 

@@ -4,21 +4,21 @@
  * (with the run's id), then state; whileRunning (a press on an already queued run is `ignored`);
  * a queued re-run REQUEUE_GAP_MS after the result shows; timeouts; cancel = kill; `stops`; the
  * `none` action; `confirm` buttons refuse presses without `confirm` (`needs-confirm`); presses older
- * than PRESS_MAX_AGE_MS are `expired`; `@state` lines latch; result text rules; last 20 runs per
+ * than the button's maxLatenessMs are `expired`; `@state` lines latch; result text rules; last 20 runs per
  * button; and when a press gets `ignored` (cancel within 700 ms of the start, the start rate limit).
  *
  * The demo's "host clock" is the page's own (lib/clock.ts), so clockSkew is 0.
  */
 import { buttonKey, findButton, parseConfig, type Button, type Config } from '../../core/config.ts';
 import { initialState, transition, type Effect, type MachineEvent, type RunState } from '../../core/machine.ts';
-import { PRESS_MAX_AGE_MS, type PressResult, type RunRecord, type StateMap } from '../../core/protocol.ts';
+import type { PressResult, RunRecord, StateMap } from '../../core/protocol.ts';
 import { wall } from '../lib/clock.ts';
 import { mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import { DEMO_CONFIG } from './demo-config.ts';
 import { simulate, type SimHandle } from './demo-script.ts';
-import { CANCEL_GRACE_MS, emptySnapshot, PressError, statesIn, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
+import { CANCEL_GRACE_MS, emptySnapshot, latenessOf, PressError, statesIn, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
 
 /**
  * As on the host for one connection (src/server/limits.ts): presses that start or queue a run,
@@ -248,7 +248,8 @@ export class DemoBackend implements Backend {
   private handle(pad: string, button: string, at: number, confirm: boolean): PressAck {
     const b = this.button(pad, button);
     if (!b) return { result: 'unknown-button' };
-    if (wall() - at > PRESS_MAX_AGE_MS) return { result: 'expired' };
+    // Made longer ago than the button allows (it sat in a dead link): dropped, as on the host.
+    if (wall() - at > latenessOf(b)) return { result: 'expired' };
     const key = buttonKey(pad, b.id);
     const s = this.states.get(key) ?? initialState();
     // A queued re-run is coming already (still running, or showing the result before it starts).

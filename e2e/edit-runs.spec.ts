@@ -145,7 +145,9 @@ test("a program that can't start: the run says why, what ran and in which folder
   await page.getByTestId('run-test').click();
   const run = page.getByTestId('run-item').first();
   await expect(run).toContainText("Couldn't start", { timeout: 8000 });
-  await expect(page.getByTestId('run-error')).toContainText('no-such-program');
+  // The path exactly, in quotes (a blank at its end would show): and what it tried to run, right there.
+  await expect(page.getByTestId('run-error')).toHaveText(`command not found: “${join(dirname(host.configPath), 'no-such-program.sh')}”`);
+  await expect(run).toContainText('Tried to run');
   await expect(page.getByTestId('run-command')).toContainText('no-such-program.sh --now');
   await expect(page.getByTestId('run-cwd')).toHaveText(dirname(host.configPath));
 });
@@ -156,8 +158,10 @@ test("a save's warnings (non-blocking) show after it, on the button they're abou
   await page.getByTestId('field-label').fill('Format SD card');
   await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
-  await expect(page.getByTestId('toast')).toContainText('Saved, with 1 warning');
   const notice = page.getByTestId('notice-warnings');
+  // The notice says it was saved: no toast on top of it (it used to hide the notice's header and ✕).
+  await expect(notice).toContainText('Saved, but the host warns about this');
+  await expect(page.getByTestId('toast')).toHaveCount(0);
   // The host checks what a press would run into: Ghost's program isn't there.
   await expect(notice.getByTestId('warning-item')).toHaveText(`Main › “Ghost” · Command: not found: ${join(dirname(host.configPath), 'no-such-program.sh')}`);
   await expect(item(page, 'ghost').getByTestId('warned-badge')).toBeVisible();
@@ -208,4 +212,67 @@ test("a broken config file's errors: “+N more” opens the whole list (notice 
   await dialog.getByTestId('broken-more').click();
   await expect(dialog.getByTestId('broken-errors').locator('li')).toHaveCount(n + 1);
   await page.getByTestId('broken-cancel').click();
+});
+
+test("a running button's new time limit applies to its run: said near Save; one shorter than it has run asks first, then stops it", async ({ page, hasTouch }) => {
+  await edit(page);
+  await runs(page, hasTouch, 'slow');
+  await page.getByTestId('run-test').click();
+  const t0 = Date.now();
+  await expect(page.getByTestId('run-test')).toHaveText('Running…');
+  await page.getByTestId('editor-tab-button').click();
+  await expect(page.getByTestId('running-note')).toContainText('A new time limit applies to this run too');
+  await expect(page.getByTestId('timeout-live-note')).toHaveText('Applies to a run in progress too.');
+  await expect(page.getByTestId('field-timeoutMs')).toHaveValue('5');
+  await page.getByTestId('field-timeoutMs').fill('60');
+  const notice = page.getByTestId('notice-live-timeout');
+  await expect(notice).toContainText('Applies to the run in progress too: once saved, “Slow” has a 1 min time limit');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  await expect(page.getByTestId('dialog-stop')).toHaveCount(0);
+  await expect(notice).toHaveCount(0);
+  // Past its old 5 s, it still runs: the new limit is its limit now.
+  await page.waitForTimeout(Math.max(0, 6000 - (Date.now() - t0)));
+  await expect(item(page, 'slow').getByTestId('running-badge')).toBeVisible();
+  // Shorter than it has run: the notice says so, and saving asks first (Cancel has the focus).
+  await page.getByTestId('field-timeoutMs').fill('2');
+  await expect(notice).toContainText('saving a 2 s limit stops it');
+  await page.getByTestId('edit-save').click();
+  const dialog = page.getByTestId('dialog-stop');
+  await expect(dialog).toContainText('“Slow” (running');
+  await expect(dialog.getByTestId('stop-timeout')).toContainText('A new time limit applies to the run in progress too');
+  await expect(page.getByTestId('stop-cancel')).toBeFocused();
+  await page.getByTestId('stop-cancel').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  await expect(item(page, 'slow').getByTestId('running-badge')).toBeVisible();
+  await page.getByTestId('edit-save').click();
+  await page.getByTestId('stop-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  await page.getByTestId('editor-tab-runs').click();
+  await expect(page.getByTestId('run-item').first()).toContainText('Timed out', { timeout: 8000 });
+});
+
+test('the host’s warnings land on their fields (a group of one, bash syntax under sh); on a phone the notice shows one, the rest on request', async ({ page, hasTouch }) => {
+  await edit(page);
+  await tap(page, hasTouch, 'edit-btn-format');
+  await page.getByTestId('editor-tab-action').click();
+  await page.getByTestId('field-group').fill('solo');
+  await tap(page, hasTouch, 'edit-btn-render');
+  await page.getByTestId('field-script').fill('if [[ -n "$HOME" ]]; then echo rendering; fi');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  const notice = page.getByTestId('notice-warnings');
+  await expect(notice).toContainText('Saved, but the host warns about 3 things');
+  if (hasTouch) {
+    await expect(notice.getByTestId('warning-item')).toHaveCount(1);
+    await notice.getByTestId('warnings-more').click();
+  }
+  await expect(notice.getByTestId('warning-item')).toHaveCount(3);
+  await expect(notice).toContainText('Main › “Format card” · Group: “solo” has no other button');
+  await expect(notice).toContainText('Main › “Render” · Shell: the script uses bash syntax ([[ … ]])');
+  await expect(notice).toContainText('set Shell to bash');
+  // On the button: in its editor, by the field's name.
+  await expect(page.getByTestId('warning-button')).toContainText('Shell: the script uses bash syntax');
+  await page.getByTestId('field-shell').fill('bash');
+  await expect(page.getByTestId('warning-button')).toHaveCount(0);
 });

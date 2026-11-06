@@ -6,7 +6,7 @@ import type { Server, ServerWebSocket } from 'bun';
 import { hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 import type { RunState } from '../core/machine.ts';
-import { PROTOCOL_VERSION, type ClientMsg, type ConfigConflict, type HostInfo, type Role, type ServerMsg } from '../core/protocol.ts';
+import { PROTOCOL_VERSION, type ClientMsg, type ConfigConflict, type HostInfo, type PairResponse, type Role, type ServerMsg } from '../core/protocol.ts';
 import webApp from '../web/index.html';
 import pkg from '../../package.json';
 import { ConfigStore } from './config-store.ts';
@@ -14,11 +14,13 @@ import { configWarnings } from './config-warnings.ts';
 import { errnoText, listenError } from './errors.ts';
 import { WriteError } from './files.ts';
 import { ThrottledLog } from './limits.ts';
+import { Pairing, type PairCode, type PairLimits } from './pairing.ts';
 import { STATE_FILE } from './persist.ts';
 import { sanitizeLog } from './runner.ts';
 import { bearerToken, loadSecrets, makeAuth, type Secrets } from './secrets.ts';
 import { starterConfigText } from './starter.ts';
 import { runEndLine, StateStore, type PressReply, type StartLimits } from './state-store.ts';
+import { WebAssets } from './web-assets.ts';
 
 export const VERSION: string = pkg.version;
 const MAX_BODY = 1024 * 1024;
@@ -51,10 +53,20 @@ export interface HostOptions {
   debounceMs?: number;
   /** Bun dev mode (HMR socket, source maps with absolute paths): local development only. Default false. */
   development?: boolean;
+  /**
+   * Build and compress the web app right after listening (the CLI does), so the first page load
+   * doesn't wait for it. Otherwise that happens on the first request for the page.
+   */
+  preloadWebApp?: boolean;
   /** Run state that survives restarts. Default: buttpad.state.json next to the config. */
   statePath?: string;
-  /** Override connection and press limits (tests). */
-  limits?: { maxClients?: number; adminReserved?: number; clientsPerAddress?: number; presses?: Partial<StartLimits> };
+  /** Override connection, press and pairing-attempt limits (tests). */
+  limits?: { maxClients?: number; adminReserved?: number; clientsPerAddress?: number; presses?: Partial<StartLimits>; pairing?: Partial<PairLimits> };
+  /**
+   * Origins (exact `scheme://host:port`, see parseOrigin) whose pages may open a WebSocket and
+   * pair, besides the host's own: a reverse proxy in front of it (an HTTPS preview, a tunnel).
+   */
+  allowOrigins?: readonly string[];
 }
 
 interface WsData {
@@ -79,6 +91,10 @@ export interface Host {
   readonly state: StateStore;
   readonly created: { config: boolean; secrets: boolean; rotatedTokens: boolean; fixedSecretsMode: boolean };
   readonly info: HostInfo;
+  /** One-time pairing codes (POST /api/pair-code makes them, POST /api/pair takes them). */
+  readonly pairing: Pairing;
+  /** What `allowOrigins` admits, normalized. */
+  readonly allowOrigins: readonly string[];
   stop(): Promise<void>;
 }
 
@@ -88,15 +104,19 @@ const unauthorized = () => json({ error: 'unauthorized' }, 401, { 'www-authentic
 const forbidden = () => json({ error: 'admin token required' }, 403);
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-async function readJson(req: Request): Promise<{ ok: true; value: unknown } | { ok: false; status: number; error: string }> {
-  if (Number(req.headers.get('content-length') ?? 0) > MAX_BODY) return { ok: false, status: 413, error: 'body too large (max 1 MB)' };
+/** A JSON body of at most `max` bytes (default 1 MB); `optional`: an empty one is `undefined`. */
+async function readJson(req: Request, o: { optional?: boolean; max?: number } = {}): Promise<{ ok: true; value: unknown } | { ok: false; status: number; error: string }> {
+  const max = o.max ?? MAX_BODY;
+  const tooLarge = { ok: false as const, status: 413, error: `body too large (max ${max >= 1024 * 1024 ? `${max / 1024 / 1024} MB` : `${max / 1024} KB`})` };
+  if (Number(req.headers.get('content-length') ?? 0) > max) return tooLarge;
   let text: string;
   try {
     text = await req.text();
   } catch {
     return { ok: false, status: 400, error: 'could not read body' };
   }
-  if (Buffer.byteLength(text) > MAX_BODY) return { ok: false, status: 413, error: 'body too large (max 1 MB)' };
+  if (Buffer.byteLength(text) > max) return tooLarge;
+  if (o.optional && !text.trim()) return { ok: true, value: undefined };
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch {
@@ -105,18 +125,40 @@ async function readJson(req: Request): Promise<{ ok: true; value: unknown } | { 
 }
 
 /**
- * A page from another origin must not open a socket (cross-site WebSocket hijacking). Browsers always
- * send Origin on WebSocket upgrades; other clients (curl, scripts) send none and are allowed.
+ * An exact origin as `--allow-origin` takes it — scheme (http/https), host, port; no path, query,
+ * credentials or wildcard — normalized (`https://x.example:443/` → `https://x.example`), or
+ * undefined when `s` isn't one.
  */
-export function sameOrigin(req: Request): boolean {
+export function parseOrigin(s: string): string | undefined {
+  const t = s.trim();
+  if (!/^https?:\/\/[^/?#*@\s]+\/?$/i.test(t)) return undefined;
+  try {
+    const u = new URL(t);
+    return u.origin === 'null' ? undefined : u.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A page from another origin must not open a socket (cross-site WebSocket hijacking) or pair.
+ * Browsers always send Origin on WebSocket upgrades and POSTs; other clients (curl, scripts) send
+ * none and are allowed. Allowed: the host's own origin (Origin's host:port is the Host header), and
+ * the exact origins in `allowed` (a reverse proxy in front of the host: see `--allow-origin`).
+ */
+export function originAllowed(req: Request, allowed: ReadonlySet<string> = new Set()): boolean {
   const origin = req.headers.get('origin');
   if (origin === null) return true;
   try {
-    return new URL(origin).host === (req.headers.get('host') ?? '').toLowerCase();
+    const u = new URL(origin);
+    return u.host === (req.headers.get('host') ?? '').toLowerCase() || allowed.has(u.origin);
   } catch {
     return false;
   }
 }
+
+/** The host's own origin only: originAllowed without an allowlist. */
+export const sameOrigin = (req: Request): boolean => originAllowed(req);
 
 /** Validates a client frame; returns an error message for anything malformed. */
 export function parseClientMsg(raw: string | Buffer): ClientMsg | string {
@@ -204,10 +246,14 @@ function addressOf(server: Server<WsData>, req: Request): string {
   return a.startsWith('::ffff:') && a.includes('.') ? a.slice(7) : a;
 }
 
+/** Where the bundle's files are: the page at `/`, the rest (hashed chunks) one level down. */
+const ASSET_PATH = /^\/[\w.-]+$/;
+
 const KNOWN_PATHS: [RegExp, string][] = [
   [/^\/api\/(health|state|runs)$/, 'GET'],
   [/^\/api\/config$/, 'GET, PUT'],
   [/^\/api\/press\/[^/]+\/[^/]+$/, 'POST'],
+  [/^\/api\/pair(-code)?$/, 'POST'],
   [/^\/ws$/, 'GET'],
 ];
 
@@ -221,6 +267,29 @@ export async function startHost(opts: HostOptions): Promise<Host> {
   const sec = loadSecrets(secretsPath, { rotate: opts.rotateTokens });
   const auth = makeAuth(sec.secrets);
   const info: HostInfo = { name: osHostname(), version: VERSION, platform: process.platform };
+  const allowOrigins = [
+    ...new Set(
+      (opts.allowOrigins ?? []).map((o) => {
+        const exact = parseOrigin(o);
+        if (!exact) throw new Error(`not an origin: "${o}" (an exact one like https://buttpad.example.com, scheme, host and port; no path, no wildcard)`);
+        return exact;
+      }),
+    ),
+  ];
+  const allowed = new Set(allowOrigins);
+  const pairing = new Pairing({ log, limits: opts.limits?.pairing });
+  /** Refused for its Origin: what the operator would change to allow it, at most once per 10 s. */
+  const originRefusals = new ThrottledLog(log, () => performance.now());
+  const refuseOrigin = (req: Request, what: string) => {
+    const origin = (req.headers.get('origin') ?? '').slice(0, 200);
+    const exact = parseOrigin(origin);
+    originRefusals.note(
+      `refused ${what} from a page at ${origin} (the request's Host is ${(req.headers.get('host') ?? 'missing').slice(0, 200)}): not this host's own address. ` +
+        (exact
+          ? `If that is ButtPad through your reverse proxy (or a preview pane), start ButtPad with --allow-origin ${exact}`
+          : 'An origin like that (opaque or malformed) can never be allowed'),
+    );
+  };
 
   const clients = new Set<ServerWebSocket<WsData>>();
   /** Open connections per client address. */
@@ -274,6 +343,28 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     };
 
   const refusingClients = new ThrottledLog(log, () => performance.now());
+
+  // The web app, compressed (web-assets.ts); built on first use, and again after a failure.
+  let assets: Promise<WebAssets> | undefined;
+  const loadAssets = () =>
+    (assets ??= WebAssets.load(webApp).catch((e: Error) => {
+      assets = undefined;
+      log(`the web app could not be built: ${e.message}`);
+      throw e;
+    }));
+  /** The bundle's file at `path`, or undefined when there is none. */
+  const serveAsset = async (req: Request, path: string): Promise<Response | undefined> => {
+    let w: WebAssets;
+    try {
+      w = await loadAssets();
+    } catch {
+      return json({ error: 'the web app could not be built (see the host log)' }, 500);
+    }
+    const a = w.get(path);
+    if (!a) return undefined;
+    if (req.method !== 'GET' && req.method !== 'HEAD') return json({ error: 'method not allowed' }, 405, { allow: 'GET, HEAD' });
+    return w.respond(req, a);
+  };
   const listenAt = { hostname: opts.host ?? config.config.server.host, port: opts.port ?? config.config.server.port };
   // Bun.serve's errors don't say which address (`ENOENT … listen` for a host name that doesn't resolve).
   const serve = ((options: Parameters<typeof Bun.serve>[0]) => {
@@ -292,9 +383,13 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     maxRequestBodySize: MAX_BODY,
     ...(opts.tls ? { tls: { cert: Bun.file(opts.tls.cert), key: Bun.file(opts.tls.key) } } : {}),
     routes: {
-      '/': webApp,
+      // Dev mode: Bun's own serving (HMR, on-the-fly rebuilds). Otherwise compressed, from the cache.
+      '/': opts.development ? webApp : async (req) => (await serveAsset(req, '/')) ?? json({ error: 'not found' }, 404),
       '/ws': (req, srv) => {
-        if (!sameOrigin(req)) return json({ error: 'cross-origin WebSocket refused' }, 403);
+        if (!originAllowed(req, allowed)) {
+          refuseOrigin(req, 'a WebSocket');
+          return json({ error: 'cross-origin WebSocket refused' }, 403);
+        }
         const role = auth(new URL(req.url).searchParams.get('token'));
         if (!role) return unauthorized();
         const address = addressOf(srv, req);
@@ -355,12 +450,43 @@ export async function startHost(opts: HostOptions): Promise<Host> {
           return json(state.runs({ pad: q.get('pad') || undefined, button: q.get('button') || undefined }));
         }),
       },
+      // No token: the code is the credential. See pairing.ts (and DESIGN.md, Pairing) for the limits.
+      '/api/pair': {
+        POST: async (req) => {
+          if (!originAllowed(req, allowed)) {
+            refuseOrigin(req, 'a pairing request');
+            return json({ error: 'cross-origin request refused' }, 403);
+          }
+          // No token here: anyone can send this, so it is kept small.
+          const body = await readJson(req, { max: 4096 });
+          if (!body.ok) return json({ error: body.error }, body.status);
+          const b = body.value;
+          if (!isRecord(b) || (typeof b.code !== 'string' && typeof b.code !== 'number')) return json({ error: 'body must be {"code": "123456"}' }, 400);
+          const r = pairing.redeem(String(b.code), addressOf(server, req));
+          if (r.ok) return json({ token: r.role === 'admin' ? sec.secrets.adminToken : sec.secrets.pressToken, role: r.role } satisfies PairResponse);
+          if (r.why === 'limited') return json({ error: 'too many attempts: wait a minute, then try again' }, 429, { 'retry-after': String(r.retryAfterSec) });
+          return json({ error: 'wrong or expired code' }, 401);
+        },
+      },
+      '/api/pair-code': {
+        POST: withRole('admin', async (req) => {
+          const body = await readJson(req, { optional: true });
+          if (!body.ok) return json({ error: body.error }, body.status);
+          const b = body.value ?? {};
+          if (!isRecord(b) || (b.role !== undefined && b.role !== 'press' && b.role !== 'admin'))
+            return json({ error: 'body must be {} or {"role": "admin" | "press"}' }, 400);
+          const code: PairCode = pairing.mint(b.role === 'press' ? 'press' : 'admin');
+          log(`a pairing code for ${code.role} was made (by ${addressOf(server, req)}), valid until ${new Date(code.expiresAt).toTimeString().slice(0, 8)}`);
+          return json(code);
+        }),
+      },
     },
-    fetch(req) {
+    async fetch(req) {
       const path = new URL(req.url).pathname;
       const allow = KNOWN_PATHS.find(([re]) => re.test(path))?.[1];
       if (allow) return json({ error: 'method not allowed' }, 405, { allow });
-      return json({ error: 'not found' }, 404);
+      const asset = !opts.development && ASSET_PATH.test(path) ? await serveAsset(req, path) : undefined;
+      return asset ?? json({ error: 'not found' }, 404);
     },
     error(e) {
       log(`request failed: ${e.stack ?? e.message}`);
@@ -407,6 +533,7 @@ export async function startHost(opts: HostOptions): Promise<Host> {
 
   // Listening, so no other host has this port: take over what a previous host left running.
   state.recover();
+  if (opts.preloadWebApp && !opts.development) void loadAssets().catch(() => {});
   config.watch(opts.debounceMs);
 
   let stopping: Promise<void> | undefined;
@@ -423,10 +550,14 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     state,
     created: { config: createdConfig, secrets: sec.created, rotatedTokens: sec.rotated, fixedSecretsMode: sec.fixedMode },
     info,
+    pairing,
+    allowOrigins,
     stop: () =>
       (stopping ??= (async () => {
         config.close();
         refusingClients.close();
+        originRefusals.close();
+        pairing.close();
         for (const ws of clients) ws.close(1001, 'host shutting down');
         await Promise.all([state.shutdown(), server.stop(true)]);
       })()),

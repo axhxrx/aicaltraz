@@ -50,6 +50,11 @@ export interface Snapshot {
   latched: Record<string, string>;
   /** The host turns connections away (503: too many devices connected). */
   hostFull: boolean;
+  /**
+   * The host turns this page's address away (403: its Origin isn't the host's own, nor one it was
+   * told about with --allow-origin): a reverse proxy, tunnel or preview pane in front of it.
+   */
+  originRefused: boolean;
   /** While not online: local (wall()) time of the last word from the host, if it ever spoke. */
   lastSeen: number | null;
   /**
@@ -144,6 +149,12 @@ export interface Backend {
    * message in words (not admin, an older host, unreachable).
    */
   pairCode?(): Promise<PairCode>;
+  /**
+   * The page hasn't been running for a while and doesn't know it yet (its heartbeat is overdue: a
+   * frozen tab that just woke). Asked while rendering: the first render after a freeze (a running
+   * clock's tick, say) must not show the minutes-old picture as live; `syncing` follows at once.
+   */
+  isStale?(): boolean;
   dispose(): void;
 }
 
@@ -167,6 +178,7 @@ export const emptySnapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   retryAt: null,
   latched: {},
   hostFull: false,
+  originRefused: false,
   lastSeen: null,
   syncing: false,
   ...over,

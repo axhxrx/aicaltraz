@@ -149,7 +149,7 @@ export class RunSession {
       kick: () => this.backend.kick(),
       mayStart: (t) => this.mayStart(e, t),
       ackTimeout: () => this.backend.ackTimeoutMs?.() ?? ACK_TIMEOUT_MS,
-      syncing: () => snap().syncing && snap().status === 'online',
+      syncing: () => (snap().syncing || !!this.backend.isStale?.()) && snap().status === 'online',
     });
     e.off = ctrl.local.subscribe(() => this.updateMarks());
     return e;

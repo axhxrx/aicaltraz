@@ -6,7 +6,8 @@ import { parseArgs } from 'node:util';
 import QRCode from 'qrcode';
 import { configWarnings } from './config-warnings.ts';
 import { errnoText } from './errors.ts';
-import { startHost, VERSION, type Host } from './host.ts';
+import { parseOrigin, startHost, VERSION, type Host } from './host.ts';
+import { formatCode, PAIR_CODE_TTL_MS, type PairCode } from './pairing.ts';
 import { sanitizeLog } from './runner.ts';
 
 export const USAGE = `Usage: buttpad [options]
@@ -19,6 +20,11 @@ export const USAGE = `Usage: buttpad [options]
   --port N          listen port (overrides config server.port; 0 = any free port)
   --rotate-tokens   generate new press/admin tokens (paired devices must pair again)
   --no-qr           don't print the pairing QR code
+  --no-pair-code    don't print a one-time admin pairing code at startup (an admin
+                    device can still make codes: menu, "Pair another device")
+  --allow-origin O  also accept pages served from origin O (exact scheme://host:port,
+                    no wildcard): a reverse proxy in front of ButtPad, e.g. an HTTPS
+                    tunnel or preview. Repeatable; or $BUTTPAD_ALLOW_ORIGINS=O1,O2
   --ready-json      once listening, print one JSON line to stdout (other output goes to stderr)
   --tls-cert PATH   serve HTTPS with this PEM certificate…
   --tls-key PATH    …and this PEM private key
@@ -37,6 +43,10 @@ export interface CliOptions {
   port?: number;
   rotateTokens: boolean;
   qr: boolean;
+  /** Print a one-time admin pairing code at startup. */
+  pairCode: boolean;
+  /** Exact origins (normalized) a reverse proxy serves the app from: --allow-origin, $BUTTPAD_ALLOW_ORIGINS. */
+  allowOrigins: string[];
   readyJson: boolean;
   tls?: { cert: string; key: string };
   dev: boolean;
@@ -68,6 +78,8 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
         port: { type: 'string' },
         'rotate-tokens': { type: 'boolean' },
         'no-qr': { type: 'boolean' },
+        'no-pair-code': { type: 'boolean' },
+        'allow-origin': { type: 'string', multiple: true },
         'ready-json': { type: 'boolean' },
         'tls-cert': { type: 'string' },
         'tls-key': { type: 'string' },
@@ -88,6 +100,17 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
   const key = values['tls-key'];
   if (!cert !== !key) throw new UsageError('--tls-cert and --tls-key go together');
   if (values.host === '') throw new UsageError('--host must not be empty');
+  const origins: string[] = [];
+  const origin = (o: string, from: string) => {
+    const exact = parseOrigin(o);
+    if (!exact)
+      throw new UsageError(
+        `${from} takes exact origins like https://buttpad.example.com or http://192.168.1.20:8080 (scheme, host and port; no path, no wildcard), got "${o}"`,
+      );
+    if (!origins.includes(exact)) origins.push(exact);
+  };
+  for (const o of values['allow-origin'] ?? []) origin(o, '--allow-origin');
+  for (const o of (env.BUTTPAD_ALLOW_ORIGINS ?? '').split(',')) if (o.trim()) origin(o, 'BUTTPAD_ALLOW_ORIGINS');
   const home = env.HOME || env.USERPROFILE || homedir();
   const path = (p: string) => expandTilde(p, home);
   return {
@@ -97,6 +120,8 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
     port,
     rotateTokens: !!values['rotate-tokens'],
     qr: !values['no-qr'],
+    pairCode: !values['no-pair-code'],
+    allowOrigins: origins,
     readyJson: !!values['ready-json'],
     tls: cert && key ? { cert: path(cert), key: path(key) } : undefined,
     dev: !!values.dev,
@@ -117,10 +142,12 @@ export function pairingHosts(bind: string, ifaces: Ifaces = networkInterfaces())
   return [...new Set(ips), 'localhost'];
 }
 
-export const pairingUrl = (scheme: string, host: string, port: number, token: string) =>
-  `${scheme}://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}/#token=${token}`;
+/** `scheme://host:port`, an IPv6 address in brackets. */
+export const hostBase = (scheme: string, host: string, port: number) => `${scheme}://${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${port}`;
 
-async function printBanner(host: Host, out: (s: string) => void, qr: boolean) {
+export const pairingUrl = (scheme: string, host: string, port: number, token: string) => `${hostBase(scheme, host, port)}/#token=${token}`;
+
+async function printBanner(host: Host, out: (s: string) => void, qr: boolean, code?: PairCode) {
   const cfg = host.config.config;
   const buttons = cfg.pads.reduce((n, p) => n + p.buttons.length, 0);
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
@@ -134,13 +161,22 @@ async function printBanner(host: Host, out: (s: string) => void, qr: boolean) {
 
   const hosts = pairingHosts(host.hostname);
   const url = (h: string, token: string) => pairingUrl(host.scheme, h, host.port, token);
+  // Through a reverse proxy (--allow-origin) the app is at the proxy's origin.
+  const proxied = (token: string) => host.allowOrigins.map((o) => `  ${o}/#token=${token}`);
   out('\nPress URL (pairs a device that can push buttons):');
   for (const h of hosts) out(`  ${url(h, host.secrets.pressToken)}`);
+  for (const l of proxied(host.secrets.pressToken)) out(l);
   out('\nAdmin URL (can edit the config = run any command on this machine; treat it like a password):');
   for (const h of hosts) out(`  ${url(h, host.secrets.adminToken)}`);
+  for (const l of proxied(host.secrets.adminToken)) out(l);
+  const lan = hosts.find((h) => h !== 'localhost');
+  if (code) {
+    const [first, ...more] = [hostBase(host.scheme, lan ?? hosts[0] ?? 'localhost', host.port), ...host.allowOrigins].map((b) => `${b}/#pair`);
+    const mins = Math.round(PAIR_CODE_TTL_MS / 60_000);
+    out(`\nPair a phone as admin: open ${first}${more.length ? ` (or ${more.join(', ')})` : ''} and enter ${formatCode(code.code)} (valid ${mins} min)`);
+  }
   if (host.scheme === 'http')
     out('\n⚠  Plain HTTP: tokens and presses cross the network unencrypted. Use it on a network you trust, or pass --tls-cert/--tls-key.');
-  const lan = hosts.find((h) => h !== 'localhost');
   if (qr && lan) {
     out(`\nScan to pair as a press device (${lan}):`);
     out(await QRCode.toString(url(lan, host.secrets.pressToken), { type: 'terminal', small: true }));
@@ -235,6 +271,9 @@ export async function main(argv: string[]): Promise<void> {
       rotateTokens: o.rotateTokens,
       tls: o.tls,
       development: o.dev,
+      allowOrigins: o.allowOrigins,
+      // Built and compressed now, so the first phone to open the page doesn't wait for it.
+      preloadWebApp: true,
       log,
     });
   } catch (e) {
@@ -247,7 +286,7 @@ export async function main(argv: string[]): Promise<void> {
   }
   g.__buttpadHost = host;
   installSignalHandlers(log);
-  await printBanner(host, out, o.qr);
+  await printBanner(host, out, o.qr, o.pairCode ? host.pairing.mint('admin') : undefined);
   if (o.readyJson) {
     const { pressToken, adminToken } = host.secrets;
     process.stdout.write(JSON.stringify({ event: 'ready', port: host.port, pressToken, adminToken, configPath: host.configPath }) + '\n');

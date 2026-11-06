@@ -205,6 +205,9 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   /** "+N more" opened up: the file's errors, the problems list. */
   const [moreFile, setMoreFile] = useState(false);
   const [moreProblems, setMoreProblems] = useState(false);
+  /** Phones: the save's warnings past the first opened up. */
+  const [moreWarnings, setMoreWarnings] = useState(false);
+  useEffect(() => setMoreWarnings(false), [warnings?.sent]);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<{ rev: string; again?: boolean; opts: SaveOpts } | null>(null);
   const [merging, setMerging] = useState<Merging | null>(null);
@@ -780,8 +783,15 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     if (!box || typeof ResizeObserver !== 'function') return;
     const ro = new ResizeObserver(() => body.current?.style.setProperty('--ed-notices-h', `${Math.round(box.getBoundingClientRect().height)}px`));
     ro.observe(box);
-    return () => ro.disconnect();
+    const more = () => box.toggleAttribute('data-more', box.scrollTop + box.clientHeight < box.scrollHeight - 2);
+    box.addEventListener('scroll', more, { passive: true });
+    return () => (ro.disconnect(), box.removeEventListener('scroll', more));
   }, []);
+  // More notices than fit (they scroll, so the canvas keeps its room): the bottom edge fades.
+  useLayoutEffect(() => {
+    const box = noticeBox.current;
+    box?.toggleAttribute('data-more', box.scrollTop + box.clientHeight < box.scrollHeight - 2);
+  });
   // The pad tabs scroll sideways when they don't fit: the selected one stays in view, the edges fade where there is more.
   useLayoutEffect(() => {
     const sc = tabs.current;
@@ -832,68 +842,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
 
   const notices = (
     <>
-      {live.length > 0 && (
-        <div class={`ed-notice ${liveStops.length ? 'is-warn' : 'is-info'}`} role="status" data-testid="notice-live-timeout">
-          <Timer />
-          <span>
-            <b>Applies to the run in progress too:</b>{' '}
-            {live.length === 1
-              ? live[0]!.ms <= live[0]!.ran
-                ? `${live[0]!.name} has run ${ran(live[0]!.ran)} already: saving a ${secs(live[0]!.ms)} limit stops it.`
-                : `once saved, ${live[0]!.name} has a ${secs(live[0]!.ms)} time limit (it has run ${ran(live[0]!.ran)}).`
-              : `once saved, the time limits of ${live.map((t, i) => `${i === 0 ? '' : i === live.length - 1 ? ' and ' : ', '}${t.name} (${secs(t.ms)})`).join('')}${liveStops.length ? `: ${liveStops.length === live.length ? 'they have' : `${liveStops.map((t) => t.name).join(' and ')} ${liveStops.length === 1 ? 'has' : 'have'}`} run longer than that already, saving stops ${liveStops.length === 1 ? 'it' : 'them'}` : ''}.`}
-          </span>
-        </div>
-      )}
-      {status !== 'online' && (
-        <div class="ed-notice is-warn" role="status" data-testid="notice-offline">
-          <Warn />
-          <span>
-            <b>Not connected to the host.</b> Keep editing; save once it's back.
-          </span>
-        </div>
-      )}
-      {fileErrors && (
-        <div class="ed-notice is-warn" role="status" data-testid="notice-file-errors">
-          <Warn />
-          <span>
-            <b>The config file on the host has errors</b> (it still runs the previous config): {fileErrors[0]}
-            {fileErrors.length > 1 && !moreFile && (
-              <>
-                {' '}
-                <button type="button" class="ed-link is-inline" data-testid="file-errors-more" onClick={() => setMoreFile(true)}>
-                  +{fileErrors.length - 1} more
-                </button>
-              </>
-            )}
-            . Someone may be editing it right now: saving asks before it replaces the file.
-            {moreFile && fileErrors.length > 1 && (
-              <ul class="ed-errlist" data-testid="file-errors-list">
-                {fileErrors.slice(1).map((e, i) => (
-                  <li key={i}>{e}</li>
-                ))}
-              </ul>
-            )}
-          </span>
-        </div>
-      )}
-      {behind && !conflict && !merging && (
-        <div class="ed-notice is-warn" role="status" data-testid="notice-host-changed">
-          <Warn />
-          <span>
-            <b>The config changed on the host</b> (a hand edit of the file, or another admin).{' '}
-            {overlap ? `${overlap} of its changes ${overlap === 1 ? 'is' : 'are'} also changed in your draft.` : 'Your draft is based on the old one.'}
-          </span>
-          <div class="ed-notice-actions">
-            <button type="button" class="ed-btn" data-testid="host-changed-merge" onClick={() => void startMerge()}>
-              {overlap ? 'Review and merge…' : 'Merge their changes'}
-            </button>
-            <button type="button" class="ed-btn is-quiet" data-testid="host-changed-dismiss" onClick={() => setDismissed(hostNow.rev)}>
-              Keep mine
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Most urgent first: answers to what was just done, then what needs a decision, then the state of things. */}
       {saveError && (
         <div class="ed-notice is-bad" role="alert" data-testid="notice-save-error">
           <Warn />
@@ -942,6 +891,36 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           </button>
         </div>
       )}
+      {behind && !conflict && !merging && (
+        <div class="ed-notice is-warn" role="status" data-testid="notice-host-changed">
+          <Warn />
+          <span>
+            <b>The config changed on the host</b> (a hand edit of the file, or another admin).{' '}
+            {overlap ? `${overlap} of its changes ${overlap === 1 ? 'is' : 'are'} also changed in your draft.` : 'Your draft is based on the old one.'}
+          </span>
+          <div class="ed-notice-actions">
+            <button type="button" class="ed-btn" data-testid="host-changed-merge" onClick={() => void startMerge()}>
+              {overlap ? 'Review and merge…' : 'Merge their changes'}
+            </button>
+            <button type="button" class="ed-btn is-quiet" data-testid="host-changed-dismiss" onClick={() => setDismissed(hostNow.rev)}>
+              Keep mine
+            </button>
+          </div>
+        </div>
+      )}
+      {live.length > 0 && (
+        <div class={`ed-notice ${liveStops.length ? 'is-warn' : 'is-info'}`} role="status" data-testid="notice-live-timeout">
+          <Timer />
+          <span>
+            <b>Applies to the run in progress too:</b>{' '}
+            {live.length === 1
+              ? live[0]!.ms <= live[0]!.ran
+                ? `${live[0]!.name} has run ${ran(live[0]!.ran)} already: saving a ${secs(live[0]!.ms)} limit stops it.`
+                : `once saved, ${live[0]!.name} has a ${secs(live[0]!.ms)} time limit (it has run ${ran(live[0]!.ran)}).`
+              : `once saved, the time limits of ${live.map((t, i) => `${i === 0 ? '' : i === live.length - 1 ? ' and ' : ', '}${t.name} (${secs(t.ms)})`).join('')}${liveStops.length ? `: ${liveStops.length === live.length ? 'they have' : `${liveStops.map((t) => t.name).join(' and ')} ${liveStops.length === 1 ? 'has' : 'have'}`} run longer than that already, saving stops ${liveStops.length === 1 ? 'it' : 'them'}` : ''}.`}
+          </span>
+        </div>
+      )}
       {warnings?.shown && (
         <div class="ed-notice is-warn" role="status" data-testid="notice-warnings">
           <Warn />
@@ -950,7 +929,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
               Saved, but the host warns about {warnings.list.length === 1 ? 'this' : `${warnings.list.length} things`}:
             </b>
             <ul>
-              {warnings.list.map((w, i) => (
+              {(wide || moreWarnings ? warnings.list : warnings.list.slice(0, 1)).map((w, i) => (
                 <li key={i}>
                   {w.button !== null ? (
                     <button type="button" class="ed-link" data-testid="warning-item" onClick={() => goToSent(w)}>
@@ -962,10 +941,49 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 </li>
               ))}
             </ul>
+            {/* Phones: one line, the rest on request (the canvas keeps its room). */}
+            {!wide && !moreWarnings && warnings.list.length > 1 && (
+              <button type="button" class="ed-link ed-more" data-testid="warnings-more" onClick={() => setMoreWarnings(true)}>
+                +{warnings.list.length - 1} more
+              </button>
+            )}
           </div>
           <button type="button" class="ed-icon" aria-label="Dismiss" data-testid="warnings-dismiss" onClick={() => setWarnings({ ...warnings, shown: false })}>
             <Close />
           </button>
+        </div>
+      )}
+
+      {fileErrors && (
+        <div class="ed-notice is-warn" role="status" data-testid="notice-file-errors">
+          <Warn />
+          <span>
+            <b>The config file on the host has errors</b> (it still runs the previous config): {fileErrors[0]}
+            {fileErrors.length > 1 && !moreFile && (
+              <>
+                {' '}
+                <button type="button" class="ed-link is-inline" data-testid="file-errors-more" onClick={() => setMoreFile(true)}>
+                  +{fileErrors.length - 1} more
+                </button>
+              </>
+            )}
+            . Someone may be editing it right now: saving asks before it replaces the file.
+            {moreFile && fileErrors.length > 1 && (
+              <ul class="ed-errlist" data-testid="file-errors-list">
+                {fileErrors.slice(1).map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            )}
+          </span>
+        </div>
+      )}
+      {status !== 'online' && (
+        <div class="ed-notice is-warn" role="status" data-testid="notice-offline">
+          <Warn />
+          <span>
+            <b>Not connected to the host.</b> Keep editing; save once it's back.
+          </span>
         </div>
       )}
     </>
@@ -1056,7 +1074,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
       </header>
 
       <div class="ed-body" ref={body}>
-        <div class="ed-stage">
+        {/* The canvas's room: rows of at least 44 px (and the hint bar under it). Notices scroll within the rest. */}
+        <div class="ed-stage" style={{ '--ed-canvas-min': `calc(${pad.rows} * 44px + ${pad.rows - 1} * var(--gap) + ${36 + (!wide && !showPanel ? 60 : 0)}px)` }}>
           <div class="ed-notices" ref={noticeBox} data-scroll>
             {notices}
           </div>

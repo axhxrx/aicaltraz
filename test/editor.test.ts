@@ -225,6 +225,22 @@ describe('tidy (before a save)', () => {
     expect(ed.dirty).toBe(false);
     expect(ed.origins()[0]).toEqual({ pad: 'main', buttons: ['lamp', 'button-2'] });
   });
+
+  test("a program's path, folders, the shell and the group too: the draft is then exactly what the schema keeps", () => {
+    const ed = new Editor(host(), 'r1');
+    ed.select(0);
+    ed.patchButton({ group: ' lights ', action: { type: 'shell', script: 'echo lamp ', shell: ' /bin/bash ', cwd: '  ' } });
+    ed.select(1);
+    ed.patchButton({ group: '   ', action: { type: 'exec', command: './porch.sh ', args: ['on '], cwd: ' /srv/bp' } });
+    ed.tidy();
+    const [a, b] = ed.state.draft.pads[0]!.buttons;
+    expect(a!.group).toBe('lights');
+    // Blank optional fields go (the script and the arguments are left as typed: blanks can mean something there).
+    expect(a!.action).toEqual({ type: 'shell', script: 'echo lamp ', shell: '/bin/bash' });
+    expect(b!.action).toEqual({ type: 'exec', command: './porch.sh', args: ['on '], cwd: '/srv/bp' });
+    expect('group' in b!).toBe(false);
+    expect(Config.parse(ed.state.draft)).toEqual(ed.state.draft);
+  });
 });
 
 describe('action type none', () => {

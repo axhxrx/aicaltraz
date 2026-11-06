@@ -44,7 +44,7 @@ function PasteToken(p: { onToken(t: string): void | Promise<string | null>; cta:
           data-testid="token-input"
           value={value}
           onInput={(e) => (setValue(e.currentTarget.value), setErr(null))}
-          placeholder="http://192.168.1.20:8787/#token=…"
+          placeholder="…/#token=…"
           autocomplete="off"
           autocapitalize="off"
           spellcheck={false}
@@ -65,6 +65,11 @@ function PasteToken(p: { onToken(t: string): void | Promise<string | null>; cta:
 
 const demoHref = () => `${location.pathname}?demo`;
 
+/**
+ * Not paired yet. The quickest way in (and the only practical one where this page isn't on the
+ * host's LAN address, behind a proxy, say) is the pairing code the host prints when it starts:
+ * that comes first, big. The QR / link / paste routes follow.
+ */
 export function PairingScreen(p: { onToken(t: string): void | Promise<string | null>; onCode(): void }) {
   return (
     <Screen testid="pairing">
@@ -72,19 +77,16 @@ export function PairingScreen(p: { onToken(t: string): void | Promise<string | n
         <Link />
       </div>
       <h1>Pair this device</h1>
-      <p>This screen becomes a remote for a ButtPad host. It needs the host's pairing token once.</p>
-      <ol class="bp-steps">
-        <li>
-          Start ButtPad on the host. It prints a <b>QR code</b> and a <b>pairing link</b>.
-        </li>
-        <li>Scan the QR with this device's camera, or open the link here.</li>
-        <li>Or paste the link below.</li>
-      </ol>
-      <PasteToken onToken={p.onToken} cta="Pair" />
-      <button type="button" class="bp-ghost bp-code-entry" data-testid="pair-with-code" onClick={p.onCode}>
-        Pair with a code…
+      <p>This screen becomes a remote for a ButtPad host. It pairs once: with a code, or with the host's pairing link.</p>
+      <button type="button" class="bp-cta bp-code-cta" data-testid="pair-with-code" onClick={p.onCode}>
+        <Key />
+        Pair with a code
       </button>
-      <p class="bp-screen-note">The host prints a one-time pairing code when it starts; an admin device can show one too.</p>
+      <p class="bp-screen-note">The host prints a one-time code when it starts (an admin device can show one too: Menu → Pair another device).</p>
+      <p>
+        Or use the host's <b>pairing link</b>: scan the <b>QR code</b> it prints with this device's camera, open the link here, or paste it below.
+      </p>
+      <PasteToken onToken={p.onToken} cta="Pair" />
       <a class="bp-demo-link" href={demoHref()} data-testid="try-demo">
         No host handy? Try the demo →
       </a>
@@ -133,7 +135,17 @@ const PAIR_ERRORS = {
   limited: 'Too many tries.',
   unreachable: 'Can’t reach the host. Check that this device is on the same network as the host.',
   old: 'This host doesn’t take pairing codes (it runs an older ButtPad): open its pairing link instead.',
+  get origin() {
+    return originAdvice();
+  },
 } as const;
+
+/**
+ * The host turns pages from this address away: this page comes through a reverse proxy, tunnel or
+ * preview pane the host wasn't told about. Says exactly what to start it with.
+ */
+export const originAdvice = () =>
+  `The host refuses requests from this page’s address (${location.origin}): a proxy, tunnel or preview is in front of it. Start ButtPad with --allow-origin ${location.origin} (or BUTTPAD_ALLOW_ORIGINS=${location.origin}).`;
 
 /**
  * Pairing by code: the digits the host printed at startup (next to its `…/#pair` link), or that an
@@ -217,8 +229,17 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
   );
 }
 
-export function ConnectingScreen(p: { status: string; hostFull?: boolean; onRepair(): void }) {
+export function ConnectingScreen(p: { status: string; hostFull?: boolean; originRefused?: boolean; onRepair(): void }) {
   const failing = p.status === 'offline';
+  if (p.originRefused)
+    return (
+      <Screen testid="connecting" tone="warn">
+        <div class="bp-spinner is-failing" />
+        <h1 data-testid="origin-refused">The host turns this address away</h1>
+        <p>{originAdvice()}</p>
+        <p>This one keeps trying, and connects once the host lets it.</p>
+      </Screen>
+    );
   if (p.hostFull)
     return (
       <Screen testid="connecting" tone="warn">

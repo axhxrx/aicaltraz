@@ -16,8 +16,10 @@ describe('index paths (parseConfig, the host’s 400)', () => {
     const bad = parseConfig({ ...cfg, pads: [{ ...cfg.pads[0], buttons: [{ ...cfg.pads[0]!.buttons[0], holdMs: 99999, cooldownMs: -1, label: 'x'.repeat(201) }] }, cfg.pads[1]] });
     expect(bad.ok).toBe(false);
     const list = toProblems(bad.ok ? [] : bad.errors);
-    expect(list).toContainEqual({ pad: 0, button: 0, field: 'holdMs', message: 'Must be at most 5000' });
-    expect(list).toContainEqual({ pad: 0, button: 0, field: 'cooldownMs', message: 'Must be at least 0' });
+    // Time fields are typed in seconds: their range is said in seconds.
+    expect(list).toContainEqual({ pad: 0, button: 0, field: 'holdMs', message: 'Must be at most 5 s' });
+    expect(list).toContainEqual({ pad: 0, button: 0, field: 'cooldownMs', message: 'Must be at least 0 s' });
+    expect(toProblems(['pads.0.buttons.0.timeoutMs: Too big: expected number to be <=86400000'])[0]!.message).toBe('Must be at most 86400 s (24 h)');
     expect(list).toContainEqual({ pad: 0, button: 0, field: 'label', message: 'At most 200 characters' });
     expect(toProblems(['pads.1.buttons.1.stops.0: use pad/button, pad/* or *'])).toEqual([{ pad: 1, button: 1, field: 'stops.0', message: 'Use pad/button, pad/* or *' }]);
     expect(toProblems(['pads.1.name: Too small: expected string to have >=1 characters'])).toEqual([{ pad: 1, button: null, field: 'name', message: "Can't be empty" }]);
@@ -33,6 +35,9 @@ describe("the host's by-id form (PUT warnings)", () => {
         'pad "fx" › button "fog": shell not found: zsh (not on PATH)',
         'pad "fx" › button "fog": permission denied (chmod +x?): /bin/zsh',
         'pad "fx" › button "off": stops "fx/nope" matches no other button',
+        'pad "fx" › button "fog": the script uses bash syntax ([[ … ]]), but runs with /bin/sh, which is not bash on many systems (dash on Debian, Ubuntu, Raspberry Pi OS): add "shell": "bash"',
+        'pad "main" › button "lamp": key "Control" never presses it: a modifier key on its own (Control, Alt, Meta/⌘, AltGr) is kept for shortcuts; pick another key',
+        'pad "main" › button "lamp": group "solo" has no other button: it stops nothing',
         'pad #2 › button #1: something new',
         'pad "fx": a pad thing',
         'pad "gone" › button "x": not here any more',
@@ -46,6 +51,14 @@ describe("the host's by-id form (PUT warnings)", () => {
       { pad: 1, button: 0, field: 'action.shell', message: 'not found: zsh (not on PATH)' },
       { pad: 1, button: 0, field: 'action.shell', message: 'permission denied (chmod +x?): /bin/zsh' },
       { pad: 1, button: 1, field: 'stops', message: '“fx/nope” matches no other button' },
+      {
+        pad: 1,
+        button: 0,
+        field: 'action.shell',
+        message: 'the script uses bash syntax ([[ … ]]), but runs with /bin/sh, which is not bash on many systems (dash on Debian, Ubuntu, Raspberry Pi OS): set Shell to bash',
+      },
+      { pad: 0, button: 0, field: 'key', message: '"Control" never presses it: a modifier key on its own (Control, Alt, Meta/⌘, AltGr) is kept for shortcuts; pick another key' },
+      { pad: 0, button: 0, field: 'group', message: '“solo” has no other button: it stops nothing' },
       { pad: 1, button: 0, field: null, message: 'something new' },
       { pad: 1, button: null, field: null, message: 'a pad thing' },
       { pad: null, button: null, field: null, message: 'pad "gone" › button "x": not here any more' },

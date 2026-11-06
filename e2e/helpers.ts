@@ -268,3 +268,64 @@ export const FLOW_CONFIG: ConfigInput = {
     },
   ],
 };
+
+/** Pixel statistics of a screenshot of `target` (as the screen shows it, after `css` is applied to the page). */
+export interface Pixels {
+  /** Mean WCAG relative luminance (0 black … 1 white). */
+  mean: number;
+  /**
+   * Mean absolute luminance step between horizontally adjacent pixels, in `strip` (fractions of the
+   * box: [x0, x1, y0, y1]): ~0 for a smooth fill, high for a texture (stripes, hatching).
+   */
+  texture: number;
+}
+
+/**
+ * Screenshots `target` and measures it in the page (canvas): mean relative luminance, and how
+ * textured a strip of it is. Animations are finished first (Playwright's `animations: 'disabled'`).
+ */
+export async function pixels(page: Page, target: Locator, strip: [number, number, number, number] = [0.04, 0.14, 0.3, 0.7]): Promise<Pixels> {
+  const png = await target.screenshot({ animations: 'disabled' });
+  return page.evaluate(
+    async ([b64, strip]) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${b64}`;
+      await img.decode();
+      const c = document.createElement('canvas');
+      [c.width, c.height] = [img.width, img.height];
+      const ctx = c.getContext('2d')!;
+      ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, c.width, c.height).data;
+      const lin = (v: number) => {
+        const x = v / 255;
+        return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+      };
+      const lum = (i: number) => 0.2126 * lin(d[i]!) + 0.7152 * lin(d[i + 1]!) + 0.0722 * lin(d[i + 2]!);
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) sum += lum(i);
+      const [x0, x1, y0, y1] = [Math.round(strip[0] * c.width), Math.round(strip[1] * c.width), Math.round(strip[2] * c.height), Math.round(strip[3] * c.height)];
+      let steps = 0;
+      let n = 0;
+      for (let y = y0; y < y1; y++)
+        for (let x = x0 + 1; x < x1; x++) {
+          steps += Math.abs(lum((y * c.width + x) * 4) - lum((y * c.width + x - 1) * 4));
+          n++;
+        }
+      return { mean: sum / (d.length / 4), texture: n ? steps / n : 0 };
+    },
+    [png.toString('base64'), strip] as const,
+  );
+}
+
+/** WCAG contrast of two CSS colors as getComputedStyle gives them (`rgb(…)` / `rgba(…)`). */
+export function contrastOf(a: string, b: string): number {
+  const lum = (css: string) => {
+    const [r, g, bl] = (css.match(/[\d.]+/g) ?? ['0', '0', '0']).slice(0, 3).map((v) => {
+      const x = Number(v) / 255;
+      return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r! + 0.7152 * g! + 0.0722 * bl!;
+  };
+  const [x, y] = [lum(a), lum(b)];
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}

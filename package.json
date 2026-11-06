@@ -11,7 +11,7 @@
     "e2e": "scripts/pw-env.sh npx playwright test -c e2e/playwright.config.ts",
     "typecheck": "tsc --noEmit",
     "schema": "bun scripts/emit-schema.ts",
-    "compile": "bun build --compile src/server/main.ts --outfile dist/buttpad"
+    "compile": "bun build --compile --minify src/server/main.ts --outfile dist/buttpad"
   },
   "dependencies": {
     "preact": "^11.0.1",

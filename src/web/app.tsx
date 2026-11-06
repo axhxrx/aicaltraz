@@ -19,7 +19,7 @@ import { RunPad } from './run/RunPad.tsx';
 import { RunSession } from './run/session.ts';
 import { MenuSheet } from './ui/Menu.tsx';
 import { Close } from './ui/icons.tsx';
-import { CheckingScreen, ConnectingScreen, MissingPadScreen, PairCodeScreen, PairingScreen, RejectedScreen } from './ui/Screens.tsx';
+import { CheckingScreen, ConnectingScreen, MissingPadScreen, originAdvice, PairCodeScreen, PairingScreen, RejectedScreen } from './ui/Screens.tsx';
 import { TopBar } from './ui/TopBar.tsx';
 
 declare global {
@@ -155,6 +155,7 @@ export function App({ opts }: { opts: AppOptions }) {
       }
       const t = readHashToken();
       if (!t || t === token) return;
+      setCodeEntry(null);
       // The draft is kept on the device either way, but leaving it deserves a question.
       if (unsavedEdits.get()) setSwitchTo(t);
       else if (token) setChecking(t);
@@ -287,6 +288,7 @@ function Connected(p: {
   const role = useStore(backend.snapshot, (s) => s.role);
   const configErrors = useStore(backend.snapshot, (s) => s.configErrors);
   const hostFull = useStore(backend.snapshot, (s) => s.hostFull);
+  const originRefused = useStore(backend.snapshot, (s) => s.originRefused);
   const syncing = useStore(backend.snapshot, (s) => s.syncing);
   const show = useStore(settings, (s) => s.show);
   const [choice, setChoice] = useState<PadChoice>(() =>
@@ -317,7 +319,7 @@ function Connected(p: {
   }, [role, mode]);
 
   if (status === 'unauthorized') return p.recovering ? <ConnectingScreen status="connecting" onRepair={p.onForget} /> : <RejectedScreen onToken={p.onPair} onRetry={p.onRetry} onCode={p.onCode} />;
-  if (!config) return <ConnectingScreen status={status} hostFull={hostFull} onRepair={p.onForget} />;
+  if (!config) return <ConnectingScreen status={status} hostFull={hostFull} originRefused={originRefused} onRepair={p.onForget} />;
   const found = resolvePad(config.pads, choice, shown.current);
   const pad = typeof found === 'string' ? null : found;
   keysOff.current = !pad && opts.lock;
@@ -373,6 +375,11 @@ function Connected(p: {
           <button type="button" class="bp-banner-x" aria-label="Hide" onClick={() => setHideStorage(true)}>
             <Close />
           </button>
+        </div>
+      )}
+      {originRefused && status !== 'online' && !editing && (
+        <div class="bp-banner" role="alert" data-testid="origin-refused">
+          <b>The host turns this address away.</b> {originAdvice()}
         </div>
       )}
       {hostFull && status !== 'online' && !editing && (

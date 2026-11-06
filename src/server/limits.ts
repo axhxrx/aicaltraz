@@ -33,6 +33,13 @@ export class TokenBucket {
     return true;
   }
 
+  /** How long until a `take()` would succeed (0: now; Infinity: it never refills). */
+  waitMs(): number {
+    this.refill();
+    if (this.tokens >= 1) return 0;
+    return this.perSec > 0 ? ((1 - this.tokens) / this.perSec) * 1000 : Infinity;
+  }
+
   /** Refilled completely: nothing left to remember about this source. */
   full(): boolean {
     this.refill();

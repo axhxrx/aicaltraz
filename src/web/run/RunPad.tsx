@@ -47,7 +47,8 @@ function RunButton({ session, pad, button, show }: { session: RunSession; pad: W
   const skew = useStore(backend.snapshot, (s) => s.clockSkew);
   const latched = useStore(backend.snapshot, (s) => s.latched[key]);
   const lastSeen = useStore(backend.snapshot, (s) => s.lastSeen);
-  const syncing = useStore(backend.snapshot, (s) => s.syncing);
+  // (A render right after the page woke from a freeze, before the backend noticed: syncing too.)
+  const syncing = useStore(backend.snapshot, (s) => s.syncing) || !!backend.isStale?.();
   const local = useStore(ctrl.local);
 
   const now = wall();

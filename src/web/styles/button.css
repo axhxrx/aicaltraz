@@ -1218,7 +1218,7 @@
   color: var(--res-text);
 }
 .bp-btn[data-show] .bp-hatch {
-  --hc: color-mix(in srgb, var(--bad) 30%, transparent);
+  --hc: color-mix(in srgb, var(--bad) 45%, transparent);
 }
 .bp-btn[data-show] .bp-drain {
   background: var(--res, var(--ink));

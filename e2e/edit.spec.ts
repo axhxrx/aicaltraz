@@ -4,7 +4,7 @@
  */
 import { expect, test, type CDPSession, type Locator, type Page } from '@playwright/test';
 import type { ConfigInput } from '../src/core/config.ts';
-import { btn, seedDemo } from './helpers.ts';
+import { btn, demo, seedDemo } from './helpers.ts';
 
 /**
  *   [alpha][beta ][  .  ]
@@ -302,8 +302,8 @@ test('validation errors show inline, mark the button and block saving', async ({
   await page.getByTestId('editor-tab-button').click();
   await page.getByTestId('field-id').fill('no spaces');
   await expect(page.getByTestId('error-id')).toHaveText('Letters, digits, _ and - only');
-  await page.getByTestId('field-holdMs').fill('50');
-  await expect(page.getByTestId('error-holdMs')).toHaveText('Must be at least 100 ms');
+  await page.getByTestId('field-holdMs').fill('0.05');
+  await expect(page.getByTestId('error-holdMs')).toHaveText('Must be at least 0.1 s');
   await page.getByTestId('edit-save').click();
   const notice = page.getByTestId('notice-problems');
   await expect(notice).toContainText("Can't save yet: 3 problems");
@@ -311,7 +311,7 @@ test('validation errors show inline, mark the button and block saving', async ({
   expect(await saved(page)).toEqual(before);
   // Fix them: the notice goes away and the save goes through.
   await page.getByTestId('field-id').fill('gamma');
-  await page.getByTestId('field-holdMs').fill('600');
+  await page.getByTestId('field-holdMs').fill('0.6');
   await page.getByTestId('editor-tab-action').click();
   await page.getByTestId('field-command').fill('printf');
   await expect(notice).toHaveCount(0);
@@ -327,13 +327,13 @@ test('edit look, press and action fields, save: run mode shows it', async ({ pag
   await page.getByTestId('field-trigger-tap').click();
   await expect(page.getByTestId('field-holdMs')).toHaveCount(0);
   await page.getByTestId('field-confirm').click();
-  await page.getByTestId('field-confirmWindowMs').fill('2000');
+  await page.getByTestId('field-confirmWindowMs').fill('2');
   await page.getByTestId('field-key').click();
   await expect(page.getByTestId('field-key')).toContainText('Press a key');
   await page.keyboard.press('K');
   await expect(page.getByTestId('field-key')).toContainText('Key “k”');
   await page.getByTestId('field-while-cancel').click();
-  await page.getByTestId('field-timeoutMs').fill('5000');
+  await page.getByTestId('field-timeoutMs').fill('5');
   await expect(item(page, 'alpha')).toContainText('Key light');
 
   await page.getByTestId('editor-tab-action').click();
@@ -719,24 +719,24 @@ test('a pattern that names nothing is listed to remove; Stops on a scripted butt
   expect((await saved(page)).pads[0].buttons[0]).not.toHaveProperty('stops');
 });
 
-test('cooldown and the time fields: hints say the range, arrows stay inside it, out of range is an error in words', async ({ page }) => {
+test('cooldown and the time fields (in seconds): hints say the range, arrows stay inside it, out of range is an error in words', async ({ page }) => {
   await p.tap(await center(item(page, 'alpha')));
-  await expect(page.getByTestId('field-cooldownMs')).toHaveValue('400');
+  await expect(page.getByTestId('field-cooldownMs')).toHaveValue('0.4');
   await expect(page.getByTestId('button-editor')).toContainText('stops key chatter and bounces');
-  await page.getByTestId('field-cooldownMs').fill('1000');
+  await page.getByTestId('field-cooldownMs').fill('1');
   await page.getByTestId('field-confirm').click();
-  await page.getByTestId('field-confirmWindowMs').fill('70000');
-  await expect(page.getByTestId('error-confirmWindowMs')).toHaveText('Must be at most 60000 ms (1 min)');
-  await page.getByTestId('field-confirmWindowMs').fill('59950');
+  await page.getByTestId('field-confirmWindowMs').fill('70');
+  await expect(page.getByTestId('error-confirmWindowMs')).toHaveText('Must be at most 60 s (1 min)');
+  await page.getByTestId('field-confirmWindowMs').fill('59.95');
   await page.getByTestId('field-confirmWindowMs').press('ArrowUp');
-  await expect(page.getByTestId('field-confirmWindowMs')).toHaveValue('60000');
-  await page.getByTestId('field-resultHoldMs').fill('61000');
-  await expect(page.getByTestId('error-resultHoldMs')).toHaveText('Must be at most 60000 ms (1 min)');
-  await page.getByTestId('field-resultHoldMs').fill('3000');
-  await page.getByTestId('field-timeoutMs').fill('90000000');
-  await expect(page.getByTestId('error-timeoutMs')).toHaveText('Must be at most 86400000 ms (24 h)');
-  await page.getByTestId('field-timeoutMs').fill('120000');
-  await expect(page.getByTestId('button-editor')).toContainText('2 min, then it\'s killed');
+  await expect(page.getByTestId('field-confirmWindowMs')).toHaveValue('60');
+  await page.getByTestId('field-resultHoldMs').fill('61');
+  await expect(page.getByTestId('error-resultHoldMs')).toHaveText('Must be at most 60 s (1 min)');
+  await page.getByTestId('field-resultHoldMs').fill('3');
+  await page.getByTestId('field-timeoutMs').fill('90000');
+  await expect(page.getByTestId('error-timeoutMs')).toHaveText('Must be at most 86400 s (24 h)');
+  await page.getByTestId('field-timeoutMs').fill('120');
+  await expect(page.getByTestId('button-editor')).toContainText("It's killed after 2 min");
   await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
   expect((await saved(page)).pads[0].buttons[0]).toMatchObject({ cooldownMs: 1000, confirm: true, confirmWindowMs: 60000, resultHoldMs: 3000, timeoutMs: 120000 });
@@ -779,10 +779,10 @@ test('labels and pad names are saved trimmed (and the draft is clean after), a b
 test('more than four problems: the rest of the list opens up', async ({ page, hasTouch }) => {
   test.skip(hasTouch, 'phones step through problems one by one');
   await p.tap(await center(item(page, 'alpha')));
-  await page.getByTestId('field-holdMs').fill('1');
-  await page.getByTestId('field-timeoutMs').fill('1');
-  await page.getByTestId('field-resultHoldMs').fill('99999999');
-  await page.getByTestId('field-cooldownMs').fill('99999999');
+  await page.getByTestId('field-holdMs').fill('0.01');
+  await page.getByTestId('field-timeoutMs').fill('0.01');
+  await page.getByTestId('field-resultHoldMs').fill('99999');
+  await page.getByTestId('field-cooldownMs').fill('99999');
   await page.getByTestId('field-id').fill('a b');
   await page.getByTestId('field-driftPx').fill('-1');
   await page.getByTestId('edit-save').click();
@@ -792,4 +792,247 @@ test('more than four problems: the rest of the list opens up', async ({ page, ha
   await expect(notice.getByTestId('problem-item')).toHaveCount(6);
   await notice.getByTestId('problems-more').click();
   await expect(notice.getByTestId('problem-item')).toHaveCount(4);
+});
+
+/** This test's own config: stored for the demo backend, the page opened again on `pad`, edit mode entered. */
+async function reseed(page: Page, cfg: ConfigInput, pad: string) {
+  await page.evaluate((c) => localStorage.setItem('buttpad.demo.config', c), JSON.stringify(cfg));
+  await page.goto(`/?demo&exact&pad=${pad}`);
+  await expect(page.getByTestId('conn')).toHaveAttribute('data-status', 'online');
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-edit').click();
+  await expect(page.getByTestId('edit-mode')).toBeVisible();
+}
+
+test('an exclusive group: typed or picked, tagged on the canvas, its buttons stopped in Stops; a bad name is an error; saved trimmed', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await page.getByTestId('editor-tab-action').click();
+  await expect(page.getByTestId('button-editor')).toContainText('Starting one stops the others in its group');
+  await page.getByTestId('field-group').fill('lights');
+  await expect(item(page, 'alpha').getByTestId('group-tag')).toHaveText('lights');
+  await expect(page.getByTestId('group-mates')).toContainText('No other button is in “lights” yet');
+  // Another one joins with a tap (or from the field's suggestions).
+  await p.tap(await center(item(page, 'beta')));
+  await expect(page.locator('[data-testid=group-options] option')).toHaveCount(1);
+  await expect(page.locator('[data-testid=group-options] option')).toHaveAttribute('value', 'lights');
+  await page.getByTestId('group-pick-lights').click();
+  await expect(page.getByTestId('field-group')).toHaveValue('lights');
+  await expect(item(page, 'beta').getByTestId('group-tag')).toHaveText('lights');
+  await expect(page.getByTestId('group-mates')).toContainText('Starting it stops “Alpha” if running');
+  // In Stops, its group mates show as stopped (by the group: not unticked there), tagged with it.
+  const chip = page.getByTestId('stop-main/alpha');
+  await expect(chip).toHaveAttribute('aria-checked', 'true');
+  await expect(chip).toBeDisabled();
+  await expect(page.getByTestId('stop-group-main/alpha')).toHaveText('lights');
+  await expect(page.getByTestId('stops-summary')).toHaveText("Stops 1 button when it's running: the other one in its group “lights”.");
+  // A Nothing button in a group does stop something: no "stops nothing" warning.
+  await page.getByTestId('field-action-type-none').click();
+  await expect(page.getByTestId('none-stops-nothing')).toHaveCount(0);
+  // Not a group name: an error that blocks saving.
+  await p.tap(await center(item(page, 'gamma')));
+  await page.getByTestId('field-group').fill('my lights');
+  await expect(page.getByTestId('error-group')).toHaveText('Letters, digits, _ and - only');
+  await expect(status(page)).toHaveText('1 problem');
+  await page.getByTestId('field-group').fill(' lights ');
+  await expect(page.getByTestId('error-group')).toHaveCount(0);
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons.map((b: { group?: string }) => b.group)).toEqual(['lights', 'lights', 'lights']);
+  await expect(page.getByTestId('field-group')).toHaveValue('lights');
+  // Emptied: no group at all.
+  await page.getByTestId('field-group').fill('');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[2]).not.toHaveProperty('group');
+});
+
+test('time fields are typed in seconds (“10” is 10 s, “2,5” works, a unit may be typed); Max lateness; suspiciously short values are pointed out, not refused', async ({ page }) => {
+  await p.tap(await center(item(page, 'alpha')));
+  await expect(page.getByTestId('field-resultHoldMs')).toHaveValue('2.5');
+  await expect(page.getByTestId('field-maxLatenessMs')).toHaveValue('3');
+  await expect(page.getByTestId('button-editor')).toContainText('dead Wi-Fi');
+  await expect(page.getByTestId('button-editor')).toContainText('dropped rather than run late');
+  await page.getByTestId('field-maxLatenessMs').fill('1,5');
+  await page.getByTestId('field-maxLatenessMs').blur();
+  await expect(page.getByTestId('field-maxLatenessMs')).toHaveValue('1.5');
+  await expect(page.getByTestId('timeout-live-note')).toHaveText('Applies to a run in progress too.');
+  await expect(page.getByTestId('warn-timeoutMs')).toHaveCount(0);
+  await page.getByTestId('field-timeoutMs').fill('0.3');
+  await expect(page.getByTestId('warn-timeoutMs')).toContainText('Only 300 ms');
+  await page.getByTestId('field-resultHoldMs').fill('0.2');
+  await expect(page.getByTestId('warn-resultHoldMs')).toContainText('Only 200 ms');
+  await page.getByTestId('field-resultHoldMs').fill('0');
+  await expect(page.getByTestId('warn-resultHoldMs')).toContainText("isn't shown at all");
+  // Warnings, not errors: it saves.
+  await expect(status(page)).toHaveAttribute('data-state', 'dirty');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0]).toMatchObject({ timeoutMs: 300, resultHoldMs: 0, maxLatenessMs: 1500 });
+  // "10" in Show result for is 10 s; "2 min" is understood too.
+  await page.getByTestId('field-resultHoldMs').fill('10');
+  await expect(page.getByTestId('warn-resultHoldMs')).toHaveCount(0);
+  await page.getByTestId('field-timeoutMs').fill('2 min');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0]).toMatchObject({ resultHoldMs: 10_000, timeoutMs: 120_000 });
+  await expect(page.getByTestId('field-timeoutMs')).toHaveValue('120');
+  await expect(page.getByTestId('button-editor')).toContainText("It's killed after 2 min");
+});
+
+test('blanks at the ends of an argument or an env value are pointed out, with a fix; a program and folder typed with one are saved trimmed', async ({ page }) => {
+  await p.tap(await center(item(page, 'gamma')));
+  await page.getByTestId('editor-tab-action').click();
+  const arg = page.getByTestId('field-arg-0');
+  await arg.fill('gamma ');
+  // Not while typing it (a space between words is on its way)…
+  await expect(page.getByTestId('field-arg-0-space')).toHaveCount(0);
+  await arg.blur();
+  // …but once it is left like that: exactly what the program gets, the blank shown.
+  const note = page.getByTestId('field-arg-0-space');
+  await expect(note).toContainText('Ends with a space: the program gets “gamma␣”, space included.');
+  await note.getByTestId('field-arg-0-space-trim').click();
+  await expect(arg).toHaveValue('gamma');
+  await expect(note).toHaveCount(0);
+  await page.getByTestId('env-add').click();
+  await page.getByTestId('env-key-0').fill('LEVEL');
+  await page.getByTestId('env-value-0').fill(' 80');
+  await page.getByTestId('env-value-0').blur();
+  await expect(page.getByTestId('env-space-0')).toContainText('Starts with a space: $LEVEL gets “␣80”');
+  await page.getByTestId('env-space-0-trim').click();
+  await expect(page.getByTestId('env-value-0')).toHaveValue('80');
+  // The program and its folder are kept trimmed, like the host keeps them: the draft is clean after.
+  await page.getByTestId('field-command').fill('printf ');
+  await page.getByTestId('field-cwd').fill(' /tmp ');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[2].action).toEqual({ type: 'exec', command: 'printf', args: ['gamma'], cwd: '/tmp', env: { LEVEL: '80' } });
+  await expect(page.getByTestId('field-command')).toHaveValue('printf');
+});
+
+test('a modifier key on its own is refused, saying so, and listening goes on; one bound by hand is pointed out', async ({ page }) => {
+  // In the file by hand: said on the field.
+  const cfg: ConfigInput = { ...CONFIG, pads: [{ ...CONFIG.pads[0]!, buttons: CONFIG.pads[0]!.buttons!.map((b) => (b.id === 'alpha' ? { ...b, key: 'Control' } : b)) }, CONFIG.pads[1]!] };
+  await reseed(page, cfg, 'main');
+  await p.tap(await center(item(page, 'alpha')));
+  await expect(page.getByTestId('field-key-modifier')).toHaveText("“Control” is a modifier key: modifier keys can't be bound — press a key like F1, Space, VolumeUp.");
+  // Pressed while binding: refused, and it still listens.
+  const key = page.getByTestId('field-key');
+  await key.click();
+  await page.keyboard.down('Shift');
+  await page.keyboard.up('Shift');
+  const refused = page.getByTestId('field-key-refused');
+  await expect(refused).toHaveText("That was Shift alone: modifier keys can't be bound — press a key like F1, Space, VolumeUp.");
+  await expect(key).toContainText('Press a key');
+  await page.keyboard.down('Control');
+  await page.keyboard.up('Control');
+  await expect(refused).toContainText('That was Control alone');
+  await page.keyboard.press('F1');
+  await expect(key).toContainText('F1');
+  await expect(refused).toHaveCount(0);
+  await expect(page.getByTestId('field-key-modifier')).toHaveCount(0);
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  expect((await saved(page)).pads[0].buttons[0].key).toBe('F1');
+});
+
+test.describe('on a 360 × 640 phone', () => {
+  test.use({ viewport: { width: 360, height: 640 } });
+  /** The hobbyist's pads: a long first pad name, three wide buttons on the second. */
+  const HOME: ConfigInput = {
+    version: 1,
+    pads: [
+      { id: 'pc', name: 'This computer', cols: 2, rows: 2, buttons: [{ id: 'hello', label: 'Hello', x: 0, y: 0, action: { type: 'shell', script: 'echo hi' } }] },
+      {
+        id: 'home',
+        name: 'Home',
+        cols: 1,
+        rows: 3,
+        buttons: [
+          { id: 'garage', label: 'Garage door', x: 0, y: 0, action: { type: 'exec', command: './garage.sh' } },
+          { id: 'porch', label: 'Porch light', color: '#facc15', x: 0, y: 1, trigger: 'tap', action: { type: 'exec', command: './porch.sh', args: ['on'] } },
+          { id: 'printer', label: 'Is the 3D printer done?', color: '#db2777', x: 0, y: 2, trigger: 'tap', action: { type: 'shell', script: 'sleep 30' } },
+        ],
+      },
+    ],
+  };
+  test.beforeEach(async ({ page }) => reseed(page, HOME, 'home'));
+
+  /** `inner` lies within `outer`, horizontally (1 px of rounding allowed). */
+  const within = (inner: { x: number; width: number }, outer: { x: number; width: number }) => {
+    expect(inner.x).toBeGreaterThanOrEqual(outer.x - 1);
+    expect(inner.x + inner.width).toBeLessThanOrEqual(outer.x + outer.width + 1);
+  };
+
+  test('the toolbar fits: the status chip clears Undo (saved or not), the selected pad tab is in full view, so is “+” after the last', async ({ page }) => {
+    const clears = async () => {
+      const chip = await box(status(page));
+      expect(chip.x + chip.width).toBeLessThanOrEqual((await box(page.getByTestId('edit-undo'))).x);
+    };
+    await clears();
+    await p.tap(await center(item(page, 'porch')));
+    await page.getByTestId('field-label').fill('Porch light!');
+    await expect(page.getByTestId('edit-discard')).toBeVisible();
+    await clears();
+    const tabs = page.locator('.ed-pads-scroll');
+    within(await box(page.getByTestId('edit-tab-home')), await box(tabs));
+    within(await box(page.getByTestId('edit-add-pad')), await box(tabs));
+    await page.getByTestId('edit-tab-pc').click();
+    within(await box(page.getByTestId('edit-tab-pc')), await box(tabs));
+    await page.getByTestId('edit-save').click();
+    await clears();
+  });
+
+  test('a toast never covers a notice; with the editor open and notices up, the canvas buttons stay big enough to hit', async ({ page }) => {
+    await demo(page, (b) => b.setOnline(false));
+    const offline = page.getByTestId('notice-offline');
+    await expect(offline).toBeVisible();
+    await p.tap(await center(item(page, 'printer')));
+    // The pad is full: a duplicate says so in a toast.
+    await page.getByTestId('editor-duplicate').click();
+    const toast = page.getByTestId('toast');
+    await expect(toast).toContainText('No room for a copy');
+    const n = await box(offline);
+    expect((await box(toast)).y).toBeGreaterThanOrEqual(n.y + n.height);
+    // A second notice (a save that can't go through) on top of that.
+    await page.getByTestId('field-trigger-hold').click();
+    await page.getByTestId('field-holdMs').fill('0.01');
+    await page.getByTestId('edit-save').click();
+    // What answers the save comes first.
+    const problems = page.getByTestId('notice-problems');
+    await expect(problems).toBeVisible();
+    expect((await box(problems)).y).toBeLessThan((await box(offline)).y);
+    for (const id of ['garage', 'porch', 'printer']) expect((await box(item(page, id))).height).toBeGreaterThanOrEqual(43);
+  });
+
+  test('typing with the on-screen keyboard up: the editor takes the whole screen, the field and the ones by it stay in view, notices step aside', async ({ page }) => {
+    await demo(page, (b) => b.setOnline(false));
+    await p.tap(await center(item(page, 'porch')));
+    await page.getByTestId('editor-tab-action').click();
+    const cmd = page.getByTestId('field-command');
+    await cmd.focus();
+    // The keyboard takes ~45% of the screen.
+    await page.setViewportSize({ width: 360, height: 350 });
+    const ed = page.getByTestId('edit-mode');
+    await expect(ed).toHaveAttribute('data-kbd', '');
+    await expect(page.getByTestId('edit-canvas')).toBeHidden();
+    await expect(page.getByTestId('notice-offline')).toBeHidden();
+    await expect(page.getByTestId('edit-save')).toBeVisible();
+    const f = await box(cmd);
+    expect(f.y).toBeGreaterThanOrEqual(0);
+    expect(f.y + f.height).toBeLessThanOrEqual(350);
+    // Not one field: room for the next ones too.
+    expect((await box(page.locator('.ed-panel-body'))).height).toBeGreaterThan(180);
+    // Another field, further down: brought into view as well.
+    const cwd = page.getByTestId('field-cwd');
+    await cwd.focus();
+    await page.waitForTimeout(100);
+    const c = await box(cwd);
+    expect(c.y + c.height).toBeLessThanOrEqual(350);
+    // The keyboard goes: the canvas and the notices are back.
+    await cwd.blur();
+    await page.setViewportSize({ width: 360, height: 640 });
+    await expect(ed).not.toHaveAttribute('data-kbd', '');
+    await expect(page.getByTestId('edit-canvas')).toBeVisible();
+    await expect(page.getByTestId('notice-offline')).toBeVisible();
+  });
 });

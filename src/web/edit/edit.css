@@ -1574,6 +1574,25 @@ p.ed-warn-note {
     font-size: 10.5px;
   }
 }
+/* Short buttons (the canvas squeezed under the editor sheet): smaller tags, tucked into the corner. */
+@container (max-height: 60px) {
+  .ed-tags {
+    top: 2px;
+    left: 3px;
+    gap: 2px;
+  }
+  .ed-group {
+    padding: 1px 5px;
+    font-size: 9.5px;
+  }
+  .ed-running {
+    padding: 2px;
+  }
+  .ed-running i {
+    width: 6px;
+    height: 6px;
+  }
+}
 .ed-item[data-running] .ed-ring {
   box-shadow: 0 0 0 2px #ffb000aa;
 }
@@ -1664,15 +1683,16 @@ p.ed-warn-note {
 .ed-notices {
   flex: none;
   min-height: 0;
-  max-height: 50%;
+  /* What the canvas doesn't need for buttons you can still hit (rows of 44 px; it shrank them to
+     20 px under a long warning on a phone): the notices scroll within that, a line at least. */
+  max-height: max(58px, calc(100% - var(--ed-canvas-min, 0px)));
 }
 .ed-notices:empty {
   display: none;
 }
-/* Phones with the editor open: the notices scroll within a third of the stage, so the canvas
-   keeps room (it used to shrink to 20 px buttons under a long warning). */
-.bp-edit[data-sheet] .ed-notices {
-  max-height: 36%;
+.ed-notices[data-more] {
+  -webkit-mask-image: linear-gradient(#000 calc(100% - 26px), transparent);
+  mask-image: linear-gradient(#000 calc(100% - 26px), transparent);
 }
 .ed-notices > .ed-notice:last-child {
   margin-bottom: 2px;

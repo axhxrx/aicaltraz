@@ -24,8 +24,8 @@ const key = (scope: string) => `buttpad.draft:${scope}`;
 export const unsavedEdits = createStore(false);
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
-const NUMS = ['x', 'y', 'w', 'h', 'holdMs', 'driftPx', 'confirmWindowMs', 'timeoutMs', 'resultHoldMs'];
-/** Button fields a draft kept by an older version may lack (cooldownMs…), at their defaults. */
+const NUMS = ['x', 'y', 'w', 'h', 'holdMs', 'driftPx', 'confirmWindowMs', 'timeoutMs', 'resultHoldMs', 'cooldownMs', 'maxLatenessMs'];
+/** Button fields a draft kept by an older version may lack (cooldownMs, maxLatenessMs…), at their defaults. */
 const BUTTON_DEFAULTS: Record<string, unknown> = (() => {
   const { id: _i, x: _x, y: _y, action: _a, ...d } = Button.parse({ id: 'x', x: 0, y: 0, action: { type: 'none' } });
   return d;

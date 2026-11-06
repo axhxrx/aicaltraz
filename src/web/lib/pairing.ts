@@ -40,8 +40,11 @@ export const CODE_MAX = 12;
 
 export type PairOutcome =
   | { ok: true; token: string; role: Role }
-  /** bad: wrong, expired or used. limited: too many tries (`retryAfter` s). old: the host has no pairing codes. */
-  | { ok: false; why: 'bad' | 'limited' | 'unreachable' | 'old'; retryAfter?: number };
+  /**
+   * bad: wrong, expired or used. limited: too many tries (`retryAfter` s). old: the host has no
+   * pairing codes. origin: the host turns this page's address away (a proxy it wasn't told about).
+   */
+  | { ok: false; why: 'bad' | 'limited' | 'unreachable' | 'old' | 'origin'; retryAfter?: number };
 
 /** POST /api/pair {code} → {token, role}: a one-time code (the host printed it, or an admin showed it) for a token. */
 export async function pairWithCode(code: string, origin = location.origin): Promise<PairOutcome> {
@@ -53,7 +56,8 @@ export async function pairWithCode(code: string, origin = location.origin): Prom
   }
   const retry = Number(r.headers.get('retry-after'));
   const retryAfter = Number.isFinite(retry) && retry > 0 ? Math.ceil(retry) : undefined;
-  if (r.status === 401 || r.status === 403 || r.status === 400) return { ok: false, why: 'bad' };
+  if (r.status === 403) return { ok: false, why: 'origin' };
+  if (r.status === 401 || r.status === 400) return { ok: false, why: 'bad' };
   if (r.status === 429 || r.status === 503) return { ok: false, why: 'limited', ...(retryAfter ? { retryAfter } : {}) };
   if (r.status === 404 || r.status === 405) return { ok: false, why: 'old' };
   if (!r.ok) return { ok: false, why: 'unreachable' };

@@ -207,6 +207,10 @@ export class WsBackend implements Backend {
     this.connect();
   }
 
+  isStale(): boolean {
+    return this.everGreeted && mono() - this.beat > STALE_GAP;
+  }
+
   /**
    * The page is running now (a heartbeat, a frame): if it hadn't for STALE_GAP, what is on screen
    * and what the socket has queued up are old news (syncing).
@@ -478,10 +482,15 @@ export class WsBackend implements Backend {
         return;
       }
       if (!r.ok || live()) return;
-      // A plain GET of /ws gets the answer the upgrade got (426 "expected a WebSocket upgrade" when there's room).
+      // A plain request to /ws gets the answer the upgrade got: 426 "expected a WebSocket upgrade"
+      // when there's room, 503 when the host is full. A POST carries this page's Origin (a GET from
+      // the same origin doesn't), so a 403 says the host turns this address away: a proxy, tunnel or
+      // preview in front of it that the host wasn't told about (--allow-origin).
       if (failed) {
-        const full = (await this.http('GET', `/ws?token=${encodeURIComponent(this.token)}`).catch(() => null))?.status === 503;
-        if (!live() && full !== this.snapshot.get().hostFull) this.patch({ hostFull: full });
+        const status = (await this.http('POST', `/ws?token=${encodeURIComponent(this.token)}`).catch(() => null))?.status;
+        const full = status === 503;
+        const refused = status === 403;
+        if (!live() && (full !== this.snapshot.get().hostFull || refused !== this.snapshot.get().originRefused)) this.patch({ hostFull: full, originRefused: refused });
       }
       const j = (await r.json()) as { states?: StateMap; serverNow?: number };
       // The socket got there first: its picture is the fresher one.
@@ -515,6 +524,7 @@ export class WsBackend implements Backend {
           // A v1 host has no latched state.
           latched: m.latched ?? {},
           hostFull: false,
+          originRefused: false,
           lastSeen: null,
           // The host's word as it is now: whatever this device was catching up on, it has.
           syncing: false,

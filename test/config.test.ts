@@ -193,14 +193,17 @@ describe('serializeConfig / redactConfig / revOf', () => {
     const text = serializeConfig(
       Config.parse(
         padConfig([
-          { id: 'a', x: 0, y: 0, stops: ['p/b'], action: { type: 'exec', command: './fade.sh', args: ['wash', '100', '10'], env: { LEVEL: '1' } } },
+          { id: 'a', x: 0, y: 0, stops: ['p/b'], action: { type: 'exec', command: './fade.sh', args: ['wash', '100', '10'] } },
           { id: 'b', x: 1, y: 0, action: { type: 'exec', command: 'echo', args: Array.from({ length: 12 }, (_, i) => `argument-${i}`) } },
           { id: 'c', x: 2, y: 0, action: { type: 'shell', script: 'echo "a fairly long script that goes on and on" && sleep 1 && echo done' } },
+          { id: 'd', x: 3, y: 0, action: { type: 'exec', command: './fade.sh', env: { LEVEL: '1' } } },
         ]),
       ),
     );
     expect(text).toContain('\n          "stops": ["p/b"],\n');
-    expect(text).toContain('\n          "action": { "type": "exec", "command": "./fade.sh", "args": ["wash", "100", "10"], "env": { "LEVEL": "1" } }\n');
+    expect(text).toContain('\n          "action": { "type": "exec", "command": "./fade.sh", "args": ["wash", "100", "10"] }\n');
+    // An object holding an object is laid out, its short inner one stays on a line.
+    expect(text).toContain('\n          "action": {\n            "type": "exec",\n            "command": "./fade.sh",\n            "env": { "LEVEL": "1" }\n          }\n');
     expect(text).toContain('"args": [\n              "argument-0",\n');
     expect(text).toContain('"action": {\n            "type": "shell",\n            "script": "echo \\"a fairly long script');
     for (const line of text.split('\n')) if (/[[{] "|\["/.test(line) && !line.trimEnd().endsWith('[') && !line.trimEnd().endsWith('{')) expect(line.length).toBeLessThanOrEqual(INLINE_WIDTH);
@@ -646,6 +649,8 @@ describe('examples and starter config', () => {
     expect(all.some((b) => b.whileRunning === 'cancel')).toBe(true);
     expect(all.some((b) => b.key)).toBe(true);
     expect(all.some((b) => b.w > 1 || b.h > 1)).toBe(true);
+    // An exclusive group: starting one of the long test runs stops the other.
+    expect(all.filter((b) => b.group === 'long-runs').map((b) => b.id)).toEqual(['progress', 'slow']);
     expect(r.config.$schema).toBe('../schema/buttpad.config.schema.json');
     expect(existsSync(resolve(dirname(examplePath), r.config.$schema!))).toBe(true);
   });
