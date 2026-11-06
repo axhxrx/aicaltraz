@@ -623,7 +623,10 @@ is logged once and the log starts empty.
 - **Backend interface**: the UI talks to an abstract backend with two implementations:
   `ws` (the host) and `demo` (in-browser: runs `machine.ts` locally with simulated actions, config
   in localStorage, the host's rules: acks with `runId`, `expired`/`needs-confirm`, already-queued
-  `ignored`, the 800 ms requeue gap, `stops`/`none`, `@state`, per-button `maxLatenessMs`, the
+  `ignored`, the 800 ms requeue gap, `stops` and exclusive `group`s (any pad), `none` saying
+  "Stopped N" (running ones and dropped re-runs) / "Nothing was running" / "Done", `@state` and
+  `@state:<pad>/<button>` (another button's chip; one naming no button is ignored), per-button
+  `maxLatenessMs`, the
   per-connection rate limit of bursts of 10 then 5/s; its controls simulate an outage, a lost ack, a
   press held up on the way, a host restart). `?demo` selects demo. Demo exists so the UI can be tried on a phone with no host,
   and so the UI can be built/tested independently.

@@ -3,8 +3,8 @@
  * UI can be tried with no host. Config lives in localStorage. Mirrors host semantics: ack first
  * (with the run's id), then state; whileRunning (a press on an already queued run is `ignored`);
  * a queued re-run REQUEUE_GAP_MS after the result shows; timeouts; cancel = kill; `stops`; the
- * `none` action; `confirm` buttons refuse presses without `confirm` (`needs-confirm`); presses older
- * than the button's maxLatenessMs are `expired`; `@state` lines latch; result text rules; last 20 runs per
+ * `none` action ("Stopped N", "Nothing was running", "Done"); exclusive `group`s; `confirm` buttons refuse presses without `confirm` (`needs-confirm`); presses older
+ * than the button's maxLatenessMs are `expired`; `@state` lines latch (`@state:<pad>/<button>` another button's); result text rules; last 20 runs per
  * button; and when a press gets `ignored` (cancel within 700 ms of the start, the start rate limit).
  *
  * The demo's "host clock" is the page's own (lib/clock.ts), so clockSkew is 0.
@@ -58,6 +58,20 @@ const tail = (lines: string[]) => lines.join('\n').slice(-TAIL);
 
 /** `pad/button`, `pad/*` or `*` (config.ts STOP_PATTERN) against a button key. */
 const stopMatches = (pattern: string, key: string) => pattern === '*' || pattern === key || (pattern.endsWith('/*') && key.startsWith(pattern.slice(0, -1)));
+
+/** Whether starting `b` (at `self`) stops `other` (at `key`): its `stops` names it, or they share a `group` (any pad), as on the host (state-store.ts stopsBeforeStart). */
+const stopsBeforeStart = (self: string, b: Button, key: string, other: Button) =>
+  key !== self && ((b.group !== undefined && other.group === b.group) || !!b.stops?.some((p) => stopMatches(p, key)));
+/** Whether `b` stops anything when it starts (`stops`, or a `group`). */
+const stopsAny = (b: Button) => !!b.stops?.length || b.group !== undefined;
+
+/** As the host gives `none` buttons their result (state-store.ts NOTHING_RUNNING). */
+const NOTHING_RUNNING = 'Nothing was running';
+
+/** `@state:<pad>/<button> text`: another button's latched state (src/server/runner.ts STATE_OF). */
+const STATE_OF = /^@state:([\w-]{1,200}\/[\w-]{1,200})(?:[ \t]+(.*))?$/;
+/** Latched state, at most this many characters (runner.ts LATCHED_MAX). */
+const LATCHED_MAX = 40;
 
 /** A result as READY shows it once it's over (the machine's reset), with no re-run to come. */
 const settled = (s: RunState): RunState =>
@@ -182,10 +196,10 @@ export class DemoBackend implements Backend {
       const after = this.states.get(key);
       if (after?.phase === 'failure' && after.runId === runId) record.reason = after.reason;
     };
-    // Runs nothing and succeeds at once: what it did was stop the others.
+    // Runs nothing and succeeds at once: what it did was stop the others ("Done" for one that names nothing to stop).
     if (b.action.type === 'none') {
       record.command = '(nothing)';
-      run.result = stopped ? `Stopped ${stopped}` : 'Done';
+      run.result = stopped ? `Stopped ${stopped}` : stopsAny(b) ? NOTHING_RUNNING : 'Done';
       queueMicrotask(() => finish(0));
       return;
     }
@@ -195,11 +209,18 @@ export class DemoBackend implements Backend {
         if (run.done) return;
         if (stream === 'stderr') return void run.stderr.push(text);
         run.stdout.push(text);
+        // `@state:<pad>/<button> text`: another button's chip (an "All off" clearing each light's "ON 80%"); one naming no button is ignored.
+        const of = STATE_OF.exec(text);
+        if (of) {
+          const [p, id] = of[1]!.split('/') as [string, string];
+          if (this.button(p, id)) this.latch(of[1]!, (of[2] ?? '').trim().slice(0, LATCHED_MAX));
+          return;
+        }
         const m = /^@(progress|status|result|state)(?:\s+(.*))?$/.exec(text);
         if (!m) return;
         const arg = (m[2] ?? '').trim();
         if (m[1] === 'result') run.result = arg;
-        else if (m[1] === 'state') this.latch(key, arg.slice(0, 40));
+        else if (m[1] === 'state') this.latch(key, arg.slice(0, LATCHED_MAX));
         else this.feed(pad, this.button(pad, b.id) ?? b, { type: 'progress', runId, ...(m[1] === 'progress' ? { progress: Number(arg) || 0 } : { status: arg }) });
       },
       exit: (code) => finish(code),
@@ -263,16 +284,18 @@ export class DemoBackend implements Backend {
     return { result, runId };
   }
 
-  /** `stops`: cancels the running buttons `b.stops` names (never itself), dropping queued re-runs; how many it stopped. */
+  /**
+   * `stops` and `group`: cancels the running buttons `b.stops` names or `b`'s group has (never
+   * itself), dropping queued re-runs; how many it stopped (dropped re-runs count, as on the host).
+   */
   private stopOthers(self: string, b: Button): number {
-    if (!b.stops?.length) return 0;
+    if (!stopsAny(b)) return 0;
     const by = b.label || b.id;
     let n = 0;
     for (const [key, s] of this.states) {
-      if (key === self || !b.stops.some((p) => stopMatches(p, key))) continue;
       const [pad, id] = key.split('/') as [string, string];
       const other = this.button(pad, id);
-      if (!other) continue;
+      if (!other || !stopsBeforeStart(self, b, key, other)) continue;
       const run = this.runs_.get(key);
       if (s.phase === 'running' && run && !s.cancelling) {
         run.stoppedBy = `Stopped by ${by}`;
@@ -285,6 +308,7 @@ export class DemoBackend implements Backend {
         const { queued: _q, ...next } = s;
         this.setState(key, next);
         this.perform(pad, other, { type: 'scheduleReset', runId: s.runId, afterMs: other.resultHoldMs });
+        n++;
       }
     }
     return n;

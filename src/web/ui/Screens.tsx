@@ -233,6 +233,9 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
   const [short, setShort] = useState(first.length > CODE_LEN);
   /** The code shown just failed: the next edit starts a new one (a tap on the field doesn't put the caret into the old digits). */
   const fresh = useRef(false);
+  /** What the field shows (set with each edit: two edits can come before a render), and what the edit on its way replaces. */
+  const shown = useRef(code);
+  const replacing = useRef<{ start: number; end: number } | null>(null);
   /** Select the code once the field can take focus again (it is read-only while the host answers). */
   const reselect = useRef(false);
   /** Too many tries: Date.now() when the host takes one again (its Retry-After), counted down on screen. */
@@ -278,12 +281,20 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
     else input.current?.focus();
     const k = (e: KeyboardEvent) => e.key === 'Escape' && p.onCancel();
     window.addEventListener('keydown', k);
-    return () => window.removeEventListener('keydown', k);
+    // The selection an edit replaces, read before the browser changes the field.
+    const el = input.current;
+    const b = () => void (replacing.current = el ? { start: el.selectionStart ?? 0, end: el.selectionEnd ?? 0 } : null);
+    el?.addEventListener('beforeinput', b);
+    return () => {
+      window.removeEventListener('keydown', k);
+      el?.removeEventListener('beforeinput', b);
+    };
   }, []);
   const onInput = (e: Event) => {
     const el = e.currentTarget as HTMLInputElement;
     const kind = (e as InputEvent).inputType ?? '';
-    const r = editCode(code, el.value, el.selectionStart ?? el.value.length, kind.startsWith('delete'), fresh.current);
+    const r = editCode(shown.current, el.value, el.selectionStart ?? el.value.length, kind.startsWith('delete'), fresh.current, replacing.current ?? undefined);
+    replacing.current = null;
     // Set here, not only through state: a refused edit leaves the state as it was, and the field must show that too.
     el.value = r.value;
     try {
@@ -291,6 +302,7 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
     } catch {
       /* not focused */
     }
+    shown.current = r.value;
     fresh.current = r.fresh;
     setCode(r.value);
     setShort(r.over);

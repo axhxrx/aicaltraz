@@ -152,6 +152,12 @@ test('after a code fails it is selected, and the next one typed replaces it, eve
   await expect(error).toHaveCount(0);
   await page.getByTestId('code-submit').click();
   await expect(error).toContainText('didn’t work');
+  // A new code pasted (or autofilled) over it that starts with the same digits is taken whole.
+  await expect.poll(() => selection(input)).toEqual([0, 7]);
+  await page.keyboard.insertText('111 199');
+  await expect(input).toHaveValue('111 199');
+  await page.keyboard.press('Enter');
+  await expect(error).toContainText('didn’t work');
   // Backspace on a failed code clears it all, not one digit.
   await expect.poll(() => selection(input)).toEqual([0, 7]);
   await input.evaluate((el: HTMLInputElement) => el.setSelectionRange(3, 3));
@@ -161,7 +167,7 @@ test('after a code fails it is selected, and the next one typed replaces it, eve
   await expect(input).toHaveValue('640 169');
   await page.keyboard.press('Enter');
   await expect(page.getByTestId('pair-code')).toHaveCount(0);
-  expect(tried).toEqual(['765616', '111111', '640169']);
+  expect(tried).toEqual(['765616', '111111', '111199', '640169']);
 });
 
 // ---- 2. a code in the pairing-link box -------------------------------------------------------------
@@ -405,6 +411,63 @@ test('a result kept on screen: TAP TO RETRY has a row of its own on small button
     expect(pill.y).toBeGreaterThanOrEqual(detail.y + detail.height - 0.5);
     expect(detail.y).toBeGreaterThanOrEqual(headline.y + headline.height - 0.5);
   }
+});
+
+// ---- the demo does what the host does ------------------------------------------------------------
+
+const PARITY: ConfigInput = {
+  version: 1,
+  pads: [
+    {
+      id: 'lights',
+      name: 'Lights',
+      cols: 3,
+      rows: 2,
+      buttons: [
+        { id: 'key', label: 'Key', x: 0, y: 0, trigger: 'tap', action: sh("echo '@state ON 80%'") },
+        { id: 'fill', label: 'Fill', x: 1, y: 0, trigger: 'tap', action: sh("echo '@state ON 40%'") },
+        { id: 'alloff', label: 'All off', x: 2, y: 0, trigger: 'tap', action: sh("echo '@state:lights/key OFF'; echo '@state:lights/fill'; echo '@state:lights/nope X'; echo off") },
+        { id: 'wash', label: 'Wash', group: 'look', x: 0, y: 1, trigger: 'tap', action: sh('sleep 30') },
+        { id: 'stop', label: 'Stop', stops: ['lights/wash'], x: 1, y: 1, trigger: 'tap', action: { type: 'none' } },
+        { id: 'noop', label: 'Noop', x: 2, y: 1, trigger: 'tap', action: { type: 'none' } },
+      ],
+    },
+    { id: 'more', name: 'More', cols: 1, rows: 1, buttons: [{ id: 'haze', label: 'Haze', group: 'look', x: 0, y: 0, trigger: 'tap', action: sh('sleep 30') }] },
+  ],
+};
+
+test('the demo as the host: a Nothing button says "Stopped N", "Nothing was running" or "Done"; a group stops its mates on any pad; @state:<pad>/<button> sets (or clears) another button’s chip', async ({ page }) => {
+  await seedDemo(page, PARITY);
+  await page.goto('/?demo&exact&pad=lights');
+  await expect(conn(page)).toHaveAttribute('data-status', 'online');
+  const press = (pad: string, id: string) => page.evaluate(([pad, id]) => window.__buttpad!.backend.press(pad!, id!), [pad, id]);
+  const state = (key: string) => page.evaluate((k) => window.__buttpad!.backend.snapshot.get().states[k], key);
+  const latched = () => page.evaluate(() => window.__buttpad!.backend.snapshot.get().latched);
+  // Nothing to stop: it says so (no "Done" read as if it switched something off); one that names nothing: "Done".
+  await press('lights', 'stop');
+  await expect.poll(async () => (await state('lights/stop'))?.text).toBe('Nothing was running');
+  await press('lights', 'noop');
+  await expect.poll(async () => (await state('lights/noop'))?.text).toBe('Done');
+  // An exclusive group, across pads: Haze (More) stops Wash (Lights)…
+  await press('lights', 'wash');
+  await expect.poll(async () => (await state('lights/wash'))?.phase).toBe('running');
+  await press('more', 'haze');
+  await expectVisual(page, 'wash', 'stopped');
+  expect(await state('lights/wash')).toMatchObject({ phase: 'failure', reason: 'cancelled', text: 'Stopped by Haze' });
+  // …and Stop names Wash: running again, it is stopped, and counted.
+  await expect.poll(async () => (await state('lights/wash'))?.phase, { timeout: 8000 }).toBe('ready');
+  await press('lights', 'wash');
+  await expect.poll(async () => (await state('lights/wash'))?.phase).toBe('running');
+  await press('lights', 'stop');
+  await expect.poll(async () => (await state('lights/stop'))?.text).toBe('Stopped 1');
+  // @state:<pad>/<button>: All off sets Key's chip, clears Fill's, ignores a button that isn't there.
+  await press('lights', 'key');
+  await press('lights', 'fill');
+  await expect.poll(latched).toEqual({ 'lights/key': 'ON 80%', 'lights/fill': 'ON 40%' });
+  await press('lights', 'alloff');
+  await expect.poll(latched).toEqual({ 'lights/key': 'OFF' });
+  await expect(page.getByTestId('latched-key')).toHaveText('OFF');
+  await expect(page.getByTestId('latched-fill')).toHaveCount(0);
 });
 
 // ---- 6. leaving the editor -----------------------------------------------------------------------

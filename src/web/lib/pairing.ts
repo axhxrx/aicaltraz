@@ -65,17 +65,25 @@ export interface CodeEdit {
  * that would make more is refused whole (QA: typed into the middle of a code, "640169616" showed as
  * "640 1696", and a wrong code went to the host). `fresh`: the code shown just failed, so this edit
  * starts a new one wherever the caret is (a tap on the field moved it into the old digits): what it
- * typed or pasted replaces the code, a delete clears it.
+ * typed or pasted replaces the code, a delete clears it. `sel`: what the edit replaced in `prev`
+ * (the selection at `beforeinput`), to tell exactly what it put in.
  */
-export function editCode(prev: string, raw: string, caret: number, deleting: boolean, fresh = false): CodeEdit {
+export function editCode(prev: string, raw: string, caret: number, deleting: boolean, fresh = false, sel?: { start: number; end: number }): CodeEdit {
   const refuse = (): CodeEdit => ({ value: prev, caret: Math.min(prev.length, Math.max(0, caret - (raw.length - prev.length))), over: true, fresh });
   if (fresh) {
     if (deleting) return { value: '', caret: 0, over: false, fresh: false };
-    // What this edit put in: `raw` without what it kept of `prev` (their common start and end).
+    // What this edit put in: `raw` without what it kept of `prev` — around the selection it replaced
+    // or, not knowing that, their common start and end (a new code pasted over the old one that
+    // starts with the same digits would lose them that way).
     let a = 0;
-    while (a < prev.length && a < raw.length && prev[a] === raw[a]) a++;
     let b = 0;
-    while (b < prev.length - a && b < raw.length - a && prev[prev.length - 1 - b] === raw[raw.length - 1 - b]) b++;
+    if (sel && sel.start >= 0 && sel.start <= sel.end && sel.end <= prev.length && raw.length - (prev.length - sel.end) >= sel.start) {
+      a = sel.start;
+      b = prev.length - sel.end;
+    } else {
+      while (a < prev.length && a < raw.length && prev[a] === raw[a]) a++;
+      while (b < prev.length - a && b < raw.length - a && prev[prev.length - 1 - b] === raw[raw.length - 1 - b]) b++;
+    }
     const typed = codeDigits(raw.slice(a, raw.length - b));
     if (typed.length > CODE_LEN) return refuse();
     // Something that isn't a digit (a letter, a space): nothing to start a code with yet.
