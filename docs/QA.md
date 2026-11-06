@@ -101,4 +101,10 @@ compact config writes, compressed assets) passed 425 bun + 401 Playwright tests.
   travelled in the WebSocket URL through the proxy (now one-time tickets); a bright @state chip in
   show mode; STOP ALL saying "Done" when nothing ran; save warnings about untouched pads.
 
-Those fixes are in the final commit after 85659ec.
+Those fixes landed in e16d512 and were verified: typecheck clean, 442 bun tests, 431 Playwright
+tests (phone + desktop, 17 touch/viewport-only skips), including a test that no request or socket
+URL ever carries a token.
+
+Known limitations (documented in DESIGN.md): no Host-header allowlist yet (DNS rebinding can redeem
+a pairing code the page already knows); Windows untested; iOS haptics and the keep-awake video
+fallback verified only in Chromium emulation; "Nothing was running" isn't stored in the run log.
