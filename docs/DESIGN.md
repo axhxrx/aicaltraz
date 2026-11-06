@@ -126,7 +126,7 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 | Method | Path | Role | Notes |
 |---|---|---|---|
 | GET | `/` | none | the web app (Bun HTML import of `src/web/index.html`), and its hashed chunks at `/chunk-….js`/`.css`: compressed, see Web app |
-| POST | `/api/pair` | none (the code is the credential) | body `{code}` (`"123456"`; spaces, `-` and `.` are ignored) → 200 `{token, role}` (`PairResponse`); 401 `{error: "wrong or expired code"}` for a wrong, used or expired one alike; 429 `{error}` + `Retry-After: N` (seconds) when attempts are coming too fast (Pairing); 400 for a body without `code`; 403 `OriginRefusal` for a page of another origin |
+| POST | `/api/pair` | none (the code is the credential) | body `{code}` (`"123456"`; spaces, `-` and `.` are ignored) → 200 `{token, role}` (`PairResponse`); 401 `{error: "wrong or expired code"}` for a wrong, used or expired one alike; 429 `{error: "too many attempts: try again in N s"}` + `Retry-After: N` (seconds, the same N) when attempts are coming too fast (Pairing); 400 for a body without `code`; 403 `OriginRefusal` for a page of another origin |
 | POST | `/api/ws-ticket` | any | no body → 200 `{ticket, expiresInMs}` (`WsTicket`): a one-time ticket for `/ws?ticket=…` (see Auth); 403 `OriginRefusal` for a page of a refused origin |
 | POST | `/api/ws-check` | any | no body → what `/ws` would answer this page now, without upgrading: 204 it would be taken; 403 `OriginRefusal`; 503 host full (`{error, reason}`); 401. POST, not GET: see Auth |
 | POST | `/api/pair-code` | admin | body `{}` (or none) for an admin code, `{"role": "press"}` for a press one → 200 `{code: "123456", expiresAt (host clock, epoch ms), role}`; 400 for another role |
@@ -483,21 +483,58 @@ is logged once and the log starts empty.
 - No token → pairing screen. First and big: **Pair with a code** — the way in from any address,
   including a page served through a reverse proxy, tunnel or preview pane (nothing in the client
   assumes the host's LAN address: every request goes to `location.origin`, `wss:` under https).
-  Then the QR / pairing link / paste field. The code entry (also `…/#pair`, or `#pair=123456`,
-  which is tried at once; and "Unlock editing…" in a press-only device's menu, whose note explains
-  the admin link and the codes): one big field (number pad, `autocomplete=one-time-code`; "123 456"
-  as read out works), `POST /api/pair {code}` → `{token, role}`, the token then used as above.
-  401 → "That code didn't work: mistyped, used already, or expired"; 429 → "Too many tries", a
-  countdown from `Retry-After`, Pair disabled meanwhile; 403 → the host turns this page's address
-  away: start it with `--allow-origin <this origin>` (said with the exact origin). An admin's menu
-  has **Pair another device…**: `POST /api/pair-code`, the code shown big ("123 456") with the time
-  it runs out (host clock, via the offset) and the `…/#pair` address to type it at.
+  Then the QR / pairing link / paste field. A pairing code typed into that field (digits, spaces,
+  dashes, dots: "123 456", the one box on the screen) is no link or token: 6 digits open the code
+  entry with it, tried at once; other digits say "That looks like a pairing code, but a code has 6
+  digits." The code entry (also `…/#pair`, or `#pair=123456`, which is tried at once; and "Unlock
+  editing…" in a press-only device's menu, whose note explains the admin link and the codes): one
+  big field (number pad, `autocomplete=one-time-code`), labelled "Pairing code · 6 digits".
+  **Exactly 6 digits, never more**: spaces, dashes and dots are ignored, the digits shown as
+  "123 456" whatever was typed (a backspace right after the space takes the digit before it); an
+  edit that would make a 7th digit — typed at the end or into the middle, or a longer paste — is
+  refused whole, the field as it was (never cut down to a wrong code), with an inline "A code has 6
+  digits." Pair stays disabled until all 6 are there (Enter before that says "A code has 6 digits
+  (4 so far).") (QA: after an error a tap put the caret mid-code, and a new code typed there showed
+  as "640 1696" of "640169616"; Pair took it and a try was burned). `POST /api/pair {code}` →
+  `{token, role}`, the token then used as above. A code that fails is **selected** (focused once
+  the field, read-only while the host answers, takes focus again), and the next edit starts a new
+  code wherever the caret is — a tap on the field moves it into the old digits (iOS), and the
+  field selects it all again once the tap is done: what is typed or pasted replaces the code, a
+  delete clears it. 401 → "That code didn't work: mistyped, used already, or expired"; 429 → "Too
+  many tries", a countdown from `Retry-After`, Pair disabled meanwhile; 403 → the address advice
+  below. An admin's menu has **Pair another device…**: `POST /api/pair-code`, the code shown big
+  ("123 456") with the time it runs out (whole seconds left, host clock via the offset: a fresh
+  10-minute code says 9:59, not 10:01) and the `…/#pair` address to type it at.
+- **The host turns this address away** (a 403 `OriginRefusal` from `POST /api/pair`,
+  `POST /api/ws-ticket` or `POST /api/ws-check`: the page comes through a reverse proxy, tunnel or
+  preview pane the host wasn't told about), said the same on the code entry, the connecting screen
+  and the pad's banner: this page's address, and the option to restart ButtPad with,
+  `--allow-origin <origin>` — the `allowOrigin` the host's answer names, else `location.origin` —
+  in a box of its own. The address never breaks inside: each origin (and the option) is an
+  unbreakable unit that moves to the next line whole (QA: "https://mason-" / "preview.test:44617",
+  split at the hyphen, ran off a 390 px screen with the env-variable example). **Copy for the
+  operator** puts exactly `--allow-origin <origin>` on the clipboard (Clipboard API on a secure
+  page; on plain HTTP a selected text area and `execCommand('copy')`; where neither works the
+  option is selected for copying by hand, and the button says so), "Copied ✓" for 2.5 s. On the
+  code entry it adds **"Restarting ButtPad prints a NEW pairing code — ask for it."** (the old one
+  is gone with the restart); a paired device instead says it stays paired and connects once the
+  host lets it.
+- **The token never goes in a URL** (a reverse proxy's or preview pane's log kept the admin token,
+  a line a second): every connection attempt first trades it for a one-time ticket,
+  `POST /api/ws-ticket` with the Bearer header → `{ticket, expiresInMs}`, and opens
+  `/ws?ticket=<ticket>` (`wss:` under https) at once; each reconnect gets a fresh one, a ticket is
+  never reused. Its 401 → token rejected (stop, as below); 403 → the address advice above (and
+  keep trying); no answer, or anything else → a failed attempt like a socket that failed. HTTP
+  carries the token only in `Authorization` headers; the `#token=` of a pairing link is a fragment,
+  which never leaves the browser.
 - WS with auto-reconnect (backoff 0, 250 ms → 5 s). The backoff starts over only after a
   connection held 10 s: a host or proxy that drops every socket right after `hello` is not
-  hammered. A socket waits 5 s for its `hello`, then 10, 20… (≤ 60 s) after each one that timed
-  out: a big config over a slow link gets through. Reconnect gets a fresh `hello`; state is
-  authoritative from the host, so a reload or flaky Wi-Fi never loses track of a running action.
-  Offline, a touch on a button tries to connect at once (not at the next retry, seconds away).
+  hammered. A socket waits 5 s for its `hello` (from when it is made; its ticket request gets as
+  long), then 10, 20… (≤ 60 s) after each one that timed out: a big config over a slow link gets
+  through. Reconnect gets a fresh `hello`; state is authoritative from the host, so a reload or
+  flaky Wi-Fi never loses track of a running action. Offline, a touch on a button tries to connect
+  at once (not at the next retry, seconds away), giving up on a ticket request or socket that has
+  been opening for 1.5 s.
 - Liveness: a link can die without a TCP close, and the host sends no heartbeats, so the client
   asks. A socket quiet for 5 s (page visible) gets `{"t":"ping"}`; the host answers a type it
   doesn't know with `error`, and any frame counts as the answer. Nothing back in 3 s (1.5 s when
@@ -510,8 +547,13 @@ is logged once and the log starts empty.
   round trips are measured (pings answered, presses acked; the last 20, none that spans a stretch
   in the background), and with ≥ 3 of them, their 90th percentile p sets: the ack wait 4p within
   2–6 s, the probe 4p within 3–8 s, the doubtful probe 3p within 1.5–5 s, "no ack yet" 2p within
-  0.6–3 s. Slower to say NO RESPONSE on a slow link, never faster than before, never past 6 s; and
-  never a success that didn't happen (only the host's answer or state shows one).
+  0.6–3 s. Until there are 3, p is the last ticket request's round trip as the network stack timed
+  it (Resource Timing, `responseStart − requestStart`: no connecting, unaffected by the page
+  stalling; none where the browser has no such entry). QA, a link 2 s each way: a fresh socket's
+  first press got the fast-link 0.6 + 1.5 s for a frame and the link was dropped, press after press,
+  so no round trip was ever measured. Slower to say NO RESPONSE on a slow link, never faster than
+  before, never past 6 s; and never a success that didn't happen (only the host's answer or state
+  shows one).
 - **Syncing**: back from a stretch in the background (hidden ≥ 5 s), a frozen tab resuming
   (Page Lifecycle `resume`, a back/forward-cache restore), or a page that didn't run for a while
   (a 1 s heartbeat that comes ≥ 8 s late: a 4 s stall isn't that): what the screen shows may be
@@ -525,11 +567,12 @@ is logged once and the log starts empty.
   (`isStale()`) and shows SYNCING too.
 - Startup: alongside the first socket, `GET /api/state` (and `/api/config` when no layout is
   cached): a rejected token shows at once, and a socket that hangs doesn't show a running action
-  as READY. While offline the last-known states stay on screen (see OFFLINE). A socket that never
-  got its hello is followed by a plain `POST /ws?token=…`, which answers what the upgrade got: 503 →
-  "Host is full (too many devices connected)" instead of "Can't reach the host"; 403 (a POST carries
-  the page's Origin, a same-origin GET doesn't) → the host turns this address away, with the exact
-  `--allow-origin` to start it with; 426 = there's room.
+  as READY. While offline the last-known states stay on screen (see OFFLINE). Browsers hide why an
+  upgrade was refused, so a socket that never got its hello is followed by `POST /api/ws-check`
+  (Bearer header, nothing in the URL; a POST because a same-origin GET carries no Origin), which
+  answers what an upgrade from this page would get now: 503 → "Host is full (too many devices
+  connected)" instead of "Can't reach the host"; 403 → the host turns this address away (the advice
+  above, with the `allowOrigin` its body names); 401 → token rejected; 204 = there's room.
 - Clocks: everything the client times itself (elapsed counters, confirm windows, countdowns,
   cooldowns) runs on `wall()` (`src/web/lib/clock.ts`): epoch ms that follow `performance.now()`, so
   setting the device's clock moves no counter; after a stretch in the background it catches up with
@@ -537,7 +580,11 @@ is logged once and the log starts empty.
   from every `hello.serverNow` (and `/api/state`'s), corrected by the one-way delay the socket's
   opening measured. The host stamps serverNow when it takes the socket, so the offset is taken as
   of the socket's opening (its upgrade answer), not as of the hello's arrival: a big config over a
-  slow link takes seconds more to arrive.
+  slow link takes seconds more to arrive. The opening took the upgrade's round trip, plus one for
+  connecting unless that was free (a proxy or tunnel on the device's side): the one-way delay is a
+  quarter to a half of it. A quarter (≤ 1 s), unless the ticket request timed the round trip on
+  its own (Resource Timing, above): half of that, within those bounds (≤ 4 s). QA: through a proxy
+  2 s each way the quarter came out at 1 s, and every press looked a second older to the host.
 - A press goes out at once or not at all, never queued for later, and carries `at` (when it was
   made, host clock: the gesture's own time — a tap's release, a hold reaching `holdMs`, a keydown —
   so a press a stalled page sends late is still dropped as too old) and, after the confirm step,
@@ -608,8 +655,11 @@ is logged once and the log starts empty.
   — asked for by the link, or deleted while on screen (renamed: followed by id, or by name if only
   its id changed) — gets a "Pad “X” no longer exists" screen (with the pads to pick from, unless
   locked), never another pad's buttons. A locked screen in that state ignores keys too. Leaving the
-  editor returns to the pad that was on screen before it (a `?pad=` link's too), not the one edited
-  last; only when that pad is gone (deleted in the editor) does the editor's pad take its place.
+  editor lands on the pad the editor had open when it closed (a `?pad=` link's page too: QA, the
+  owner built "Stage", saved, closed the editor and was back on "Test"). A pad saved just then may
+  reach the page a moment after the save's answer (with the socket's `config`): the page waits up
+  to 10 s for it, on the pad that was on screen meanwhile, unless another pad is picked; one never
+  saved (a draft thrown away) leaves the pad that was on screen before.
 - Banners (unsaved edits kept on the device, storage blocked, host full, address refused, config
   errors, pairing notes) take their own room below the pad, which shrinks for them: never over a
   button (on a 360×640 phone one covered the bottom row). Toasts (a key pressed a button on another
@@ -654,7 +704,10 @@ brighter just as the house went dark): every face is its hue dimmed to the same 
 result is a colored edge (4 px or more; dashed for UNKNOWN), the glyph and the text in the result's
 color on a near-black face, never a full-tile flood; FAILURE keeps its hatching (in red) and pulses
 its edge instead of the brightness. No bright flashes: the fire flash peaks at 14 % ink (65 % white
-otherwise), badges and pills are dim (pills outlined), the arming fill is fainter. Measured on a
+otherwise), badges and pills are dim (pills outlined), the arming fill is fainter. The `@state`
+chip stays a solid chip, but in the face's hue a step lighter (OKLCH L 0.36, `showPalette().chip`)
+with the ink on it (≥ 4.5:1), not a chip in the ink (QA: "ON 80%" was the brightest thing on a dark
+pad, 0.35 on a 0.025 face; now ~0.11, darker than the label). Measured on a
 phone (mean relative luminance of a tile): READY 0.25 / 0.53 (blue / yellow) → 0.06 / 0.07, a
 SUCCESS flood 0.44 → 0.07, a FAILURE 0.24 → 0.08: a result about as bright as READY was, where
 normal mode's green flood is 1.8× a blue button's READY, and many times a dark one's (BLACKOUT).
@@ -665,7 +718,10 @@ press stays on screen until the next run on the button supersedes it, or its ✕
 clears it without a press. A press on it is an ordinary press, a retry ("TAP / HOLD / 2× TAP TO
 RETRY"): the trigger, confirm and cooldown rules as always, a key too (also one for a button on
 another pad). It clears the result when it fires; a press that comes to nothing (SLIPPED, a graze)
-leaves it, and a CONFIRM step shows over it (it's back if the window runs out).
+leaves it, and a CONFIRM step shows over it (it's back if the window runs out). The retry pill (and
+NEXT RUN QUEUED) has a row of its own along the bottom edge, taken out of the room the fitted text
+is sized for, like the top band's (QA: on 122 px buttons, a 3 × 6 pad on a phone, and in the
+gallery, it printed over "EXIT 3"); on short buttons (one row) it goes.
 
 Badges flash over the face (as a small chip over a result, so the result stays readable): BUSY
 (pressed while running or sending; briefly and without a buzz within the cooldown), BUSY / TRY
@@ -751,6 +807,10 @@ synchronously inside the handler.
 - Entered from the menu. Grid lines visible. Tap an empty cell → new button there. Drag a button
   to move, drag its corner handle to resize; snaps to cells; overlap/out-of-bounds is refused
   visibly (red ring, a shake). A duplicate lands with a calm glow instead.
+- Closing it (✕, Save and close, Discard changes) reports the pad open in the editor, by its id on
+  the host (a pad whose id the draft changed: the host's; after Save and close: the saved one; a
+  new pad thrown away: none), and run mode lands on that pad (QA: the owner built "Stage", closed
+  the editor, and was back on "Test").
 - Selecting a button opens an editor (bottom sheet on phones, side panel on wide screens): label,
   color, trigger, holdMs, driftPx, confirm (+ confirmWindowMs), cooldownMs, maxLatenessMs ("Max
   lateness": a press that reaches the host later than this — dead Wi-Fi, a frozen host — is
@@ -796,9 +856,17 @@ synchronously inside the handler.
   (undoable) in plain sight on every layout. Validation errors from the host are shown; long lists
   ("+3 more": a broken file's errors, the problems) open up in full. The host's PUT `warnings`
   (saved, but e.g. a program it can't find, bash syntax under /bin/sh, a modifier key, a group of
-  one) show after the save as a notice — no "Saved" toast over it — and on the button and field
-  they name (an amber badge, a callout in its editor: Command, Shell, Key, Group…) until that part
-  of it changes. Dialogs that could destroy work focus their safe way out (Cancel / Keep editing).
+  one) are about the whole config, so each save tells what it changed from the rest (diffing the
+  saved config against the one the draft was based on, by identity: a renamed button is the same
+  button). Warnings about a button it added or changed, a group a button joined or left (the one
+  left alone in it), or a `pad/*` pattern whose buttons it removed show after the save as a notice
+  ("Saved, but the host warns about this:") — no "Saved" toast over it, nor one left from an
+  earlier save. The rest is old news (an example's intentionally broken button on a pad the user
+  never touched: QA saw "Test › Missing binary" after every save): one quiet line, "N other
+  warnings elsewhere", that opens up to the list; inside that notice, or alone, muted and last of
+  the notices, with the "Saved" toast. Every warning also marks the button and field it names (an
+  amber badge, a callout in its editor: Command, Shell, Key, Group…) until that part of it
+  changes. Dialogs that could destroy work focus their safe way out (Cancel / Keep editing).
 - The draft is kept on the device (localStorage, per host origin; written right after each change
   and when the page is hidden) until saved or discarded: a reload, an evicted tab, a rotated token
   (401) or a pairing link opened in the tab don't lose it (a pairing link opened while the draft is
@@ -831,7 +899,10 @@ synchronously inside the handler.
 - Admin extra: per-button run log (from `/api/runs`) to see why something failed: outcome, the
   output tails, what ran (`command`), in which folder (`cwd`), and why it couldn't start or was
   stopped (`error`; a path it couldn't start is shown exactly, in quotes, blanks visible, with what
-  it tried to run right under it). It refetches every second while the button runs. **Run now** for a saved,
+  it tried to run right under it). A Nothing (`none`) run, which runs no program, reads "Done"
+  (not "exit 0") with what the host said it did, from the button's state while it has it ("Stopped
+  2", "Nothing was running"), like any result: never as a failure or a "why it stopped". It
+  refetches every second while the button runs. **Run now** for a saved,
   unchanged button; otherwise **Save & run** (saves the draft, then runs the saved version). On a
   `confirm` button both ask first (a dialog that focuses Cancel) and the press then carries
   `confirm: true` (the host refuses unconfirmed ones). While the button runs, Run now is never a
@@ -839,7 +910,8 @@ synchronously inside the handler.
 - Phones, down to 360 × 640: the status chip shrinks rather than run under Undo; the pad tabs
   scroll sideways (the edges fade; the selected tab, and the "+" after the last, stay in view).
   Notices sit above the canvas, most urgent first (what answers the last action, then what needs a
-  decision, then the state of things); one line per host warning ("+2 more"), and they scroll
+  decision, then the state of things); one line per host warning about the save ("+2 more"), the
+  others folded into "N other warnings elsewhere", and they scroll
   within what the canvas can spare: under the editor sheet it keeps rows of 44 px. Toasts go under
   the notices, never over one. With the on-screen keyboard up (the visual viewport shrinks ~45%)
   the editor takes the whole screen: the sheet goes full height, the canvas, notices and pad row

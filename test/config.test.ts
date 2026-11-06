@@ -614,20 +614,31 @@ describe('examples and starter config', () => {
     expect(configWarnings(cfg, dirname(examplePath))).toEqual(['pad "test" › button "spawn-fail": command not found: buttpad-no-such-tool (not on PATH)']);
   });
 
-  test('the fake devices latch their state with @state', () => {
+  test("the fake devices latch their state with @state, and a light's other buttons (All on/off: each light's) with @state:<pad>/<button>", () => {
     const state = tmpDir();
-    const sh = (...argv: string[]) =>
-      Bun.spawnSync(argv, { cwd: dirname(examplePath), env: { ...process.env, BUTTPAD_FAKE_STATE: state } })
+    const cfg = Config.parse(JSON.parse(readFileSync(examplePath, 'utf8')));
+    /** The @state lines of a run of `pad/button` (as the host runs it), by the button's own action. */
+    const run = (pad: string, button: string) => {
+      const a = findButton(cfg, pad, button)!.action;
+      if (a.type !== 'exec') throw new Error(`${pad}/${button} is not an exec action`);
+      return Bun.spawnSync([a.command, ...a.args], { cwd: dirname(examplePath), env: { ...process.env, BUTTPAD_FAKE_STATE: state, BUTTPAD_PAD: pad, BUTTPAD_BUTTON: button } })
         .stdout.toString()
         .split('\n')
         .filter((l) => l.startsWith('@state'));
-    expect(sh('./scripts/light.sh', 'key', '80')).toEqual(['@state ON 80%']);
-    expect(sh('./scripts/light.sh', 'key', 'off')).toEqual(['@state OFF']);
-    expect(sh('./scripts/light.sh', 'fill', 'toggle')).toEqual(['@state ON 80%']);
-    expect(sh('./scripts/light.sh', 'all', 'off')).toEqual([]);
-    expect(sh('./scripts/camera.sh', 'rec')).toEqual(['@state REC ●']);
-    expect(sh('./scripts/camera.sh', 'rec')).toEqual(['@state']);
-  }, 20_000);
+    };
+    expect(run('lights', 'key-80')).toEqual(['@state ON 80%', '@state:lights/key-off ON 80%']);
+    expect(run('lights', 'key-off')).toEqual(['@state OFF', '@state:lights/key-80 OFF']);
+    expect(run('lights', 'fill')).toEqual(['@state ON 80%']);
+    // All off: no chip of its own (one can't speak for three lights); each light's buttons get theirs.
+    const allOff = run('lights', 'all-off');
+    expect(allOff).toEqual(['@state:lights/key-80 OFF', '@state:lights/key-off OFF', '@state:lights/fill OFF', '@state:lights/back-30 OFF']);
+    for (const l of allOff) expect(findButton(cfg, 'lights', /^@state:lights\/([\w-]+) /.exec(l)![1]!)).toBeDefined();
+    expect(run('lights', 'all-on')).toEqual(['@state:lights/key-80 ON 80%', '@state:lights/key-off ON 80%', '@state:lights/fill ON 80%', '@state:lights/back-30 ON 80%']);
+    // A scene sets lights too: their buttons follow (and the scene keeps no chip).
+    expect(run('lights', 'interview')).toEqual(['@state:lights/key-80 ON 80%', '@state:lights/key-off ON 80%', '@state:lights/fill ON 40%', '@state:lights/back-30 ON 25%']);
+    expect(run('camera', 'rec')).toEqual(['@state REC ●']);
+    expect(run('camera', 'rec')).toEqual(['@state']);
+  }, 30_000);
 
   test('the starter has a stop button that runs nothing, and nothing in it would fail to start', () => {
     for (const platform of ['linux', 'darwin', 'win32'] as const) {

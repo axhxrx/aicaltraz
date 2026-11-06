@@ -103,11 +103,11 @@ const PRESS_NOTE: Partial<Record<PressResult, string>> = {
   'needs-confirm': "The host wants this press confirmed, and it wasn't: nothing ran.",
 };
 
-function Run({ r, skew, shown, open, onToggle }: { r: RunRecord; skew: number; shown: string | undefined; open: boolean; onToggle(): void }) {
+function Run({ r, skew, stateText, open, onToggle }: { r: RunRecord; skew: number; stateText: string | undefined; open: boolean; onToggle(): void }) {
   const o = outcome(r);
   const start = r.startedAt + skew;
   const dur = r.endedAt !== undefined ? fmtElapsed(r.endedAt - r.startedAt) : null;
-  const said = resultText(r, o.tone === 'bad') ?? (r.endedAt !== undefined ? shown : undefined);
+  const said = resultText(r, o.tone === 'bad') ?? (r.endedAt !== undefined ? stateText : undefined);
   const text = said === o.title ? undefined : said;
   return (
     <li class={`ed-run is-${o.tone}${open ? ' is-open' : ''}`} data-testid="run-item">
@@ -338,7 +338,7 @@ export function RunLog(p: {
       {onHost && runs && runs.length > 0 && (
         <ol class="ed-run-list">
           {runs.map((r) => (
-            <Run key={r.runId} r={r} skew={skew} shown={shownText(st, r.runId)} open={shown === r.runId} onToggle={() => setOpen(shown === r.runId ? -1 : r.runId)} />
+            <Run key={r.runId} r={r} skew={skew} stateText={shownText(st, r.runId)} open={shown === r.runId} onToggle={() => setOpen(shown === r.runId ? -1 : r.runId)} />
           ))}
         </ol>
       )}

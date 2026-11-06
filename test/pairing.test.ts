@@ -166,7 +166,15 @@ describe('POST /api/pair-code (admin) and POST /api/pair (no token)', () => {
     const r = await post('/api/pair', { code: made.code });
     expect(r.status).toBe(429);
     expect(r.headers.get('retry-after')).toBe('10');
-    expect(await r.json()).toEqual({ error: 'too many attempts: wait a minute, then try again' });
+    // The words say what Retry-After says (not "wait a minute" next to Retry-After: 7).
+    expect(await r.json()).toEqual({ error: 'too many attempts: try again in 10 s' });
+    await Bun.sleep(1100);
+    const later = await post('/api/pair', { code: made.code });
+    expect(later.status).toBe(429);
+    const wait = Number(later.headers.get('retry-after'));
+    expect(wait).toBeGreaterThanOrEqual(1);
+    expect(wait).toBeLessThan(10);
+    expect(await later.json()).toEqual({ error: `too many attempts: try again in ${wait} s` });
   });
 
   test("a page of another origin can't pair (a hidden form on some web page burning the code)", async () => {
@@ -298,6 +306,8 @@ const HeaderedWebSocket = WebSocket as unknown as new (url: string, options: { h
 
 function reverseProxy() {
   const target = { port: 0 };
+  /** Every request line it forwarded, as a proxy's access log has them (QA found the admin token in one). */
+  const logged: string[] = [];
   type Data = { path: string; origin: string | null; up?: WebSocket; queue: (string | Buffer)[] };
   const proxy = Bun.serve<Data>({
     port: 0,
@@ -305,6 +315,7 @@ function reverseProxy() {
     async fetch(req, srv) {
       const url = new URL(req.url);
       const upstream = `127.0.0.1:${target.port}`;
+      logged.push(`${req.method} ${url.pathname}${url.search}`);
       if (req.headers.get('upgrade')?.toLowerCase() === 'websocket')
         return srv.upgrade(req, { data: { path: url.pathname + url.search, origin: req.headers.get('origin'), queue: [] } }) ? undefined : new Response('no upgrade', { status: 400 });
       const headers = new Headers(req.headers);
@@ -332,7 +343,7 @@ function reverseProxy() {
       },
     },
   });
-  return { proxy, target, origin: `http://127.0.0.1:${proxy.port}` };
+  return { proxy, target, logged, origin: `http://127.0.0.1:${proxy.port}` };
 }
 
 /** A browser-like socket (it sends its page's Origin): the first message, or how it closed. */
@@ -378,6 +389,40 @@ describe('through a reverse proxy at the root path', () => {
       expect(plain.logs.filter((l) => l.startsWith('refused'))).toEqual([
         `refused a WebSocket from a page at ${origin} (the request's Host is 127.0.0.1:${plain.host.port}): not this host's own address. If that is ButtPad through your reverse proxy (or a preview pane), start ButtPad with --allow-origin ${origin}`,
       ]);
+    } finally {
+      proxy.stop(true);
+    }
+  });
+
+  test("a browser's way onto /ws leaves no token in the proxy's log: a ticket (POST, Bearer), /ws?ticket=, the probe (POST)", async () => {
+    const { proxy, target, origin, logged } = reverseProxy();
+    try {
+      const { host, logs } = await setup({ allowOrigins: [origin] });
+      target.port = host.port;
+      const auth = { authorization: `Bearer ${host.secrets.adminToken}`, origin };
+      expect((await fetch(`${origin}/api/ws-check`, { method: 'POST', headers: auth })).status).toBe(204);
+      const t = (await (await fetch(`${origin}/api/ws-ticket`, { method: 'POST', headers: auth })).json()) as { ticket: string };
+      const ok = await wsFrom(`ws://127.0.0.1:${proxy.port}/ws?ticket=${t.ticket}`, origin);
+      expect(ok.hello).toMatchObject({ t: 'hello', role: 'admin' });
+      expect(logged).toEqual(['POST /api/ws-check', 'POST /api/ws-ticket', `GET /ws?ticket=${t.ticket}`]);
+      // Replayed from that log: worthless.
+      expect((await wsFrom(`ws://127.0.0.1:${proxy.port}/ws?ticket=${t.ticket}`, origin)).hello).toBeUndefined();
+      expect(logs.filter((l) => l.startsWith('refused'))).toEqual([]);
+
+      // The same proxy in front of a host that wasn't told about it: the ticket (and the probe) say so, and which flag would allow it.
+      const plain = await setup();
+      target.port = plain.host.port;
+      const h = { authorization: `Bearer ${plain.host.secrets.pressToken}`, origin };
+      for (const path of ['/api/ws-ticket', '/api/ws-check']) {
+        const r = await fetch(`${origin}${path}`, { method: 'POST', headers: h });
+        expect(r.status).toBe(403);
+        expect(await r.json()).toEqual({ error: 'cross-origin WebSocket refused', origin, allowOrigin: origin });
+      }
+      expect(plain.logs.filter((l) => l.startsWith('refused'))).toEqual([
+        `refused a WebSocket ticket request from a page at ${origin} (the request's Host is 127.0.0.1:${plain.host.port}): not this host's own address. If that is ButtPad through your reverse proxy (or a preview pane), start ButtPad with --allow-origin ${origin}`,
+      ]);
+      for (const token of [host.secrets.adminToken, host.secrets.pressToken, plain.host.secrets.adminToken, plain.host.secrets.pressToken])
+        expect(logged.join('\n')).not.toContain(token);
     } finally {
       proxy.stop(true);
     }

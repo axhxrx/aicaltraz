@@ -2,7 +2,7 @@
  * Run mode, round 4 (demo backend, `?demo&exact`): per-button maxLatenessMs on the client, show
  * mode for dark rooms (measured: how bright READY and results get), FAILURE's hatching (grayscale,
  * show mode), READY's last-result text, narrow buttons keeping their trigger/confirm glyphs, and
- * leaving the editor for the pad that was on screen before.
+ * leaving the editor for the pad it had open.
  */
 import { writeFileSync } from 'node:fs';
 import { expect, test, type Page, type TestInfo } from '@playwright/test';
@@ -320,19 +320,29 @@ async function editAnotherPadAndLeave(page: Page, other: string) {
   await expect(page.getByTestId('edit-mode')).toHaveCount(0);
 }
 
-test('leaving the editor returns to the pad that was on screen before (a ?pad= link’s too), not the one edited last', async ({ page }) => {
+test('leaving the editor lands on the pad it had open (a ?pad= link’s page too); with that pad never saved, on the one on screen before', async ({ page }) => {
   await open(page, PADS, '?demo&exact&pad=backup');
   await expect(btn(page, 'spare')).toBeVisible();
   await editAnotherPadAndLeave(page, 'main');
-  await expect(btn(page, 'spare')).toBeVisible();
-  await expect(page.getByTestId('tab-backup')).toHaveAttribute('aria-selected', 'true');
+  await expect(btn(page, 'go')).toBeVisible();
+  await expect(page.getByTestId('tab-main')).toHaveAttribute('aria-selected', 'true');
 
   // Picked from the tabs: the same.
   await page.getByTestId('tab-crew').click();
   await expect(btn(page, 'call')).toBeVisible();
-  await editAnotherPadAndLeave(page, 'main');
-  await expect(btn(page, 'call')).toBeVisible();
-  await expect(page.getByTestId('tab-crew')).toHaveAttribute('aria-selected', 'true');
+  await editAnotherPadAndLeave(page, 'backup');
+  await expect(btn(page, 'spare')).toBeVisible();
+  await expect(page.getByTestId('tab-backup')).toHaveAttribute('aria-selected', 'true');
+
+  // A pad added in the editor and thrown away: back on the pad on screen before (not "no longer exists").
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-edit').click();
+  await page.getByTestId('edit-add-pad').click();
+  await page.getByTestId('edit-close').click();
+  await page.getByTestId('leave-discard').click();
+  await expect(page.getByTestId('edit-mode')).toHaveCount(0);
+  await expect(btn(page, 'spare')).toBeVisible();
+  await expect(page.getByTestId('pad-missing')).toHaveCount(0);
 });
 
 // ---- the gallery has every state, show mode too ---------------------------------------------------

@@ -104,6 +104,8 @@ describe('StateStore', () => {
       baseDir: '/cfg',
       timeoutMs: 1234,
       env: { BUTTPAD_PAD: 'p', BUTTPAD_BUTTON: 'a', BUTTPAD_RUN_ID: '1', BUTTPAD_LABEL: 'Alpha' },
+      // Its own key: `@state:p/a` from its own script is its plain `@state`.
+      key: 'p/a',
     });
     expect(store.running).toBe(1);
   });

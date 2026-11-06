@@ -72,7 +72,9 @@ Actions:
 - Exit code 0 = SUCCESS. Script output protocol (stdout lines):
   `@progress 40` (determinate fill), `@status warming up`, `@result Key light ON 80%`, and
   `@state REC ●` — a device-state chip that stays on the button across runs and restarts (`@state`
-  alone clears it). Without `@result`, the last stdout line is the result text (stderr's on failure).
+  alone clears it). `@state:<pad>/<button> OFF` sets (bare: clears) another button's chip, e.g. All
+  off resetting each light's "ON 80%". Without `@result`, the last stdout line is the result text
+  (stderr's on failure).
 - Background processes a script starts are left alone when it exits (ButtPad stops reading their
   output); cancelling or a timeout kills the whole process group.
 

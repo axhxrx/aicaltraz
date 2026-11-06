@@ -4,13 +4,13 @@
  * and the run log across restarts (buttpad.runs.json).
  */
 import { afterAll, afterEach, describe, expect, test } from 'bun:test';
-import { chmodSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Config, type ConfigInput } from '../src/core/config.ts';
 import type { RunState } from '../src/core/machine.ts';
 import type { RunRecord } from '../src/core/protocol.ts';
 import { startHost, type Host } from '../src/server/host.ts';
-import { HISTORY_SIZE, parseRuns, runsFileText, runsPathFor, SAVED_TAIL_BYTES, STATE_FILE, tailBytes, UNCERTAIN_PREFIX } from '../src/server/persist.ts';
+import { HISTORY_SIZE, MAX_RUN_ID, parseRuns, runsFileText, runsPathFor, SAVED_TAIL_BYTES, STATE_FILE, tailBytes, UNCERTAIN_PREFIX } from '../src/server/persist.ts';
 import { processFingerprint } from '../src/server/proc.ts';
 import { sanitize, startRun, type RunHandle, type RunHooks, type RunOutcome, type RunSpec, type RunUpdate } from '../src/server/runner.ts';
 import { StateStore, stopsBeforeStart, type PressOptions, type StateStoreOptions } from '../src/server/state-store.ts';
@@ -508,7 +508,7 @@ describe('the run log across restarts (buttpad.runs.json)', () => {
       [2, 'interrupted', 'stopped: host shutdown'],
       [1, 'exit', undefined],
     ]);
-    // Run ids continue past everything the log knew.
+    // Run ids continue where the state file says they were.
     expect(two.store.press('p', 'a')).toMatchObject({ result: 'started', runId: HISTORY_SIZE + 4 });
     two.runs.at(-1)!.exit();
     await two.store.shutdown(20);
@@ -519,6 +519,69 @@ describe('the run log across restarts (buttpad.runs.json)', () => {
     await three.store.shutdown(20);
     const saved = readJson<{ runs: Record<string, RunRecord[]> }>(three.runsPath);
     expect(Object.keys(saved.runs)).toEqual(['p/a']);
+  });
+
+  test('run ids come from the state file only (the run log is display data); an absurd id in either file is dropped as malformed', async () => {
+    const dir = tmpDir('buttpad-r4-');
+    const statePath = join(dir, STATE_FILE);
+    const runsPath = join(dir, 'buttpad.runs.json');
+    const rec = (runId: number, startedAt: number) => ({ runId, pad: 'p', button: 'a', startedAt, endedAt: startedAt + 1, exitCode: 0, stdout: `#${runId}`, stderr: '' });
+    const buttons: Buttons = [
+      { id: 'a', x: 0, y: 0, resultHoldMs: 0, action: shell('x') },
+      { id: 'b', x: 1, y: 0, resultHoldMs: 0, action: shell('x') },
+    ];
+    // QA: a run log holding runId 2^53 − 1 seeded the counter, and +1 no longer changed it: every run was #9007199254740992.
+    writeJson(statePath, { version: 1, savedAt: Date.now(), buttons: { 'p/a': { lastRunId: 3 } }, live: [] });
+    chmodSync(statePath, 0o600);
+    writeJson(runsPath, { version: 1, runs: { 'p/a': [rec(Number.MAX_SAFE_INTEGER, 3000), rec(MAX_RUN_ID + 1, 2500), rec(MAX_RUN_ID, 2000), rec(3, 1000)] } });
+    const one = storeAt(dir, buttons);
+    // Shown (display data), the absurd ones dropped like any malformed record…
+    expect(one.store.runs().map((r) => r.runId)).toEqual([MAX_RUN_ID, 3]);
+    // …and the ids go on from the state file's, one by one.
+    const ids: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const r = one.store.press('p', 'a');
+      ids.push(r.runId!);
+      one.runs.at(-1)!.exit();
+      await waitFor(() => one.store.get('p/a')?.phase === 'ready', 2000, 'ready');
+    }
+    expect(ids).toEqual([4, 5, 6]);
+    await one.store.shutdown(20);
+
+    // buttpad.state.json deleted, the run log kept: the ids start over (the log's #6 doesn't move them).
+    rmSync(statePath);
+    const two = storeAt(dir, buttons);
+    expect(two.store.runs().filter((r) => r.button === 'a')[0]).toMatchObject({ runId: 6 });
+    expect(two.store.press('p', 'a')).toMatchObject({ result: 'started', runId: 1 });
+    two.runs.at(-1)!.exit();
+    await two.store.shutdown(20);
+
+    // In the state file: an absurd lastRunId (and an absurd run in flight) is dropped like any bad value; `last` is a run the ids passed.
+    writeJson(statePath, {
+      version: 1,
+      savedAt: Date.now(),
+      buttons: { 'p/a': { lastRunId: Number.MAX_SAFE_INTEGER, latched: 'X' }, 'p/b': { lastRunId: 2, last: { runId: 7, ok: true, endedAt: 1 } } },
+      live: [{ key: 'p/a', runId: MAX_RUN_ID + 1, pid: NO_SUCH_PID, pgid: NO_SUCH_PID, startedAt: 1 }],
+    });
+    chmodSync(statePath, 0o600);
+    const three = storeAt(dir, buttons);
+    expect(three.logs.filter((l) => l.includes('interrupted'))).toEqual([]);
+    expect(three.store.latched()).toEqual({});
+    expect(three.store.press('p', 'a')).toMatchObject({ runId: 1 });
+    expect(three.store.press('p', 'b')).toMatchObject({ runId: 8 });
+    for (const r of three.runs) r.exit();
+    await three.store.shutdown(20);
+
+    // At the bound itself the ids still count up (2^53 − 1 couldn't: + 1 changed nothing there).
+    writeJson(statePath, { version: 1, savedAt: Date.now(), buttons: { 'p/a': { lastRunId: MAX_RUN_ID } }, live: [] });
+    chmodSync(statePath, 0o600);
+    const four = storeAt(dir, buttons);
+    expect(four.store.press('p', 'a')).toMatchObject({ runId: MAX_RUN_ID + 1 });
+    four.runs.at(-1)!.exit();
+    await waitFor(() => four.store.get('p/a')?.phase === 'ready', 2000, 'ready');
+    expect(four.store.press('p', 'a')).toMatchObject({ runId: MAX_RUN_ID + 2 });
+    four.runs.at(-1)!.exit();
+    await four.store.shutdown(20);
   });
 
   test('a crash: the runs that ended are there, the one cut off is added once as interrupted', async () => {

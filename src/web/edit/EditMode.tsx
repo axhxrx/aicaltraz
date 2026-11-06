@@ -318,7 +318,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const warned = useMemo(() => new Set(pad.buttons.flatMap((b, i) => (warningsFor(b).size ? [i] : []))), [pad, warnings]);
   const full = pad.buttons.reduce((n, b) => n + b.w * b.h, 0) >= pad.cols * pad.rows;
 
-  useEffect(() => unsavedEdits.set(dirty), [dirty]);
+  // Right after the render (not after paint): a pairing link opened a moment after an edit asks first.
+  useLayoutEffect(() => unsavedEdits.set(dirty), [dirty]);
   useEffect(() => () => unsavedEdits.set(false), []);
 
   // ---- feedback ---------------------------------------------------------------------------
@@ -1034,7 +1035,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           </span>
         </div>
       )}
-      {/* Only old news from the save (its "Saved" toast said the rest): one quiet line, last. */}
+      {/* A save with only old news to warn about (its "Saved" toast answered it): one quiet line, last. */}
       {warnings?.shown && !warnings.mine.length && warnings.others.length > 0 && (
         <div class="ed-notice is-quiet" role="status" data-testid="notice-warnings-elsewhere">
           <Warn />

@@ -99,6 +99,11 @@ const ACK_TIMEOUT_MAX = 6000;
 const RTT_WINDOW = 20;
 const RTT_MIN_SAMPLES = 3;
 const RTT_SAMPLE_MAX = 15_000;
+/** The one-way delay a socket's opening alone suggests, at most (see oneWay); and the most it is ever taken to be. */
+const ONE_WAY_GUESS_MAX = 1000;
+const ONE_WAY_MAX = 4000;
+/** Resource Timing keeps a few hundred entries, then drops new ones: the ticket's must get in. */
+const RT_ENTRIES_MAX = 150;
 /** Back from at least this long in the background → probe. */
 const HIDDEN_DOUBT_AFTER = 1000;
 /** …this long → syncing (the screen may be minutes old). */
@@ -131,6 +136,11 @@ interface Conn {
   openedAt: number;
   upAt: number;
   greetedAt: number;
+  /**
+   * The ticket request's round trip as the network stack timed it (Resource Timing: from sending
+   * the request to the first byte of its answer, no connecting, unaffected by the page stalling).
+   */
+  ticketRtt?: number;
   /** mono() of the last frame from the host. */
   lastFrame: number;
   pending: Map<string, Pending>;
@@ -171,6 +181,13 @@ export class WsBackend implements Backend {
   private readonly offs: (() => void)[] = [];
   /** Recent round trips (ms): pings answered, presses acked. */
   private rtts: number[] = [];
+  /**
+   * The last ticket request's round trip (Conn.ticketRtt): what the link is like until enough of
+   * the above are in. QA: on a link 2 s each way, a fresh socket's first press waited the fast-link
+   * 0.6 s + 1.5 s for a frame, was declared dead, and so on with every press; no round trip was
+   * ever measured.
+   */
+  private linkHint: number | null = null;
   /**
    * Bumped whenever the page may not have run for a while (hidden, frozen, asleep): a "round trip"
    * that spans one measures the page, not the link.
@@ -243,9 +260,9 @@ export class WsBackend implements Backend {
     if (this.rtts.length > RTT_WINDOW) this.rtts.shift();
   }
 
-  /** The 90th percentile of the recent round trips; null: too few to say. */
+  /** The 90th percentile of the recent round trips; too few of them: the ticket's (null: none either). */
   private rttP90(): number | null {
-    if (this.rtts.length < RTT_MIN_SAMPLES) return null;
+    if (this.rtts.length < RTT_MIN_SAMPLES) return this.linkHint;
     const s = [...this.rtts].sort((a, b) => a - b);
     return s[Math.min(s.length - 1, Math.ceil(0.9 * s.length) - 1)]!;
   }
@@ -298,9 +315,24 @@ export class WsBackend implements Backend {
     this.snapshot.set((s) => ({ ...s, ...p }));
   }
 
+  /** How long the ticket request, and then the socket for its hello, may take: 5 s, doubled after each that didn't make it (≤ 60 s). */
+  private helloWait(): number {
+    return Math.min(HELLO_TIMEOUT_MAX, HELLO_TIMEOUT * 2 ** this.helloMisses);
+  }
+
+  /** Gives `c` until helloWait() from now, then it is dead (and the next attempt waits longer). */
+  private armHello(c: Conn) {
+    clearTimeout(c.helloTimer);
+    c.helloTimer = setTimeout(() => {
+      this.helloMisses++;
+      this.lost(c);
+    }, this.helloWait());
+  }
+
   /**
-   * A connection attempt: a fresh one-time ticket, then the socket. The hello wait covers both (a
-   * ticket request on a dead link hangs like a socket does).
+   * A connection attempt: a fresh one-time ticket, then the socket. The ticket request gets the
+   * hello's wait too (one on a dead link hangs like a socket does); the socket gets its own, from
+   * when it is made, as before tickets.
    */
   private connect() {
     if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
@@ -326,13 +358,7 @@ export class WsBackend implements Backend {
       probeSentAt: 0,
     };
     this.conn = c;
-    c.helloTimer = setTimeout(
-      () => {
-        this.helloMisses++;
-        this.lost(c);
-      },
-      Math.min(HELLO_TIMEOUT_MAX, HELLO_TIMEOUT * 2 ** this.helloMisses),
-    );
+    this.armHello(c);
     void this.openWithTicket(c);
   }
 
@@ -363,6 +389,7 @@ export class WsBackend implements Backend {
     }
     c.ws = ws;
     c.openedAt = mono();
+    this.armHello(c);
     ws.onmessage = (ev) => {
       if (this.conn === c) this.onFrame(c, ev.data);
     };
@@ -379,12 +406,30 @@ export class WsBackend implements Backend {
 
   /**
    * How long the upgrade's answer took to get here from when the host stamped serverNow: about half
-   * a round trip. Opening the socket took about two (TCP connect, then the upgrade), so a quarter of
-   * that (at most 1 s).
+   * a round trip. Opening the socket took the upgrade's round trip, plus one for connecting unless
+   * that was free (a proxy or tunnel on this machine): the one-way delay is between a quarter and
+   * half of it. A quarter (at most 1 s) unless the ticket's request timed the round trip on its own:
+   * then half of that, within those bounds (QA: through a proxy 2 s each way, the quarter came out
+   * at half the real delay, and every press looked a second older to the host than it was).
    */
   private oneWay(c: Conn): number {
-    const opening = (c.upAt || c.greetedAt) - c.openedAt;
-    return Math.min(1000, Math.max(0, opening / 4));
+    const opening = Math.max(0, (c.upAt || c.greetedAt) - c.openedAt);
+    const quarter = Math.min(ONE_WAY_GUESS_MAX, opening / 4);
+    if (c.ticketRtt === undefined) return quarter;
+    return Math.min(ONE_WAY_MAX, Math.max(quarter, Math.min(opening / 2, c.ticketRtt / 2)));
+  }
+
+  /** Conn.ticketRtt from Resource Timing (in by the hello: the socket took a round trip at least); undefined where the browser has none. */
+  private ticketTiming(c: Conn): number | undefined {
+    try {
+      const all = performance.getEntriesByName(`${this.origin}/api/ws-ticket`, 'resource') as PerformanceResourceTiming[];
+      const e = all.filter((x) => x.startTime >= c.startedAt - 1).at(-1);
+      if (performance.getEntriesByType('resource').length > RT_ENTRIES_MAX) performance.clearResourceTimings();
+      if (e && e.requestStart > 0 && e.responseStart >= e.requestStart) return e.responseStart - e.requestStart;
+    } catch {
+      /* no Resource Timing */
+    }
+    return undefined;
   }
 
   private onFrame(c: Conn, data: unknown) {
@@ -407,6 +452,8 @@ export class WsBackend implements Backend {
       this.everGreeted = true;
       this.helloMisses = 0;
       clearTimeout(c.helloTimer);
+      c.ticketRtt = this.ticketTiming(c);
+      if (c.ticketRtt !== undefined) this.linkHint = c.ticketRtt;
     }
     this.onMessage(c, msg);
   }
@@ -677,7 +724,7 @@ export class WsBackend implements Backend {
     if (c?.greeted) this.probe(c, QUICK_PROBE_TIMEOUT);
     // Offline, waiting for the next retry, or stuck getting a ticket or opening a socket that should
     // be open by now (one that is open and waiting for a slow hello is left to it): go now.
-    else if (!c || ((!c.ws || c.ws.readyState === WebSocket.CONNECTING) && mono() - c.startedAt > KICK_STALE_CONNECT)) this.connectNow();
+    else if (!c || ((!c.ws || c.ws.readyState === WebSocket.CONNECTING) && mono() - (c.ws ? c.openedAt : c.startedAt) > KICK_STALE_CONNECT)) this.connectNow();
   }
 
   private async http(method: string, path: string, body?: string, signal?: AbortSignal): Promise<Response> {

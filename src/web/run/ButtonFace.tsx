@@ -410,9 +410,12 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, show, ...res
   const u = v === 'offline' ? vm.under : v;
   const badge = vm.flash ? badgeOf(vm.flash.kind, vm) : undefined;
   const top = !!(vm.latched || vm.last || vm.other || (vm.sticky && onDismiss));
+  // A result's pill along the bottom (TAP TO RETRY, NEXT RUN QUEUED) gets a row of its own, and the
+  // text above is sized for what is left (QA: on 122 px buttons it printed over "EXIT 3").
+  const foot = isResult(v) && (vm.nextQueued || (v !== 'success' && vm.sticky));
   return (
     <div
-      class={`bp-btn${cls ? ` ${cls}` : ''}${top ? ' has-top' : ''}`}
+      class={`bp-btn${cls ? ` ${cls}` : ''}${top ? ' has-top' : ''}${foot ? ' has-foot' : ''}`}
       data-visual={v}
       data-under={v === 'offline' ? vm.under : undefined}
       data-testid={`btn-${vm.id}`}

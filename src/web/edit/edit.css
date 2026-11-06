@@ -1791,6 +1791,9 @@ p.ed-warn-note {
 .ed-elsewhere-toggle[aria-expanded='true'] svg {
   rotate: 180deg;
 }
+.ed-elsewhere ul {
+  opacity: 0.8;
+}
 .ed-elsewhere .ed-link {
   font-weight: 600;
 }

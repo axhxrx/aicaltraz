@@ -801,8 +801,9 @@ button.bp-row:active {
   border-color: var(--amber);
   color: var(--amber);
 }
-.bp-origin .bp-origin-new {
-  margin: 12px 0 0;
+.bp-screen .bp-origin p.bp-origin-new,
+.bp-origin p.bp-origin-new {
+  margin: 14px 0 0;
   font-weight: 900;
   color: var(--text);
 }

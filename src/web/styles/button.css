@@ -41,8 +41,11 @@
   --pad: max(8px, 6cqmin);
   --top-fs: clamp(10px, 4.6cqmin, 20px);
   --top-h: 0px;
+  /* A result's bottom pill (TAP TO RETRY, NEXT RUN QUEUED): its font, and the row kept for it. */
+  --foot-fs: clamp(9px, 5.2cqmin, 22px);
+  --foot-h: 0px;
   --iw: calc(100cqw - 2 * var(--pad));
-  --ih: calc(100cqh - 2 * var(--pad) - var(--top-h));
+  --ih: calc(100cqh - 2 * var(--pad) - var(--top-h) - var(--foot-h));
   --radius: clamp(10px, 7cqmin, 30px);
   position: absolute;
   inset: 0;
@@ -589,12 +592,21 @@
   opacity: 1;
   height: max(6px, 3cqmin);
 }
-/* Bottom-edge notes of a result: stays until touched, a queued re-run coming up. */
+/* Bottom-edge notes of a result: stays until touched, a queued re-run coming up. They sit in a row
+   of their own (--foot-h, taken out of --ih like the top band's), so the fitted text above is sized
+   for the room that is left and is never printed over (QA: "EXIT 3" under TAP TO RETRY on 122 px
+   buttons). */
+.bp-btn.has-foot .bp-face {
+  --foot-h: calc(var(--foot-fs) * 1.95);
+}
+.bp-btn.has-foot .bp-content {
+  padding-bottom: var(--foot-h);
+}
 .bp-sticky,
 .bp-next {
   position: absolute;
   left: 50%;
-  bottom: -0.15em;
+  bottom: -0.1em;
   translate: -50% 0;
   max-width: 100%;
   overflow: hidden;
@@ -603,7 +615,7 @@
   padding: 0.32em 0.7em;
   border-radius: 99px;
   font-weight: 900;
-  font-size: clamp(9px, 5.2cqmin, 22px);
+  font-size: var(--foot-fs);
   letter-spacing: 0.05em;
   line-height: 1;
   background: color-mix(in srgb, var(--ink) 18%, transparent);
@@ -611,12 +623,6 @@
 .bp-next {
   background: var(--ink);
   color: var(--flood);
-}
-@container (min-height: 131px) {
-  .bp-btn[data-sticky] .bp-content,
-  .bp-btn:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']):has(.bp-next) .bp-content {
-    padding-bottom: 1.7em;
-  }
 }
 
 /* ---- OFFLINE -------------------------------------------------------------------------- */
@@ -952,8 +958,13 @@
    + gap, the label the rest), and the font sizes are computed for those same widths: a label sized
    for two lines is laid out on two, never squeezed onto one and clipped. */
 @container (max-height: 84px) {
-  .bp-btn.has-top .bp-face {
+  .bp-btn.has-top .bp-face,
+  .bp-btn.has-foot .bp-face {
     --top-h: 0px;
+    --foot-h: 0px;
+  }
+  .bp-btn.has-foot .bp-content {
+    padding-bottom: 0;
   }
   .bp-btn[data-visual] .bp-content {
     --gapw: max(6px, 2.4cqw);

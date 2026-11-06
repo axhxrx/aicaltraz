@@ -323,9 +323,13 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
           data-testid="code-input"
           value={code}
           onInput={onInput}
-          // A failed code is selected, but a tap on the field puts the caret into it: select it again
-          // (and the next edit replaces it all the same, wherever the caret ends up).
-          onClick={(e) => fresh.current && e.currentTarget.select()}
+          // A failed code is selected, but a tap on the field puts the caret into it (after the click
+          // event, in Chromium): select it again once that is done. The next edit replaces it all the
+          // same, wherever the caret ends up.
+          onClick={(e) => {
+            const el = e.currentTarget;
+            if (fresh.current) setTimeout(() => fresh.current && document.activeElement === el && el.select(), 0);
+          }}
           // Enter with fewer digits: Pair can't be pressed yet, so say why here.
           onKeyDown={(e) => e.key === 'Enter' && !complete && setShort(true)}
           inputMode="numeric"

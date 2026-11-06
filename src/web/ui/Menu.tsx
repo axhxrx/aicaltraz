@@ -64,9 +64,9 @@ function RepairRow(p: { onRepair(): void }) {
 /** 123456 → "123 456", 12345678 → "1234 5678": easier to read out and type. */
 const grouped = (code: string) => (code.length >= 6 && /^\d+$/.test(code) ? code.replace(new RegExp(`(\\d{${Math.ceil(code.length / 2)}})(?=\\d)`), '$1 ') : code);
 
-/** m:ss */
+/** m:ss, whole seconds left (a fresh 10-minute code says 10:00, then 9:59; not 10:01). */
 const mmss = (ms: number) => {
-  const s = Math.max(0, Math.ceil(ms / 1000));
+  const s = Math.max(0, Math.floor(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 

@@ -735,6 +735,33 @@ describe('over the wire', () => {
     expect(host.state.latched()).toEqual({ 'lights/key': 'ON 80%' }); // device state outlives the run
   });
 
+  test("@state:<pad>/<button> end to end: All off clears each light's chip on every device, and that survives a restart", async () => {
+    const cfg = padConfig([
+      { id: 'key', x: 0, y: 0, action: sh('echo "@state ON 80%"') },
+      { id: 'fill', x: 1, y: 0, action: sh('echo "@state ON 40%"') },
+      { id: 'off', label: 'All off', x: 2, y: 0, action: sh('echo "@state:p/key OFF"; echo "@state:p/fill"; echo "@state:p/ghost x"; echo "All lights OFF"') },
+    ]);
+    const { host, ws, logs, dir } = await realHost(cfg);
+    const c = await ws();
+    c.send({ t: 'press', id: '1', pad: 'p', button: 'key' });
+    c.send({ t: 'press', id: '2', pad: 'p', button: 'fill' });
+    await c.next('latched', (m) => m.key === 'p/key' && m.text === 'ON 80%');
+    await c.next('latched', (m) => m.key === 'p/fill' && m.text === 'ON 40%');
+    const from = c.msgs.length;
+    c.send({ t: 'press', id: '3', pad: 'p', button: 'off' });
+    expect(await c.next('latched', (m) => m.key === 'p/key', 5000, from)).toEqual({ t: 'latched', key: 'p/key', text: 'OFF' });
+    expect(await c.next('latched', (m) => m.key === 'p/fill', 5000, from)).toEqual({ t: 'latched', key: 'p/fill', text: null });
+    expect((await c.next('state', (m) => m.key === 'p/off' && m.state.phase === 'success', 5000, from)).state).toMatchObject({ text: 'All lights OFF' });
+    expect(host.state.latched()).toEqual({ 'p/key': 'OFF' });
+    expect(logs).toContain('p/off #1: "@state:p/ghost" names no button in the config; ignored');
+    const late = await ws();
+    expect((late.msgs[0] as { latched: Record<string, string> }).latched).toEqual({ 'p/key': 'OFF' });
+    await host.stop();
+    const two = await startHost({ configPath: join(dir, 'buttpad.config.json'), host: '127.0.0.1', port: 0, log: () => {} });
+    hosts.push(two);
+    expect(two.state.latched()).toEqual({ 'p/key': 'OFF' });
+  });
+
   test("the host log passes on no escape sequences from labels, paths or files (a reload's warnings neither)", async () => {
     const evil = '\u001b[41mEVIL\u001b[0m\u001b]0;pwned\u0007';
     const cfg = padConfig([

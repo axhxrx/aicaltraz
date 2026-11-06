@@ -3,9 +3,10 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import type { ConfigInput } from '../src/core/config.ts';
-import { PROTOCOL_VERSION, type RunRecord } from '../src/core/protocol.ts';
+import { PROTOCOL_VERSION, type OriginRefusal, type RunRecord, type WsTicket } from '../src/core/protocol.ts';
 import { revOf } from '../src/server/config-store.ts';
 import { ADMIN_RESERVED, MAX_CLIENTS, startHost, type Host, type HostOptions } from '../src/server/host.ts';
+import { WS_TICKET_TTL_MS, WS_TICKETS_PER_TOKEN, WsTickets } from '../src/server/secrets.ts';
 import { CANCEL_GRACE_MS } from '../src/server/state-store.ts';
 import { cleanupTmp, eventually, isAlive, readJson, TestClient, tmpDir, waitFor, writeExecutable, writeJson } from './helpers.ts';
 
@@ -191,6 +192,140 @@ describe('auth', () => {
     expect((await api('/api/config', { method: 'PUT', body: { config: adminBody.config, baseRev: adminBody.rev } })).status).toBe(403);
     expect((await api('/api/runs')).status).toBe(403);
     expect((await api('/api/runs', { token: admin })).status).toBe(200);
+  });
+});
+
+describe('WebSocket tickets: a browser never puts its token in a URL (QA: the admin token in a proxy log)', () => {
+  const bearer = (token: string) => ({ authorization: `Bearer ${token}` });
+  const post = (base: string, path: string, headers: Record<string, string> = {}) => fetch(base + path, { method: 'POST', headers });
+  const mint = async (base: string, token: string) => ((await (await post(base, '/api/ws-ticket', bearer(token))).json()) as WsTicket).ticket;
+
+  test('POST /api/ws-ticket (Bearer) → a ticket that opens one socket, with the role of the token that made it', async () => {
+    const { host, base, press, admin } = await setup();
+    const r = await post(base, '/api/ws-ticket', bearer(press));
+    expect(r.status).toBe(200);
+    expect(r.headers.get('cache-control')).toBe('no-store');
+    const t = (await r.json()) as WsTicket;
+    // 32 random bytes, base64url; valid 30 s.
+    expect(t).toEqual({ ticket: expect.stringMatching(/^[\w-]{43}$/), expiresInMs: 30_000 });
+    expect(WS_TICKET_TTL_MS).toBe(30_000);
+    const c = await TestClient.connect(`ws://127.0.0.1:${host.port}/ws?ticket=${t.ticket}`);
+    clients.push(c);
+    expect((await c.next('hello')).role).toBe('press');
+    // Used up.
+    expect(await rawUpgrade(host.port, `/ws?ticket=${t.ticket}`)).toStartWith('HTTP/1.1 401');
+    const a = await TestClient.connect(`ws://127.0.0.1:${host.port}/ws?ticket=${await mint(base, admin)}`);
+    clients.push(a);
+    expect((await a.next('hello')).role).toBe('admin');
+    // No ticket, not one, a token where the ticket goes; with a ticket in the URL a token is ignored.
+    for (const q of ['ticket=', 'ticket=nope', `ticket=${press}`, `ticket=${'x'.repeat(5000)}`, `ticket=nope&token=${admin}`])
+      expect(await rawUpgrade(host.port, `/ws?${q}`)).toStartWith('HTTP/1.1 401');
+    // Scripts and other non-browser clients keep ?token=.
+    expect(await rawUpgrade(host.port, `/ws?token=${press}`)).toStartWith('HTTP/1.1 101');
+  });
+
+  test('making one takes a token in the header (none in the URL); GET is 405', async () => {
+    const { base, press } = await setup();
+    for (const h of [{}, bearer('wrong'), { authorization: 'Bearer' }, { authorization: `Basic ${btoa(`x:${press}`)}` }]) {
+      const r = await post(base, '/api/ws-ticket', h);
+      expect(r.status).toBe(401);
+      expect(await r.json()).toEqual({ error: 'unauthorized' });
+    }
+    expect((await post(base, `/api/ws-ticket?token=${press}`)).status).toBe(401);
+    for (const path of ['/api/ws-ticket', '/api/ws-check']) {
+      const g = await fetch(base + path, { headers: bearer(press) });
+      expect(g.status).toBe(405);
+      expect(g.headers.get('allow')).toBe('POST');
+    }
+  });
+
+  test('a ticket is used up by the first request that shows it, whatever becomes of it (a proxy that logged it has nothing)', async () => {
+    const { host, base, press } = await setup(baseConfig(), { limits: { maxClients: 1, adminReserved: 0 } });
+    // A page the host turns away: 403, and the ticket is gone.
+    const refused = await mint(base, press);
+    expect(await rawUpgrade(host.port, `/ws?ticket=${refused}`, { Origin: 'http://evil.example' })).toStartWith('HTTP/1.1 403');
+    expect(await rawUpgrade(host.port, `/ws?ticket=${refused}`)).toStartWith('HTTP/1.1 401');
+    // A plain request (no upgrade): 426, gone.
+    const plain = await mint(base, press);
+    expect((await fetch(`${base}/ws?ticket=${plain}`)).status).toBe(426);
+    expect(await rawUpgrade(host.port, `/ws?ticket=${plain}`)).toStartWith('HTTP/1.1 401');
+    // A full host: 503, gone.
+    const c = await TestClient.connect(`ws://127.0.0.1:${host.port}/ws?ticket=${await mint(base, press)}`);
+    clients.push(c);
+    const full = await mint(base, press);
+    expect(await rawUpgrade(host.port, `/ws?ticket=${full}`)).toStartWith('HTTP/1.1 503');
+    c.close();
+    await eventually(async () => (await post(base, '/api/ws-check', bearer(press))).status === 204, 3000, 'room again');
+    expect(await rawUpgrade(host.port, `/ws?ticket=${full}`)).toStartWith('HTTP/1.1 401');
+  });
+
+  test('valid 30 s; at most 64 out per token, the oldest going first, so a press-token flood never touches admin tickets', async () => {
+    let now = 0;
+    const t = new WsTickets({ clock: () => now });
+    const a = t.mint('admin');
+    const p = t.mint('press');
+    expect(a.ticket).not.toBe(p.ticket);
+    expect(a).toEqual({ ticket: expect.stringMatching(/^[\w-]{43}$/), expiresInMs: WS_TICKET_TTL_MS });
+    now = WS_TICKET_TTL_MS - 1;
+    expect(t.redeem(p.ticket)).toBe('press');
+    expect(t.redeem(p.ticket)).toBeUndefined();
+    now = WS_TICKET_TTL_MS;
+    expect(t.redeem(a.ticket)).toBeUndefined(); // expired
+    expect(t.size).toBe(0);
+    const admins = Array.from({ length: 3 }, () => t.mint('admin').ticket);
+    const presses = Array.from({ length: WS_TICKETS_PER_TOKEN + 10 }, () => t.mint('press').ticket);
+    expect(new Set([...admins, ...presses]).size).toBe(admins.length + presses.length);
+    expect(t.size).toBe(3 + WS_TICKETS_PER_TOKEN);
+    for (const x of presses.slice(0, 10)) expect(t.redeem(x)).toBeUndefined();
+    expect(t.redeem(presses[10]!)).toBe('press');
+    expect(t.redeem(presses.at(-1)!)).toBe('press');
+    for (const x of admins) expect(t.redeem(x)).toBe('admin');
+    for (const junk of ['', 'x'.repeat(10_000), admins[0]!.toUpperCase()]) expect(t.redeem(junk)).toBeUndefined();
+    // Over a host: expired is a 401 like any wrong one.
+    const { host, base, press } = await setup(baseConfig(), { limits: { tickets: { ttlMs: 150 } } });
+    const late = await mint(base, press);
+    await Bun.sleep(300);
+    expect(await rawUpgrade(host.port, `/ws?ticket=${late}`)).toStartWith('HTTP/1.1 401');
+  });
+
+  test('POST /api/ws-check: what an upgrade from this page would get now, the token in a header — 204, 401, 403 (and why), 503', async () => {
+    const { host, base, press, admin } = await setup(baseConfig(), { limits: { maxClients: 2, adminReserved: 1 } });
+    const check = (h: Record<string, string>) => post(base, '/api/ws-check', h);
+    const ok = await check(bearer(press));
+    expect(ok.status).toBe(204);
+    expect(ok.headers.get('cache-control')).toBe('no-store');
+    expect(await ok.text()).toBe('');
+    expect((await check({})).status).toBe(401);
+    expect((await check(bearer('wrong'))).status).toBe(401);
+    // The one press slot taken: full for press (the same 503 the upgrade gets), still room for an admin.
+    const c = await TestClient.connect(`ws://127.0.0.1:${host.port}/ws?ticket=${await mint(base, press)}`);
+    clients.push(c);
+    const full = await check(bearer(press));
+    expect(full.status).toBe(503);
+    expect(await full.json()).toEqual({ error: 'host full', reason: 'too many connections' });
+    expect(await rawUpgrade(host.port, `/ws?token=${press}`)).toStartWith('HTTP/1.1 503');
+    expect((await check(bearer(admin))).status).toBe(204);
+  });
+
+  test('a refused origin hears why: the same 403 body from /ws, its ticket and its probe (origin first, as /ws); allowOrigin only when a flag can allow it', async () => {
+    const { base, press } = await setup();
+    const want = (origin: string, allowOrigin?: string): OriginRefusal => ({ error: 'cross-origin WebSocket refused', origin, ...(allowOrigin ? { allowOrigin } : {}) });
+    for (const [method, path] of [
+      ['GET', `/ws?token=${press}`],
+      ['POST', '/api/ws-ticket'],
+      ['POST', '/api/ws-check'],
+    ] as const) {
+      const at = (origin: string, token = press) => fetch(base + path, { method, headers: { ...bearer(token), origin } });
+      const r = await at('https://preview.example:443');
+      expect(r.status).toBe(403);
+      expect(await r.json()).toEqual(want('https://preview.example:443', 'https://preview.example'));
+      expect(await (await at('null')).json()).toEqual(want('null'));
+      expect((await at('http://evil.example', 'wrong')).status).toBe(403);
+      // Its own pages are fine.
+      expect((await at(base)).status).not.toBe(403);
+    }
+    const pair = await fetch(`${base}/api/pair`, { method: 'POST', headers: { origin: 'http://evil.example', 'content-type': 'application/json' }, body: '{"code":"123456"}' });
+    expect(await pair.json()).toEqual({ error: 'cross-origin request refused', origin: 'http://evil.example', allowOrigin: 'http://evil.example' });
   });
 });
 

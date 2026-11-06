@@ -501,7 +501,9 @@ export async function startHost(opts: HostOptions): Promise<Host> {
           if (!isRecord(b) || (typeof b.code !== 'string' && typeof b.code !== 'number')) return json({ error: 'body must be {"code": "123456"}' }, 400);
           const r = pairing.redeem(String(b.code), addressOf(server, req));
           if (r.ok) return json({ token: r.role === 'admin' ? sec.secrets.adminToken : sec.secrets.pressToken, role: r.role } satisfies PairResponse);
-          if (r.why === 'limited') return json({ error: 'too many attempts: wait a minute, then try again' }, 429, { 'retry-after': String(r.retryAfterSec) });
+          // The words say what Retry-After says (QA: "wait a minute" next to Retry-After: 7).
+          if (r.why === 'limited')
+            return json({ error: `too many attempts: try again in ${r.retryAfterSec} s` }, 429, { 'retry-after': String(r.retryAfterSec) });
           return json({ error: 'wrong or expired code' }, 401);
         },
       },
