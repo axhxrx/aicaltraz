@@ -11,7 +11,8 @@
  * device (draft-store.ts) until saved or discarded.
  */
 import './edit.css';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import type { RefObject } from 'preact';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { buttonKey, findButton, parseConfig, type Button, type Config } from '../../core/config.ts';
 import type { WireConfig } from '../../core/protocol.ts';
 import type { Backend } from '../backend/types.ts';
@@ -20,16 +21,17 @@ import { useStore } from '../lib/store.ts';
 import { Close, Warn } from '../ui/icons.tsx';
 import { ButtonPanel, type Tab } from './ButtonPanel.tsx';
 import { Canvas } from './Canvas.tsx';
-import { BrokenFileDialog, ConflictDialog, MergeDialog, RestoreDialog, StopDialog } from './dialogs.tsx';
+import { BrokenFileDialog, ConflictDialog, MergeDialog, ran, RestoreDialog, StopDialog, type StopRun } from './dialogs.tsx';
 import { clearDraft, DraftKeeper, draftScope, loadDraft, unsavedEdits, type StoredDraft } from './draft-store.ts';
 import { Editor, stable } from './editor.ts';
 import { Dialog, typingIn } from './fields.tsx';
-import { Plus, Redo, Sliders, Undo } from './icons.tsx';
+import { Plus, Redo, Sliders, Timer, Undo } from './icons.tsx';
 import { merge3, type Conflict, type MergeResult, type Side } from './merge.ts';
 import { PadPanel } from './PadPanel.tsx';
 import type { RunAsk } from './RunLog.tsx';
 import { nameOf, rectOf, refusal, same } from './ops.ts';
 import { buttonFieldErrors, describe, padFieldErrors, toProblems, type Problem } from './problems.ts';
+import { secs } from './time.ts';
 
 export interface EditModeProps {
   backend: Backend;
@@ -51,6 +53,65 @@ function useMedia(q: string): boolean {
     return () => mq.removeEventListener('change', f);
   }, [q]);
   return m;
+}
+
+/**
+ * Phones: typing in the editor with the on-screen keyboard up, i.e. a text field in the panel has
+ * the focus and the visual viewport got short (the keyboard takes ~45% of it). The editor then
+ * gives the panel the whole height. `vv`: the keyboard shrank only the visual viewport (iOS, Android
+ * by default), not the layout one: the editor follows the visible part.
+ */
+function useKeyboard(enabled: boolean, root: RefObject<HTMLDivElement | null>): { up: boolean; vv: { top: number; height: number } | null } {
+  const [kb, setKb] = useState<{ up: boolean; vv: { top: number; height: number } | null }>({ up: false, vv: null });
+  useEffect(() => {
+    if (!enabled) return void setKb({ up: false, vv: null });
+    const vv = window.visualViewport;
+    let width = innerWidth;
+    let tall = Math.max(innerHeight, vv?.height ?? 0);
+    let raf = 0;
+    const check = () => {
+      cancelAnimationFrame(raf);
+      // After focus has moved on (focusout comes first) and the viewport has its new size.
+      raf = requestAnimationFrame(() => {
+        const h = vv?.height ?? innerHeight;
+        if (innerWidth !== width) ((width = innerWidth), (tall = Math.max(innerHeight, h)));
+        else tall = Math.max(tall, innerHeight, h);
+        const t = document.activeElement;
+        const typing = typingIn(t) && !!root.current?.querySelector('.ed-panel')?.contains(t);
+        const up = typing && (h < tall * 0.75 || h < 420);
+        const visualOnly = up && !!vv && innerHeight - vv.height > 40;
+        setKb((o) => {
+          const next = { up, vv: visualOnly ? { top: Math.round(vv!.offsetTop), height: Math.round(vv!.height) } : null };
+          return o.up === next.up && o.vv?.top === next.vv?.top && o.vv?.height === next.vv?.height ? o : next;
+        });
+      });
+    };
+    vv?.addEventListener('resize', check);
+    vv?.addEventListener('scroll', check);
+    addEventListener('resize', check);
+    document.addEventListener('focusin', check);
+    document.addEventListener('focusout', check);
+    check();
+    return () => {
+      cancelAnimationFrame(raf);
+      vv?.removeEventListener('resize', check);
+      vv?.removeEventListener('scroll', check);
+      removeEventListener('resize', check);
+      document.removeEventListener('focusin', check);
+      document.removeEventListener('focusout', check);
+    };
+  }, [enabled]);
+  return kb;
+}
+
+/** Scrolls `el` into the upper part of its scroller (the hint under it in view too); only that scroller moves. */
+function reveal(el: Element | null) {
+  const sc = el?.closest<HTMLElement>('[data-scroll]');
+  if (!el || !sc) return;
+  const er = el.getBoundingClientRect();
+  const sr = sc.getBoundingClientRect();
+  if (er.top >= sr.top + 8 && er.bottom <= sr.bottom - 8) return;
+  sc.scrollTop += er.top - sr.top - Math.max(8, Math.min(sr.height / 4, sr.height - er.height - 8));
 }
 
 /** Admins get the full config; a redacted one (cached layout) has no actions to edit. */
@@ -100,7 +161,7 @@ interface SaveOpts {
   then?(): void;
   retried?: boolean;
 }
-type Ask = { kind: 'stop'; runs: { name: string; ms: number }[]; go(): void } | { kind: 'broken'; errors: string[]; go(): void };
+type Ask = { kind: 'stop'; runs: StopRun[]; go(): void } | { kind: 'broken'; errors: string[]; go(): void };
 interface Merging {
   theirs: Config;
   rev: string;
@@ -125,7 +186,10 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const hostConfig = useStore(backend.snapshot, (s) => s.config) as Config;
   const fileErrors = useStore(backend.snapshot, (s) => s.configErrors);
   const states = useStore(backend.snapshot, (s) => s.states);
+  const clockSkew = useStore(backend.snapshot, (s) => s.clockSkew);
   const wide = useMedia(WIDE);
+  const root = useRef<HTMLDivElement>(null);
+  const kb = useKeyboard(!wide, root);
 
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetFull, setSheetFull] = useState(false);
@@ -393,7 +457,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     if (pr.pad !== ed.state.view.pad) ed.showPad(pr.pad);
     if (pr.button !== null) {
       ed.select(pr.button);
-      setTab(pr.field?.startsWith('action') || pr.field?.startsWith('stops') ? 'action' : 'button');
+      setTab(pr.field?.startsWith('action') || pr.field?.startsWith('stops') || pr.field === 'group' ? 'action' : 'button');
       setSheetOpen(true);
     } else {
       ed.select(null);
@@ -415,13 +479,16 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   /** Running buttons this config would end: deleted, or their pad's or their own id changed. */
   const wouldStop = (next: Config) => {
     const s = backend.snapshot.get();
-    const out: { name: string; ms: number }[] = [];
+    const out: StopRun[] = [];
     for (const [key, rs] of Object.entries(s.states)) {
       if (rs.phase !== 'running') continue;
       const [p, b] = key.split('/') as [string, string];
-      if (findButton(next, p, b)) continue;
       const hb = s.config && findButton(s.config as Config, p, b);
-      out.push({ name: hb ? nameOf(hb) : b, ms: wall() - (rs.startedAt + s.clockSkew) });
+      const nb = findButton(next, p, b);
+      const ms = wall() - (rs.startedAt + s.clockSkew);
+      // A new time limit applies to the run going on: one shorter than it has run stops it at once.
+      if (nb && !(hb && nb.timeoutMs !== hb.timeoutMs && nb.timeoutMs <= ms)) continue;
+      out.push({ name: hb ? nameOf(hb) : b, ms, ...(nb ? { limit: nb.timeoutMs } : {}) });
     }
     return out;
   };
@@ -498,7 +565,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
     if (again) return save({ ...o, retried: true });
     if (ok) {
-      say(warned ? `Saved, with ${warned} warning${warned === 1 ? '' : 's'} from the host` : 'Saved: live on every device now');
+      // With warnings, their notice says "Saved, but…": a toast on top of it would only hide it.
+      if (!warned) say('Saved: live on every device now');
       o.then?.();
     }
     return ok;
@@ -676,6 +744,78 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     return out;
   }, [pad, states, st.base]);
 
+  /**
+   * Running buttons (any pad) whose time limit the draft changes: saving applies it to the run in
+   * progress too (unless the save stops the run: its id or its pad's changed).
+   */
+  const liveTimeouts = useMemo(() => {
+    const out: { name: string; ms: number; startedAt: number }[] = [];
+    for (const dp of draft.pads) {
+      const bp = ed.baseOf(dp);
+      if (!bp || bp.id !== dp.id) continue;
+      for (const b of dp.buttons) {
+        const bb = ed.baseOf(b, dp);
+        const rs = bb && bb.id === b.id && bb.timeoutMs !== b.timeoutMs ? states[buttonKey(bp.id, bb.id)] : undefined;
+        if (rs?.phase === 'running') out.push({ name: nameOf(b), ms: b.timeoutMs, startedAt: rs.startedAt });
+      }
+    }
+    return out;
+  }, [draft, states, st.base]);
+  // How long they have run, kept roughly current (a shorter limit than that stops the run at once).
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!liveTimeouts.length) return;
+    const t = setInterval(() => tick((n) => n + 1), 5000);
+    return () => clearInterval(t);
+  }, [liveTimeouts.length > 0]);
+  const live = liveTimeouts.map((t) => ({ ...t, ran: wall() - (t.startedAt + clockSkew) }));
+  const liveStops = live.filter((t) => t.ms <= t.ran);
+
+  const tabs = useRef<HTMLDivElement>(null);
+  const body = useRef<HTMLDivElement>(null);
+  const noticeBox = useRef<HTMLDivElement>(null);
+  // Toasts go under the notices (never over a notice's header or its ✕): their height, as a CSS variable.
+  useEffect(() => {
+    const box = noticeBox.current;
+    if (!box || typeof ResizeObserver !== 'function') return;
+    const ro = new ResizeObserver(() => body.current?.style.setProperty('--ed-notices-h', `${Math.round(box.getBoundingClientRect().height)}px`));
+    ro.observe(box);
+    return () => ro.disconnect();
+  }, []);
+  // The pad tabs scroll sideways when they don't fit: the selected one stays in view, the edges fade where there is more.
+  useLayoutEffect(() => {
+    const sc = tabs.current;
+    if (!sc) return;
+    const edges = () => {
+      sc.toggleAttribute('data-more-left', sc.scrollLeft > 1);
+      sc.toggleAttribute('data-more-right', sc.scrollLeft + sc.clientWidth < sc.scrollWidth - 1);
+    };
+    const show = () => {
+      const t = sc.querySelector<HTMLElement>('[aria-selected="true"]');
+      if (t) {
+        // A bit of the neighbours shows (there's more); after the last tab, all of "+".
+        const next = t.nextElementSibling as HTMLElement | null;
+        const margin = 28;
+        const left = t.offsetLeft - sc.offsetLeft;
+        const right = next && !next.matches('[role=tab]') ? next.offsetLeft - sc.offsetLeft + next.offsetWidth : left + t.offsetWidth + margin;
+        if (left - margin < sc.scrollLeft) sc.scrollLeft = Math.max(0, left - margin);
+        else if (right > sc.scrollLeft + sc.clientWidth) sc.scrollLeft = Math.min(left - (left > 0 ? 12 : 0), right - sc.clientWidth);
+      }
+      edges();
+    };
+    show();
+    const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(show) : null;
+    ro?.observe(sc);
+    sc.addEventListener('scroll', edges, { passive: true });
+    return () => (ro?.disconnect(), sc.removeEventListener('scroll', edges));
+  }, [pi, draft.pads.length, wide, dirty]);
+  // The keyboard came up (or went): the field being typed in goes where it can be seen. Whatever the
+  // browser scrolled to show it (the editor's own frame, which never scrolls) goes back.
+  useLayoutEffect(() => {
+    for (let n: HTMLElement | null = root.current; n; n = n.parentElement) if (n.scrollTop) n.scrollTop = 0;
+    if (kb.up) reveal(document.activeElement);
+  }, [kb.up, kb.vv?.height]);
+
   const panel: 'button' | 'pad' | null = button ? 'button' : padOpen || wide ? 'pad' : null;
   const showPanel = panel !== null && (wide || sheetOpen);
   const sheet = wide ? null : { full: sheetFull, onToggle: () => setSheetFull((f) => !f) };
@@ -686,12 +826,25 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     saving: 'Saving…',
     problems: `${problems.length} problem${problems.length === 1 ? '' : 's'}`,
     dirty: wide ? 'Unsaved changes' : 'Unsaved',
-    clean: 'All saved',
+    clean: wide ? 'All saved' : 'Saved',
   }[state];
   const overlap = preview?.conflicts.length ?? 0;
 
   const notices = (
     <>
+      {live.length > 0 && (
+        <div class={`ed-notice ${liveStops.length ? 'is-warn' : 'is-info'}`} role="status" data-testid="notice-live-timeout">
+          <Timer />
+          <span>
+            <b>Applies to the run in progress too:</b>{' '}
+            {live.length === 1
+              ? live[0]!.ms <= live[0]!.ran
+                ? `${live[0]!.name} has run ${ran(live[0]!.ran)} already: saving a ${secs(live[0]!.ms)} limit stops it.`
+                : `once saved, ${live[0]!.name} has a ${secs(live[0]!.ms)} time limit (it has run ${ran(live[0]!.ran)}).`
+              : `once saved, the time limits of ${live.map((t, i) => `${i === 0 ? '' : i === live.length - 1 ? ' and ' : ', '}${t.name} (${secs(t.ms)})`).join('')}${liveStops.length ? `: ${liveStops.length === live.length ? 'they have' : `${liveStops.map((t) => t.name).join(' and ')} ${liveStops.length === 1 ? 'has' : 'have'}`} run longer than that already, saving stops ${liveStops.length === 1 ? 'it' : 'them'}` : ''}.`}
+          </span>
+        </div>
+      )}
       {status !== 'online' && (
         <div class="ed-notice is-warn" role="status" data-testid="notice-offline">
           <Warn />
@@ -825,7 +978,17 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   );
 
   return (
-    <div class="bp-edit" data-testid="edit-mode" data-layout={wide ? 'wide' : 'narrow'} data-dirty={dirty ? '' : undefined} data-sheet={!wide && showPanel ? (sheetFull ? 'full' : 'half') : undefined}>
+    <div
+      ref={root}
+      class="bp-edit"
+      data-testid="edit-mode"
+      data-layout={wide ? 'wide' : 'narrow'}
+      data-dirty={dirty ? '' : undefined}
+      data-sheet={!wide && showPanel ? (sheetFull || kb.up ? 'full' : 'half') : undefined}
+      data-kbd={kb.up && showPanel ? '' : undefined}
+      data-vv={kb.up && showPanel && kb.vv ? '' : undefined}
+      style={kb.vv ? { '--ed-vvtop': `${kb.vv.top}px`, '--ed-vvh': `${kb.vv.height}px` } : undefined}
+    >
       <header class="ed-head">
         <button type="button" class="ed-icon ed-exit" aria-label="Close the editor" title="Back to the pad" data-testid="edit-close" onClick={exit}>
           <Close />
@@ -852,7 +1015,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           )}
         </div>
         <nav class="ed-pads" aria-label="Pads">
-          <div class="ed-pads-scroll" role="tablist" data-scroll-x>
+          <div class="ed-pads-scroll" ref={tabs} role="tablist" data-scroll-x>
             {draft.pads.map((x, i) => (
               <button
                 key={i}
@@ -867,10 +1030,11 @@ function Session({ backend, padId, onExit }: EditModeProps) {
                 {padsBad.has(i) && <i class="ed-tab-bad" aria-label="has problems" />}
               </button>
             ))}
+            {/* After the last tab (it scrolls with them): the tabs get the room. */}
+            <button type="button" class="ed-icon ed-padbtn" aria-label="Add a pad" title="Add a pad" data-testid="edit-add-pad" onClick={() => (ed.addPad(), showPadSettings())}>
+              <Plus />
+            </button>
           </div>
-          <button type="button" class="ed-icon ed-padbtn" aria-label="Add a pad" title="Add a pad" data-testid="edit-add-pad" onClick={() => (ed.addPad(), showPadSettings())}>
-            <Plus />
-          </button>
           <button type="button" class="ed-icon ed-padbtn" aria-label="Pad settings" title="Pad settings" data-testid="edit-pad-settings" aria-pressed={panel === 'pad' && showPanel} onClick={showPadSettings}>
             <Sliders />
           </button>
@@ -891,9 +1055,11 @@ function Session({ backend, padId, onExit }: EditModeProps) {
         </div>
       </header>
 
-      <div class="ed-body">
+      <div class="ed-body" ref={body}>
         <div class="ed-stage">
-          {notices}
+          <div class="ed-notices" ref={noticeBox} data-scroll>
+            {notices}
+          </div>
           <Canvas
             ed={ed}
             pad={pad}

@@ -12,8 +12,9 @@ import { ButtonFace } from '../run/ButtonFace.tsx';
 import { cellStyle, PadGrid } from '../run/RunPad.tsx';
 import type { Flash } from './EditMode.tsx';
 import type { Editor } from './editor.ts';
-import { Plus, Resize } from './icons.tsx';
+import { GroupIcon, Plus, Resize } from './icons.tsx';
 import { fits, occupant, rectOf, refusal, sameRect, type Fit, type Rect } from './ops.ts';
+import { groupOf } from './StopsEditor.tsx';
 
 /** Grid geometry in client px, measured when a gesture starts. */
 interface Geo {
@@ -211,6 +212,7 @@ export function Canvas({ ed, pad, sel, bad, warned, running, flash, onOpen, onDe
     const r = d ? d.cand : b;
     const flashing = !!flash?.ixs.includes(i);
     const refused = d && !d.fit.ok ? (d.fit.reason as string) : flashing && flash!.kind === 'refused' ? 'flash' : undefined;
+    const group = groupOf(b);
     kids.push(
       <div
         key={`b${i}`}
@@ -229,7 +231,7 @@ export function Canvas({ ed, pad, sel, bad, warned, running, flash, onOpen, onDe
         tabIndex={0}
         role="button"
         aria-pressed={sel === i}
-        aria-label={`${b.label || b.id}: ${b.w}×${b.h} at column ${b.x + 1}, row ${b.y + 1}${running.has(i) ? ', running on the host' : ''}`}
+        aria-label={`${b.label || b.id}: ${b.w}×${b.h} at column ${b.x + 1}, row ${b.y + 1}${group ? `, in group ${group}` : ''}${running.has(i) ? ', running on the host' : ''}`}
         onFocus={() => sel !== i && !g.current && ed.select(i)}
         onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), onOpen(i))}
       >
@@ -246,10 +248,20 @@ export function Canvas({ ed, pad, sel, bad, warned, running, flash, onOpen, onDe
             </div>
           )
         )}
-        {running.has(i) && (
-          <div class="ed-running" data-testid="running-badge" aria-hidden="true">
-            <i />
-            Running
+        {(running.has(i) || group) && (
+          <div class="ed-tags" aria-hidden="true">
+            {running.has(i) && (
+              <span class="ed-running" data-testid="running-badge">
+                <i />
+                <span class="ed-running-text">Running</span>
+              </span>
+            )}
+            {group && (
+              <span class="ed-group" data-testid="group-tag" title={`Group “${group}”: starting one of its buttons stops the others`}>
+                <GroupIcon />
+                <span>{group}</span>
+              </span>
+            )}
           </div>
         )}
         {d && !d.settling && !d.fit.ok && <div class="ed-refuse">{cap(refusal(d.fit, pad))}</div>}
@@ -264,7 +276,20 @@ export function Canvas({ ed, pad, sel, bad, warned, running, flash, onOpen, onDe
   });
 
   return (
-    <div class="ed-canvas" ref={root} data-testid="edit-canvas" data-dragging={drag && !drag.settling ? '' : undefined} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={cancel} onLostPointerCapture={cancel}>
+    <div
+      class="ed-canvas"
+      ref={root}
+      data-testid="edit-canvas"
+      data-dragging={drag && !drag.settling ? '' : undefined}
+      onPointerDown={down}
+      onPointerMove={move}
+      onPointerUp={up}
+      onPointerCancel={cancel}
+      onLostPointerCapture={cancel}
+      // Taps are handled as pointer events. The click a browser makes up after a touch would land on
+      // whatever just opened under the finger: the editor sheet's grab handle, or its Delete button.
+      onTouchEnd={(e) => e.cancelable && e.preventDefault()}
+    >
       <PadGrid pad={pad}>{kids}</PadGrid>
       {pad.buttons.length === 0 && <div class="ed-empty-hint">{emptyHint}</div>}
     </div>

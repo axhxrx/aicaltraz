@@ -7,6 +7,7 @@ import { keyName } from '../run/view.ts';
 import { Close } from '../ui/icons.tsx';
 import { ChevronDown, ChevronUp, Plus } from './icons.tsx';
 import { PALETTE } from './ops.ts';
+import { fmtSeconds, parseDuration } from './time.ts';
 
 export const typingIn = (t: EventTarget | null) =>
   t instanceof Element && !!t.closest('input:not([type=checkbox]):not([type=radio]):not([type=color]), textarea, select, [contenteditable]');
@@ -20,8 +21,8 @@ export function Section(p: { title: string; children: ComponentChildren }) {
   );
 }
 
-/** Label + control + hint/error. `for` links the label to a single input. */
-export function Field(p: { label: string; for?: string; hint?: ComponentChildren; error?: string; testid?: string; children: ComponentChildren }) {
+/** Label + control + hint/error. `for` links the label to a single input. `warn`: a non-blocking warning, under the hint. */
+export function Field(p: { label: string; for?: string; hint?: ComponentChildren; error?: string; warn?: ComponentChildren; testid?: string; children: ComponentChildren }) {
   return (
     <div class={`ed-field${p.error ? ' is-bad' : ''}`}>
       {p.for ? (
@@ -39,7 +40,53 @@ export function Field(p: { label: string; for?: string; hint?: ComponentChildren
       ) : (
         p.hint && <span class="ed-hint">{p.hint}</span>
       )}
+      {!p.error && p.warn}
     </div>
+  );
+}
+
+/** Whitespace at the ends of `s`, if any. */
+export function edgeSpace(s: string): 'start' | 'end' | 'both' | null {
+  const a = /^\s/.test(s);
+  const z = /\s$/.test(s);
+  return a && z ? 'both' : a ? 'start' : z ? 'end' : null;
+}
+
+const WS: Record<string, string> = { '\t': '⇥', '\n': '↵', '\r': '↵' };
+const visible = (ws: string) =>
+  ws && (
+    <span class="ed-ws" title={`${ws.length} blank character${ws.length === 1 ? '' : 's'}`}>
+      {[...ws].map((c) => WS[c] ?? '␣').join('')}
+    </span>
+  );
+
+/** `text` exactly, in quotes, the blanks at its ends shown (␣): what a program really gets. */
+export function Exact({ text }: { text: string }) {
+  const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(text)!;
+  return (
+    <span class="ed-exact" data-selectable>
+      “{visible(m[1]!)}
+      {m[2]}
+      {visible(m[3]!)}”
+    </span>
+  );
+}
+
+/**
+ * A value that starts or ends with a blank (a phone keyboard adds a space after a word): said, with
+ * the value as the program gets it, and a way to remove them.
+ */
+export function SpaceNote(p: { value: string; what: string; onTrim(): void; testid: string }) {
+  const e = edgeSpace(p.value);
+  if (!e) return null;
+  const where = e === 'both' ? 'Starts and ends' : e === 'start' ? 'Starts' : 'Ends';
+  return (
+    <span class="ed-warn-note" data-testid={p.testid}>
+      {where} with a space: {p.what} gets <Exact text={p.value} />, space included.{' '}
+      <button type="button" class="ed-link is-inline" data-testid={`${p.testid}-trim`} onClick={p.onTrim}>
+        Remove {e === 'both' ? 'them' : 'it'}
+      </button>
+    </span>
   );
 }
 
@@ -55,11 +102,15 @@ interface InputProps {
   invalid?: boolean;
   testid?: string;
   maxLength?: number;
+  /** A <datalist> of suggestions. */
+  list?: string;
 }
 
-export function TextInput({ value, onValue, mono, invalid, testid, ...rest }: InputProps) {
+export function TextInput({ value, onValue, mono, invalid, testid, list, ...rest }: InputProps) {
   return (
     <input
+      type="text"
+      list={list}
       class={`ed-input${mono ? ' is-mono' : ''}`}
       value={value}
       onInput={(e) => onValue(e.currentTarget.value)}
@@ -137,6 +188,51 @@ export function NumberInput(p: { id?: string; value: number; onValue(n: number):
   );
 }
 
+/**
+ * A duration, stored in ms, typed in seconds ("10" is 10 s; "2,5", "500 ms", "2 min" work too). Like
+ * NumberInput: what's typed stays as typed, every parseable value goes to the draft, junk reverts
+ * on blur; arrow keys step by `step` ms within `min`..`max` (Shift: ×10).
+ */
+export function DurationInput(p: { id?: string; value: number; onValue(ms: number): void; invalid?: boolean; testid?: string; step: number; min: number; max: number }) {
+  const [text, setText] = useState(fmtSeconds(p.value));
+  useEffect(() => {
+    if (parseDuration(text) !== p.value || text.trim() === '') setText(fmtSeconds(p.value));
+  }, [p.value]);
+  return (
+    <div class="ed-num">
+      <input
+        id={p.id}
+        class="ed-input is-num"
+        inputMode="decimal"
+        value={text}
+        aria-invalid={p.invalid || undefined}
+        aria-describedby={p.id && `${p.id}-unit`}
+        data-testid={p.testid}
+        autocomplete="off"
+        enterKeyHint="done"
+        onInput={(e) => {
+          const t = e.currentTarget.value;
+          setText(t);
+          const ms = parseDuration(t);
+          if (ms !== null) p.onValue(ms);
+        }}
+        onBlur={() => setText(fmtSeconds(p.value))}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur();
+          if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            const n = p.value + (e.key === 'ArrowUp' ? 1 : -1) * p.step * (e.shiftKey ? 10 : 1);
+            p.onValue(Math.min(p.max, Math.max(p.min, n)));
+          }
+        }}
+      />
+      <span class="ed-unit" id={p.id && `${p.id}-unit`} aria-label="seconds">
+        s
+      </span>
+    </div>
+  );
+}
+
 export interface Option<T extends string> {
   value: T;
   label: string;
@@ -202,15 +298,22 @@ export function Stepper(p: { value: number; min: number; max: number; onChange(v
   );
 }
 
-const MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'Fn', 'FnLock', 'Hyper', 'Super', 'OS', 'Tab', 'Unidentified', 'Dead', 'Process']);
+/** Keys that only modify others (or lock): never a binding of their own. */
+export const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'CapsLock', 'Fn', 'FnLock', 'Hyper', 'Super', 'OS', 'Symbol', 'SymbolLock', 'NumLock', 'ScrollLock']);
+/** Not keys a remote sends: focus moves (Tab), composition and unknown keys. Passed on. */
+const NOT_KEYS = new Set(['Tab', 'Unidentified', 'Dead', 'Process']);
 const KEY_WORDS: Record<string, string> = { ' ': 'Space', Enter: 'Enter', ArrowUp: 'Arrow up', ArrowDown: 'Arrow down', ArrowLeft: 'Arrow left', ArrowRight: 'Arrow right' };
+const MODIFIER_HELP = "modifier keys can't be bound — press a key like F1, Space, VolumeUp";
 
 /**
  * "Press a key to bind": captures the next keydown (Esc cancels), before any other handler sees it.
- * Shortcuts (⌘/Ctrl/Alt + key, e.g. ⌘S to save) pass through: a remote doesn't send those.
+ * Shortcuts (⌘/Ctrl/Alt + key, e.g. ⌘S to save) pass through: a remote doesn't send those. A
+ * modifier pressed and let go on its own is refused, saying so; listening goes on.
  */
 export function KeyCapture(p: { value: string | undefined; onChange(k: string | undefined): void; conflict?: ComponentChildren; testid: string }) {
   const [listening, setListening] = useState(false);
+  /** The modifier just pressed alone while listening. */
+  const [refused, setRefused] = useState<string | null>(null);
   const btn = useRef<HTMLButtonElement>(null);
   const onChange = useRef(p.onChange);
   onChange.current = p.onChange;
@@ -218,25 +321,42 @@ export function KeyCapture(p: { value: string | undefined; onChange(k: string | 
   const stop = useRef<(() => void) | null>(null);
   // Listeners go on in the click itself (not an effect after paint), so even an instant key lands.
   const start = () => {
+    /** A modifier is down and nothing else was pressed since. */
+    let alone: string | null = null;
     const key = (e: KeyboardEvent) => {
-      if (MODIFIERS.has(e.key)) return;
+      if (NOT_KEYS.has(e.key)) return;
+      if (MODIFIER_KEYS.has(e.key)) {
+        alone = e.key;
+        return;
+      }
+      alone = null;
       if ((e.metaKey || e.ctrlKey || e.altKey) && !e.getModifierState?.('AltGraph')) return;
       e.preventDefault();
       e.stopImmediatePropagation();
       if (e.key !== 'Escape') onChange.current(e.key.length === 1 ? e.key.toLowerCase() : e.key);
       end();
     };
+    const up = (e: KeyboardEvent) => {
+      if (alone === null || e.key !== alone) return;
+      alone = null;
+      e.preventDefault();
+      setRefused(e.key);
+    };
     // Safari doesn't focus buttons on click, so blur alone can't end listening.
     const away = (e: PointerEvent) => !btn.current?.contains(e.target as Node) && end();
     const end = () => {
       window.removeEventListener('keydown', key, true);
+      window.removeEventListener('keyup', up, true);
       window.removeEventListener('pointerdown', away, true);
       stop.current = null;
       setListening(false);
+      setRefused(null);
     };
     window.addEventListener('keydown', key, true);
+    window.addEventListener('keyup', up, true);
     window.addEventListener('pointerdown', away, true);
     stop.current = end;
+    setRefused(null);
     setListening(true);
   };
   useEffect(() => () => stop.current?.(), []);
@@ -268,6 +388,16 @@ export function KeyCapture(p: { value: string | undefined; onChange(k: string | 
         <button type="button" class="ed-icon" aria-label="Remove key" data-testid={`${p.testid}-clear`} onClick={() => p.onChange(undefined)}>
           <Close />
         </button>
+      )}
+      {listening && refused && (
+        <span class="ed-warn-note" role="alert" data-testid={`${p.testid}-refused`}>
+          That was {refused} alone: {MODIFIER_HELP}.
+        </span>
+      )}
+      {!listening && v !== undefined && MODIFIER_KEYS.has(v) && (
+        <span class="ed-warn-note" data-testid={`${p.testid}-modifier`}>
+          “{v}” is a modifier key: {MODIFIER_HELP}.
+        </span>
       )}
       {p.conflict && (
         <span class="ed-warn-note" data-testid={`${p.testid}-conflict`}>
@@ -400,6 +530,7 @@ export function ListEditor(p: { items: string[]; onChange(items: string[], field
               Empty: the program gets an empty argument here. Remove it if that's not what you want.
             </span>
           )}
+          {editing !== i && <SpaceNote value={v} what="the program" testid={`${p.testid}-${i}-space`} onTrim={() => set(i, v.trim())} />}
         </div>
       ))}
       <button type="button" class="ed-add" data-testid={`${p.testid}-add`} onClick={() => (p.onChange([...p.items, '']), setFocus(p.items.length))}>
@@ -412,6 +543,7 @@ export function ListEditor(p: { items: string[]; onChange(items: string[], field
 function EnvRow(p: { name: string; value: string; error?: string; taken: (k: string) => boolean; onRename(k: string): void; onValue(v: string): void; onRemove(): void; i: number }) {
   const [name, setName] = useState(p.name);
   const editing = useRef(false);
+  const [editingValue, setEditingValue] = useState(false);
   useEffect(() => {
     if (!editing.current) setName(p.name);
   }, [p.name]);
@@ -436,7 +568,16 @@ function EnvRow(p: { name: string; value: string; error?: string; taken: (k: str
           }}
         />
         <span class="ed-env-eq">=</span>
-        <TextInput value={p.value} mono aria-label={`Value of ${p.name}`} placeholder="value" testid={`env-value-${p.i}`} onValue={p.onValue} />
+        <TextInput
+          value={p.value}
+          mono
+          aria-label={`Value of ${p.name}`}
+          placeholder="value"
+          testid={`env-value-${p.i}`}
+          onValue={p.onValue}
+          onFocus={() => setEditingValue(true)}
+          onBlur={() => setEditingValue(false)}
+        />
         <button type="button" class="ed-icon" aria-label={`Remove ${p.name}`} onClick={p.onRemove} data-testid={`env-remove-${p.i}`}>
           <Close />
         </button>
@@ -446,6 +587,7 @@ function EnvRow(p: { name: string; value: string; error?: string; taken: (k: str
           {err}
         </span>
       )}
+      {!editingValue && <SpaceNote value={p.value} what={`$${p.name}`} testid={`env-space-${p.i}`} onTrim={() => p.onValue(p.value.trim())} />}
     </div>
   );
 }

@@ -7,27 +7,34 @@ import { toRGB } from '../lib/color.ts';
 import { matchKey } from '../run/RunPad.tsx';
 import { Close, DoubleTap, Hold, Tap } from '../ui/icons.tsx';
 import type { Editor } from './editor.ts';
-import { ColorPicker, EnvEditor, Field, KeyCapture, ListEditor, NumberInput, Section, Segmented, SwitchRow, TextArea, TextInput } from './fields.tsx';
+import { ColorPicker, DurationInput, EnvEditor, Field, KeyCapture, ListEditor, NumberInput, Section, Segmented, SwitchRow, TextArea, TextInput } from './fields.tsx';
 import { Copy, Trash } from './icons.tsx';
 import { isPlaceholder, nameOf, stateLookalike } from './ops.ts';
 import { fieldName } from './problems.ts';
 import { RunLog, type RunAsk } from './RunLog.tsx';
-import { StopsEditor } from './StopsEditor.tsx';
+import { GroupField, groupMates, StopsEditor } from './StopsEditor.tsx';
+import { secs } from './time.ts';
 
 export type Tab = 'button' | 'action' | 'runs';
 
-/** "400 ms", "2.5 s", "1.5 min", "2 h". */
-export const secs = (ms: number) =>
-  ms >= 3_600_000 ? `${+(ms / 3_600_000).toFixed(1)} h` : ms >= 60_000 ? `${+(ms / 60_000).toFixed(1)} min` : ms >= 1000 || ms === 0 ? `${+(ms / 1000).toFixed(1)} s` : `${ms} ms`;
-
-/** The schema's bounds (core/config.ts), for hints and arrow keys. */
+/** The schema's bounds (core/config.ts) and the arrow keys' step, in ms. The fields show seconds. */
 const RANGE = {
-  holdMs: [100, 5000],
-  confirmWindowMs: [500, 60_000],
-  cooldownMs: [0, 10_000],
-  timeoutMs: [100, 86_400_000],
-  resultHoldMs: [0, 60_000],
+  holdMs: [100, 5000, 50],
+  confirmWindowMs: [500, 60_000, 100],
+  cooldownMs: [0, 10_000, 100],
+  maxLatenessMs: [200, 10_000, 100],
+  timeoutMs: [100, 86_400_000, 1000],
+  resultHoldMs: [0, 60_000, 500],
 } as const;
+
+/** Below these a value is more likely a slip (ms typed as s, a stray digit) than meant: said, not refused. */
+export const SHORT = { timeoutMs: 2000, resultHoldMs: 500 } as const;
+
+function shortNote(k: keyof typeof SHORT, ms: number): string | null {
+  if (ms >= SHORT[k]) return null;
+  if (k === 'timeoutMs') return `Only ${secs(ms)}: most actions take longer than that, so it would be killed before it's done.`;
+  return ms === 0 ? "0: ✓ / ✗ isn't shown at all, the button goes straight back to READY." : `Only ${secs(ms)}: ✓ / ✗ is gone before anyone can read it.`;
+}
 
 const TRIGGER_NOTE: Record<Button['trigger'], string> = {
   hold: 'Fires after holding for the hold time. Safest against bumps and pockets.',
@@ -120,13 +127,7 @@ export function ButtonPanel(
   const uid = useId();
   const id = (k: string) => `${uid}-${k}`;
   const err = (k: string) => errors.get(k);
-  /** Range errors in words with the unit ("Must be at most 60000 ms (1 min)"). */
-  const msErr = (k: string) => {
-    const e = err(k);
-    const m = e && /^Must be at (most|least) (\d+)$/.exec(e);
-    return m ? `Must be at ${m[1]} ${m[2]} ms${+m[2]! >= 1000 ? ` (${secs(+m[2]!)})` : ''}` : e;
-  };
-  const onActionTab = (k: string) => k.startsWith('action') || k.startsWith('stops');
+  const onActionTab = (k: string) => k.startsWith('action') || k.startsWith('stops') || k === 'group';
   const actionBad = [...errors.keys()].some(onActionTab);
   const buttonBad = [...errors.keys()].some((k) => k && !onActionTab(k));
   const look = stateLookalike(toRGB(b.color));
@@ -138,9 +139,23 @@ export function ButtonPanel(
     </button>
   );
 
-  const num = (k: keyof typeof RANGE, label: string, hint: ComponentChildren, step: number) => (
-    <Field label={label} for={id(k)} error={msErr(k)} hint={hint} testid={k}>
-      <NumberInput id={id(k)} value={b[k]} unit="ms" step={step} min={RANGE[k][0]} max={RANGE[k][1]} onValue={(n) => ed.patchButton({ [k]: n }, k)} testid={`field-${k}`} invalid={!!err(k)} />
+  /** A duration field: typed in seconds, kept in ms. */
+  const dur = (k: keyof typeof RANGE, label: string, hint: ComponentChildren, warn?: string | null) => (
+    <Field
+      label={label}
+      for={id(k)}
+      error={err(k)}
+      hint={hint}
+      testid={k}
+      warn={
+        warn && (
+          <span class="ed-warn-note" data-testid={`warn-${k}`}>
+            {warn}
+          </span>
+        )
+      }
+    >
+      <DurationInput id={id(k)} value={b[k]} step={RANGE[k][2]} min={RANGE[k][0]} max={RANGE[k][1]} onValue={(n) => ed.patchButton({ [k]: n }, k)} testid={`field-${k}`} invalid={!!err(k)} />
     </Field>
   );
 
@@ -175,7 +190,8 @@ export function ButtonPanel(
       <div class="ed-panel-body" data-scroll key={p.tab}>
         {p.running && p.tab !== 'runs' && (
           <div class="ed-callout is-running" data-testid="running-note">
-            Running on the host now. Changing it doesn't touch this run; deleting it or changing its id (or the pad's) and saving stops it.
+            Running on the host now. A new time limit applies to this run too, once saved; other changes count from its next run. Deleting it or changing its id (or
+            the pad's) and saving stops it.
           </div>
         )}
         {err('') && (
@@ -224,14 +240,19 @@ export function ButtonPanel(
               />
               <p class="ed-hint">{TRIGGER_NOTE[b.trigger]}</p>
               <div class="ed-pair">
-                {b.trigger === 'hold' && num('holdMs', 'Hold for', '100–5000 ms', 50)}
+                {b.trigger === 'hold' && dur('holdMs', 'Hold for', '0.1–5 s')}
                 <Field label="Finger may slide" for={id('drift')} error={err('driftPx')} hint="before the press cancels" testid="driftPx">
                   <NumberInput id={id('drift')} value={b.driftPx} unit="px" step={5} min={0} onValue={(n) => ed.patchButton({ driftPx: n }, 'driftPx')} testid="field-driftPx" invalid={!!err('driftPx')} />
                 </Field>
               </div>
               <SwitchRow title="Ask to confirm" note="Needs a second press: for things you can't take back." on={b.confirm} onChange={(v) => ed.patchButton({ confirm: v })} testid="field-confirm" />
-              {b.confirm && num('confirmWindowMs', 'Second press within', `${secs(b.confirmWindowMs)} (0.5–60 s)`, 100)}
-              {num('cooldownMs', 'Then ignore presses for', `${secs(b.cooldownMs)} after it fires (0–10 s; 0 = off): stops key chatter and bounces from firing it twice.`, 100)}
+              {b.confirm && dur('confirmWindowMs', 'Second press within', '0.5–60 s')}
+              {dur('cooldownMs', 'Then ignore presses for', 'after it fires (0–10 s; 0 = off): stops key chatter and bounces from firing it twice.')}
+              {dur(
+                'maxLatenessMs',
+                'Max lateness',
+                'A press that reaches the host later than this (dead Wi-Fi, a frozen host) is dropped rather than run late. 0.2–10 s.',
+              )}
               <Field label="Keyboard key" error={err('key')} hint="Bluetooth clickers and remotes pair as keyboards: press theirs here.">
                 <KeyCapture value={b.key} onChange={(k) => ed.patchButton({ key: k })} conflict={keyNote(p.pads, p.pi, b)} testid="field-key" />
               </Field>
@@ -249,9 +270,19 @@ export function ButtonPanel(
                 ]}
               />
               <p class="ed-hint">{WHILE_NOTE[b.whileRunning]}</p>
-              <div class="ed-pair">
-                {num('timeoutMs', 'Time limit', `${secs(b.timeoutMs)}, then it's killed (up to 24 h)`, 1000)}
-                {num('resultHoldMs', 'Show result for', `${secs(b.resultHoldMs)} of ✓ / ✗ (up to 60 s)`, 500)}
+              <div class="ed-pair is-wrap">
+                {dur(
+                  'timeoutMs',
+                  'Time limit',
+                  <>
+                    It's killed after {secs(b.timeoutMs)} (up to 24 h).{' '}
+                    <span class="ed-live-note" data-testid="timeout-live-note">
+                      Applies to a run in progress too.
+                    </span>
+                  </>,
+                  shortNote('timeoutMs', b.timeoutMs),
+                )}
+                {dur('resultHoldMs', 'Show result for', '✓ / ✗ stays on the button this long (up to 60 s).', shortNote('resultHoldMs', b.resultHoldMs))}
               </div>
             </Section>
             <Section title="Id">
@@ -263,7 +294,8 @@ export function ButtonPanel(
         )}
         {p.tab === 'action' && (
           <>
-            <ActionFields ed={ed} a={b.action} stops={!!b.stops?.length} errors={errors} id={id} />
+            <ActionFields ed={ed} a={b.action} stops={!!b.stops?.length || groupMates(p.pads, b).length > 0} errors={errors} id={id} />
+            <GroupField pads={p.pads} pi={p.pi} b={b} error={err('group')} onChange={(group) => ed.patchButton({ group }, 'group')} />
             <StopsEditor pads={p.pads} pi={p.pi} b={b} error={[...errors].find(([k]) => k.startsWith('stops'))?.[1]} onChange={(stops) => ed.patchButton({ stops })} />
             {b.action.type !== 'none' && <OutputTips shell={b.action.type === 'shell'} />}
           </>

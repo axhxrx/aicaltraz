@@ -15,13 +15,20 @@
  *
  * The fingerprint is no secret (anyone can read /proc), so the runs in flight are trusted to name
  * processes to stop only when no one but the host's user could have written the file (`notPrivate`).
+ *
+ * The run log (GET /api/runs) survives too, in a sibling file (buttpad.runs.json, see RunsFile
+ * below): the last HISTORY_SIZE finished runs per button, their output tails cut to
+ * SAVED_TAIL_BYTES. Same posture: written 0600, read without blocking, everything in it checked
+ * and capped (it is display data: nothing in it is ever run or signalled).
  */
 import { statSync, type Stats } from 'node:fs';
-import { dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { FailureReason, LastResult } from '../core/machine.ts';
+import type { RunRecord } from '../core/protocol.ts';
 import { atomicWrite } from './config-store.ts';
 import { errnoText } from './errors.ts';
 import { NotRegularFileError, readRegularFileStat } from './files.ts';
+import { LATCHED_MAX } from './runner.ts';
 
 export const STATE_FILE = 'buttpad.state.json';
 export const STATE_VERSION = 1;
@@ -29,6 +36,13 @@ export const STATE_VERSION = 1;
 export const SAVE_INTERVAL_MS = 250;
 /** …a run starting or ending at most this often (the restart needs those most). */
 export const URGENT_SAVE_INTERVAL_MS = 50;
+/**
+ * Marks a latched device state (`@state`) the host can't vouch for: the run that set it was cut
+ * off by a crash, so the device may be in any state now ("? BGM ●"). The next `@state` replaces it.
+ */
+export const UNCERTAIN_PREFIX = '? ';
+/** A latched state as kept: `@state` text, possibly marked uncertain. */
+export const LATCHED_KEPT_MAX = LATCHED_MAX + UNCERTAIN_PREFIX.length;
 
 export interface ButtonMemo {
   lastRunId: number;
@@ -112,7 +126,7 @@ export function parseState(raw: unknown, clean: (s: string, max: number) => stri
       const memo: ButtonMemo = { lastRunId: v.lastRunId };
       const last = parseLast(v.last, clean);
       if (last) memo.last = last;
-      const latched = typeof v.latched === 'string' ? clean(v.latched, 40) : '';
+      const latched = typeof v.latched === 'string' ? clean(v.latched, LATCHED_KEPT_MAX) : '';
       if (latched) memo.latched = latched;
       buttons[key] = memo;
     }
@@ -153,12 +167,16 @@ export function notPrivate(path: string, st: Stats, uid: number | undefined = pr
   return undefined;
 }
 
-export function loadState(path: string, clean: (s: string, max: number) => string): LoadResult {
+/**
+ * A file of ours, as JSON: read without blocking on a FIFO or device, at most `maxBytes`, with
+ * whether someone else could have written it (`notPrivate`). A string says why it can't be used.
+ */
+function readOwnJson(path: string, maxBytes: number): { ok: true; raw: unknown; notPrivate?: string } | { ok: false; missing: boolean; error: string } {
   let text: string;
   let stat: Stats;
   try {
     // Never blocks on a FIFO or device (files.ts checks before and after opening, non-blocking).
-    const r = readRegularFileStat(path, MAX_STATE_BYTES);
+    const r = readRegularFileStat(path, maxBytes);
     text = r.data.toString('utf8');
     stat = r.stat;
   } catch (e) {
@@ -172,10 +190,142 @@ export function loadState(path: string, clean: (s: string, max: number) => strin
   } catch (e) {
     return { ok: false, missing: false, error: `invalid JSON (${(e as Error).message})` };
   }
-  const r = parseState(raw, clean);
-  if (typeof r === 'string') return { ok: false, missing: false, error: r };
   const why = notPrivate(path, stat);
-  return why ? { ok: true, state: r, notPrivate: why } : { ok: true, state: r };
+  return why ? { ok: true, raw, notPrivate: why } : { ok: true, raw };
+}
+
+export function loadState(path: string, clean: (s: string, max: number) => string): LoadResult {
+  const f = readOwnJson(path, MAX_STATE_BYTES);
+  if (!f.ok) return f;
+  const r = parseState(f.raw, clean);
+  if (typeof r === 'string') return { ok: false, missing: false, error: r };
+  return f.notPrivate ? { ok: true, state: r, notPrivate: f.notPrivate } : { ok: true, state: r };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The run log across restarts.
+
+export const RUNS_VERSION = 1;
+/** Per stream, what a saved run keeps of its output: the last 2 KB. */
+export const SAVED_TAIL_BYTES = 2048;
+/** What a saved run keeps of its `command` and `cwd` (the start: a long script is cut). */
+export const SAVED_COMMAND_MAX = 4096;
+/** The whole file at most: past it, the oldest runs (over all buttons) are left out. */
+export const RUNS_FILE_MAX = 2 * 1024 * 1024;
+/** The run log is saved at most this often (a run ending, a config change dropping runs). */
+export const RUNS_SAVE_INTERVAL_MS = 1000;
+/** Runs per button the run log keeps (in memory, and in the file). */
+export const HISTORY_SIZE = 20;
+
+export interface PersistedRuns {
+  version: typeof RUNS_VERSION;
+  savedAt: number;
+  /** Per button key, newest first. */
+  runs: Record<string, RunRecord[]>;
+}
+
+/** Where the run log goes: next to the state file, `buttpad.state.json` → `buttpad.runs.json`. */
+export function runsPathFor(statePath: string): string {
+  const name = basename(statePath);
+  const stem = name.endsWith('.state.json') ? name.slice(0, -'.state.json'.length) : name.endsWith('.json') ? name.slice(0, -'.json'.length) : name;
+  return join(dirname(statePath), `${stem}.runs.json`);
+}
+
+/** The end of `s`, at most `maxBytes` of UTF-8 (whole characters), marked with a leading "…" when cut. */
+export function tailBytes(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, 'utf8');
+  if (buf.length <= maxBytes) return s;
+  let start = buf.length - (maxBytes - 3); // room for the "…" (3 bytes)
+  while (start < buf.length && (buf[start]! & 0xc0) === 0x80) start++;
+  return '…' + buf.subarray(start).toString('utf8');
+}
+
+/** The start of `s`, at most `max` characters, marked with a trailing "…" when cut. */
+const headChars = (s: string, max: number) => (s.length <= max ? s : s.slice(0, max - 1) + '…');
+
+/** A run as the file keeps it: output tails cut to SAVED_TAIL_BYTES, `command`/`cwd` to SAVED_COMMAND_MAX. */
+export function savedRecord(r: RunRecord): RunRecord {
+  const out: RunRecord = { ...r, stdout: tailBytes(r.stdout, SAVED_TAIL_BYTES), stderr: tailBytes(r.stderr, SAVED_TAIL_BYTES) };
+  if (r.command !== undefined) out.command = headChars(r.command, SAVED_COMMAND_MAX);
+  if (r.cwd !== undefined) out.cwd = headChars(r.cwd, SAVED_COMMAND_MAX);
+  return out;
+}
+
+function parseRecord(v: unknown, key: string, clean: (s: string, max: number) => string): RunRecord | undefined {
+  if (!isRecord(v) || !isCount(v.runId) || !isTime(v.startedAt) || !isTime(v.endedAt)) return undefined;
+  const [pad = '', button = ''] = key.split('/');
+  // Only finished runs are saved; a record names its own button.
+  if (v.pad !== pad || v.button !== button) return undefined;
+  const text = (x: unknown) => (typeof x === 'string' ? x : '');
+  const r: RunRecord = {
+    runId: v.runId,
+    pad,
+    button,
+    startedAt: v.startedAt,
+    endedAt: v.endedAt,
+    stdout: tailBytes(text(v.stdout), SAVED_TAIL_BYTES),
+    stderr: tailBytes(text(v.stderr), SAVED_TAIL_BYTES),
+  };
+  if (v.exitCode === null || Number.isSafeInteger(v.exitCode)) r.exitCode = v.exitCode as number | null;
+  if (REASONS.includes(v.reason as FailureReason)) r.reason = v.reason as FailureReason;
+  // Display text, like the host writes it (sanitized); the paths are shown as they are.
+  if (typeof v.error === 'string') r.error = clean(v.error, 2000);
+  if (typeof v.command === 'string') r.command = headChars(v.command, SAVED_COMMAND_MAX);
+  if (typeof v.cwd === 'string') r.cwd = headChars(v.cwd, SAVED_COMMAND_MAX);
+  return r;
+}
+
+/** Validates a run log file's JSON like parseState: what's malformed inside is dropped. A string says why the whole file is unusable. */
+export function parseRuns(raw: unknown, clean: (s: string, max: number) => string): PersistedRuns | string {
+  if (!isRecord(raw)) return 'not a JSON object';
+  if (raw.version !== RUNS_VERSION) return `unknown version ${JSON.stringify(raw.version ?? null)}`;
+  const runs: Record<string, RunRecord[]> = {};
+  if (isRecord(raw.runs))
+    for (const [key, list] of Object.entries(raw.runs)) {
+      if (!isKey(key) || !Array.isArray(list)) continue;
+      const seen = new Set<number>();
+      const records = list
+        .map((v) => parseRecord(v, key, clean))
+        .filter((r): r is RunRecord => !!r && !seen.has(r.runId) && !!seen.add(r.runId))
+        .sort((a, b) => b.startedAt - a.startedAt || b.runId - a.runId)
+        .slice(0, HISTORY_SIZE);
+      if (records.length) runs[key] = records;
+    }
+  return { version: RUNS_VERSION, savedAt: isTime(raw.savedAt) ? raw.savedAt : 0, runs };
+}
+
+export type RunsLoadResult = { ok: true; runs: PersistedRuns; notPrivate?: string } | { ok: false; missing: boolean; error: string };
+
+export function loadRuns(path: string, clean: (s: string, max: number) => string): RunsLoadResult {
+  // A file the host wrote is at most RUNS_FILE_MAX; a much bigger one isn't ours.
+  const f = readOwnJson(path, 2 * RUNS_FILE_MAX);
+  if (!f.ok) return f;
+  const r = parseRuns(f.raw, clean);
+  if (typeof r === 'string') return { ok: false, missing: false, error: r };
+  return f.notPrivate ? { ok: true, runs: r, notPrivate: f.notPrivate } : { ok: true, runs: r };
+}
+
+/**
+ * The run log file's text: per button (in `history` order) its finished runs, newest first, cut by
+ * savedRecord; at most RUNS_FILE_MAX bytes in all — past that, the oldest runs over all buttons are
+ * left out (the in-memory log keeps them).
+ */
+export function runsFileText(history: Iterable<[string, readonly RunRecord[]]>, savedAt: number, maxBytes = RUNS_FILE_MAX): string {
+  const all: { key: string; json: string; endedAt: number; startedAt: number }[] = [];
+  for (const [key, list] of history)
+    for (const r of list) if (r.endedAt !== undefined) all.push({ key, json: JSON.stringify(savedRecord(r)), endedAt: r.endedAt, startedAt: r.startedAt });
+  const head = `{"version":${RUNS_VERSION},"savedAt":${savedAt},"runs":{`;
+  let size = Buffer.byteLength(head) + 3;
+  const kept = new Set<(typeof all)[number]>();
+  for (const x of [...all].sort((a, b) => b.endedAt - a.endedAt || b.startedAt - a.startedAt)) {
+    const add = Buffer.byteLength(x.json) + Buffer.byteLength(JSON.stringify(x.key)) + 4;
+    if (size + add > maxBytes) break;
+    size += add;
+    kept.add(x);
+  }
+  const byKey = new Map<string, string[]>();
+  for (const x of all) if (kept.has(x)) byKey.set(x.key, [...(byKey.get(x.key) ?? []), x.json]);
+  return `${head}${[...byKey].map(([key, list]) => `\n${JSON.stringify(key)}:[\n${list.join(',\n')}]`).join(',')}\n}}\n`;
 }
 
 export interface StateFileOptions {
@@ -184,9 +334,16 @@ export interface StateFileOptions {
   write?: (path: string, text: string) => void;
   /** Monotonic ms. */
   clock?: () => number;
+  /** Saves at most this often (default SAVE_INTERVAL_MS)… */
+  intervalMs?: number;
+  /** …urgent ones at most this often (default URGENT_SAVE_INTERVAL_MS). */
+  urgentIntervalMs?: number;
+  /** For the log: what the file is ("state") and what is at stake while saving fails. */
+  name?: string;
+  stake?: string;
 }
 
-/** Saves snapshots of the host's run state to `path`, throttled. Never throws: failures are logged. */
+/** Saves snapshots (`text()`) of the host's run state to `path`, throttled. Never throws: failures are logged. */
 export class StateFile {
   /** Snapshots written (tests). */
   writes = 0;
@@ -197,21 +354,27 @@ export class StateFile {
   private closed = false;
   private readonly write: (path: string, text: string) => void;
   private readonly clock: () => number;
+  private readonly text: () => string;
 
   constructor(
     readonly path: string,
-    private readonly snapshot: () => PersistedState,
+    /** The state as an object (written as JSON), or the file's text as is. */
+    snapshot: () => PersistedState | string,
     private readonly opts: StateFileOptions = {},
   ) {
     this.write = opts.write ?? ((p, t) => void atomicWrite(p, t, { mode: 0o600 }));
     this.clock = opts.clock ?? (() => performance.now());
+    this.text = () => {
+      const s = snapshot();
+      return typeof s === 'string' ? s : JSON.stringify(s, null, 1) + '\n';
+    };
   }
 
   /** Something changed: save soon; `urgent` (a run started or ended) sooner. */
   request(urgent = false) {
     if (this.closed) return;
     const now = this.clock();
-    const due = Math.max(now, this.lastWrite + (urgent ? URGENT_SAVE_INTERVAL_MS : SAVE_INTERVAL_MS));
+    const due = Math.max(now, this.lastWrite + (urgent ? (this.opts.urgentIntervalMs ?? URGENT_SAVE_INTERVAL_MS) : (this.opts.intervalMs ?? SAVE_INTERVAL_MS)));
     if (this.timer && this.dueAt <= due) return;
     clearTimeout(this.timer);
     this.dueAt = due;
@@ -225,15 +388,18 @@ export class StateFile {
     this.timer = undefined;
     this.dueAt = Infinity;
     this.lastWrite = this.clock();
+    const name = this.opts.name ?? 'state';
     try {
-      this.write(this.path, JSON.stringify(this.snapshot(), null, 1) + '\n');
+      this.write(this.path, this.text());
       this.writes++;
-      if (this.failing) this.opts.log?.(`state: saving ${this.path} works again`);
+      if (this.failing) this.opts.log?.(`${name}: saving ${this.path} works again`);
       this.failing = false;
       return true;
     } catch (e) {
       if (!this.failing)
-        this.opts.log?.(`state: cannot save ${this.path} (${(e as Error).message}); run ids, results and running actions won't survive a restart until this is fixed`);
+        this.opts.log?.(
+          `${name}: cannot save ${this.path} (${(e as Error).message}); ${this.opts.stake ?? "run ids, results and running actions won't survive a restart"} until this is fixed`,
+        );
       this.failing = true;
       return false;
     }

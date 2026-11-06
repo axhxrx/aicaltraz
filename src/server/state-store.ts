@@ -8,9 +8,21 @@
  */
 import { buttonKey, type Button, type Config } from '../core/config.ts';
 import { transition, type Effect, type LastResult, type MachineEvent, type RunState } from '../core/machine.ts';
-import { PRESS_MAX_AGE_MS, type PressResult, type RunRecord, type StateMap } from '../core/protocol.ts';
+import type { PressResult, RunRecord, StateMap } from '../core/protocol.ts';
 import { BucketMap, ThrottledLog, TokenBucket, type PressSource } from './limits.ts';
-import { loadState, StateFile, type ButtonMemo, type LiveEntry, type PersistedState } from './persist.ts';
+import {
+  HISTORY_SIZE,
+  loadRuns,
+  loadState,
+  RUNS_SAVE_INTERVAL_MS,
+  runsFileText,
+  runsPathFor,
+  StateFile,
+  UNCERTAIN_PREFIX,
+  type ButtonMemo,
+  type LiveEntry,
+  type PersistedState,
+} from './persist.ts';
 import { Leftover, processFingerprint, processFingerprintAsync } from './proc.ts';
 import {
   clip,
@@ -28,7 +40,7 @@ import {
   type RunUpdate,
 } from './runner.ts';
 
-export const HISTORY_SIZE = 20;
+export { HISTORY_SIZE };
 /**
  * Backstop for the run log: over all buttons, at most this much stored output (stdout + stderr
  * tails, in characters); past it the oldest runs that hold output are dropped, down to 3/4 of it.
@@ -66,7 +78,7 @@ export interface StartLimits {
 export const START_LIMITS: StartLimits = { burst: 40, perSec: 20, sourceBurst: 10, sourcePerSec: 5, maxRunning: 32 };
 
 export interface PressOptions {
-  /** When the user pressed, by the host's clock (epoch ms). Older than PRESS_MAX_AGE_MS → `expired`; later than now counts as now; absent = now. */
+  /** When the user pressed, by the host's clock (epoch ms). Older than the button's maxLatenessMs → `expired`; later than now counts as now; absent = now. */
   at?: number;
   /** The user went through the button's confirm step: needed to start (or queue) a `confirm` button. */
   confirm?: boolean;
@@ -138,6 +150,10 @@ export interface StateStoreOptions {
   statePath?: string;
   /** Injection point for tests: writes the state file (default: atomic write). */
   stateWrite?: (path: string, text: string) => void;
+  /** The run log across restarts (default: buttpad.runs.json next to the state file; see persist.ts runsPathFor). */
+  runsPath?: string;
+  /** Injection point for tests: writes the run log file (default: atomic write, 0600). */
+  runsWrite?: (path: string, text: string) => void;
   cancelGraceMs?: number;
   limits?: Partial<StartLimits>;
   /** Injection points for tests. */
@@ -152,6 +168,20 @@ export interface StateStoreOptions {
 export function matchesStop(patterns: readonly string[], pad: string, button: string): boolean {
   return patterns.some((p) => p === '*' || p === `${pad}/*` || p === `${pad}/${button}`);
 }
+
+/**
+ * Whether `self`, about to start, stops `other` first: `other` is named by its `stops`, or is in
+ * its `group` (on any pad). Never itself.
+ */
+export function stopsBeforeStart(self: { pad: string; button: Button }, other: { pad: string; button: Button }): boolean {
+  if (self.pad === other.pad && self.button.id === other.button.id) return false;
+  const group = self.button.group;
+  if (group !== undefined && other.button.group === group) return true;
+  return !!self.button.stops?.length && matchesStop(self.button.stops, other.pad, other.button.id);
+}
+
+/** Whether a button stops anything when it starts (`stops`, or a `group`). */
+const stopsAny = (b: Button) => !!b.stops?.length || b.group !== undefined;
 
 /** How a finished run ended, as READY's `last` will say it (the machine's rule). */
 function lastOf(s: RunState): LastResult | undefined {
@@ -190,6 +220,8 @@ export class StateStore {
   /** What loading the state file found, logged by recover(): once the host is listening, not before a failed start. */
   private loadNotes: string[] = [];
   private persist: StateFile | undefined;
+  /** The run log file (buttpad.runs.json): saved like the state file, less often. */
+  private runsFile: StateFile | undefined;
   private hostId: PersistedState['host'];
   private closed = false;
   private readonly spawn: NonNullable<StateStoreOptions['spawn']>;
@@ -239,7 +271,8 @@ export class StateStore {
 
   /**
    * Reconcile with a new config. Removed buttons lose their state (and a running action is killed);
-   * kept buttons pick up their new settings, but a current run keeps the action it started with.
+   * kept buttons pick up their new settings, but a current run keeps the action it started with —
+   * except its time limit: a changed `timeoutMs` applies to the run going on (see `retime`).
    * Returns the keys of added buttons.
    */
   setConfig(config: Config): string[] {
@@ -251,6 +284,7 @@ export class StateStore {
       const slot = this.slots.get(key);
       if (slot) {
         slot.button = button;
+        if (slot.run && slot.run.timeoutMs !== button.timeoutMs) this.retime(slot.run, button.timeoutMs);
         continue;
       }
       // Keep runIds increasing for a key that comes back (or across a restart), so clients never see an old runId reused.
@@ -267,8 +301,8 @@ export class StateStore {
 
   /**
    * Handle a press. Results other than started/queued/cancelling run nothing: `unknown-button`,
-   * `expired` (older than PRESS_MAX_AGE_MS by the host's clock: it sat in a dead link or a stalled
-   * host), `needs-confirm` (a `confirm` button pressed without `confirm`), `ignored` (running
+   * `expired` (older than the button's maxLatenessMs by the host's clock: it sat in a dead link or
+   * a stalled host), `needs-confirm` (a `confirm` button pressed without `confirm`), `ignored` (running
    * with whileRunning `ignore`, already queued, a cancel within the double-press grace, an earlier
    * run of the button still dying, or refused by the limits: then `refused` says which).
    */
@@ -284,8 +318,9 @@ export class StateStore {
     if (this.closed) return reply('ignored');
     const from = o.source ? ` from ${o.source.label}` : '';
     const now = this.now();
-    if (o.at !== undefined && now - o.at > PRESS_MAX_AGE_MS) {
-      this.expired.note(`dropped a stale press of ${key}${from}: made ${seconds(now - o.at)} ago (max ${seconds(PRESS_MAX_AGE_MS)}); it was held up on the way`);
+    const maxAge = slot.button.maxLatenessMs;
+    if (o.at !== undefined && now - o.at > maxAge) {
+      this.expired.note(`dropped a stale press of ${key}${from}: made ${seconds(now - o.at)} ago (max ${seconds(maxAge)}); it was held up on the way`);
       return reply('expired');
     }
     const prev = slot.state;
@@ -386,23 +421,31 @@ export class StateStore {
       this.log(`■ ${e.key} #${e.runId} was interrupted when the previous host stopped (${how})`);
       const endedAt = e.endedAt ?? this.now();
       const [pad = '', button = ''] = e.key.split('/');
-      this.addRecord(e.key, {
-        runId: e.runId,
-        pad,
-        button,
-        startedAt: e.startedAt,
-        endedAt,
-        exitCode: null,
-        reason: 'interrupted',
-        error: e.stopped === 'shutdown' ? STOP_REASONS.shutdown : `interrupted: the host stopped while it ran (${how})`,
-        ...(e.command !== undefined ? { command: e.command } : {}),
-        ...(e.cwd !== undefined ? { cwd: e.cwd } : {}),
-        stdout: '',
-        stderr: '',
-      });
+      // A graceful shutdown saved the run in the run log as it ended (with its output): that one stays.
+      if (!this.history.get(e.key)?.some((r) => r.runId === e.runId))
+        this.addRecord(e.key, {
+          runId: e.runId,
+          pad,
+          button,
+          startedAt: e.startedAt,
+          endedAt,
+          exitCode: null,
+          reason: 'interrupted',
+          error: e.stopped === 'shutdown' ? STOP_REASONS.shutdown : `interrupted: the host stopped while it ran (${how})`,
+          ...(e.command !== undefined ? { command: e.command } : {}),
+          ...(e.cwd !== undefined ? { cwd: e.cwd } : {}),
+          stdout: '',
+          stderr: '',
+        });
       const memo = this.memo(e.key);
       if (e.runId < memo.lastRunId) continue; // a newer run is known: this one is old news
       memo.last = { runId: e.runId, ok: false, reason: 'interrupted', text: INTERRUPTED_TEXT, endedAt };
+      // Cut off by a crash: what it last latched (`@state`) may no longer be what the device is
+      // doing. (A graceful shutdown saw the run end, as a cancel does: its state stands.)
+      if (e.stopped !== 'shutdown' && memo.latched && !memo.latched.startsWith(UNCERTAIN_PREFIX)) {
+        memo.latched = UNCERTAIN_PREFIX + memo.latched;
+        this.opts.onLatched?.(e.key, memo.latched);
+      }
       const slot = this.slots.get(e.key);
       if (slot?.state.phase === 'ready' && slot.state.runId === e.runId)
         this.apply(
@@ -411,7 +454,10 @@ export class StateStore {
           [{ type: 'scheduleReset', runId: e.runId, afterMs: slot.button.resultHoldMs }],
         );
     }
-    if (entries.length) this.persist?.flush();
+    if (entries.length) {
+      this.persist?.flush();
+      this.runsFile?.request();
+    }
   }
 
   /** Stop accepting presses, SIGTERM every running action, SIGKILL what's left after `graceMs`, save the state file. */
@@ -433,6 +479,8 @@ export class StateStore {
     await Promise.race([Promise.all(ending.map((r) => r.handle.done)), Bun.sleep(1000)]);
     this.persist?.flush();
     this.persist?.close();
+    this.runsFile?.flush();
+    this.runsFile?.close();
   }
 
   /**
@@ -442,6 +490,7 @@ export class StateStore {
   forceKillAll(runs: Iterable<Straggler> = [...this.live, ...this.stragglers()]) {
     for (const r of runs) if (r.handle.alive()) r.handle.forceKill();
     this.persist?.flush();
+    this.runsFile?.flush();
   }
 
   /** Every log line goes to a terminal: what's in it from the config or the state file (keys, labels, errors) can't carry escape sequences. */
@@ -473,6 +522,7 @@ export class StateStore {
         return 'busy';
       }
     }
+    // An emergency stop gets through: `stops` (or a group) with something to stop.
     if (none && this.wouldStop(slot)) return undefined;
     if (source && !source.buckets.every((b) => b.available())) {
       this.refusals.note(`refusing presses from ${source.label}: too many (max ${this.limits.sourceBurst} at once, then ${this.limits.sourcePerSec}/s per device)`);
@@ -487,12 +537,11 @@ export class StateStore {
     return undefined;
   }
 
-  /** Whether `self`'s `stops` would stop something now: a run it names that isn't being cancelled yet, or a queued re-run. */
+  /** Whether `self`'s `stops` (or its group) would stop something now: a run it names that isn't being cancelled yet, or a queued re-run. */
   private wouldStop(self: Slot): boolean {
-    const patterns = self.button.stops;
-    if (!patterns?.length) return false;
+    if (!stopsAny(self.button)) return false;
     for (const slot of this.slots.values()) {
-      if (slot === self || !matchesStop(patterns, slot.pad, slot.button.id)) continue;
+      if (slot === self || !stopsBeforeStart(self, slot)) continue;
       const s = slot.state;
       if ((s.phase === 'running' && !s.cancelling) || (s.phase !== 'ready' && s.queued)) return true;
     }
@@ -607,14 +656,16 @@ export class StateStore {
     this.dispatch(slot, { type: 'requeue', runId, now: this.now() });
   }
 
-  /** `stops`: cancel the running buttons it names (never itself), dropping their queued re-runs. How many it stopped. */
+  /**
+   * `stops` and `group`: cancel the running buttons its patterns name and the running buttons of
+   * its group (any pad; never itself), dropping their queued re-runs. How many it stopped.
+   */
   private stopOthers(self: Slot): number {
-    const patterns = self.button.stops ?? [];
     // A label is anyone's text (the config): none of its escape sequences or controls in the result text, RunRecord.error or the log.
     const by = sanitize(self.button.label).trim() || self.button.id;
     let n = 0;
     for (const slot of this.slots.values()) {
-      if (slot === self || !matchesStop(patterns, slot.pad, slot.button.id)) continue;
+      if (slot === self || !stopsBeforeStart(self, slot)) continue;
       const s = slot.state;
       if (s.phase === 'running') {
         // The machine's cancel, whatever the button's own whileRunning: kill, and drop a queued re-run.
@@ -672,6 +723,7 @@ export class StateStore {
       for (const r of list) if (!live.has(r)) this.historyChars -= outputChars(r);
       if (kept.length) this.history.set(key, kept);
       else this.history.delete(key);
+      if (kept.length < list.length) this.runsFile?.request();
     }
   }
 
@@ -690,11 +742,30 @@ export class StateStore {
     }
   }
 
+  /**
+   * The button's `timeoutMs` changed while `run` goes on: its limit is now `timeoutMs` from its
+   * start, re-armed for what is left of it; a run already past it times out now. A run on its way
+   * out (cancelled, stopped) keeps going down.
+   */
+  private retime(run: LiveRun, timeoutMs: number) {
+    if (run.none || run.stopReason !== undefined) return;
+    const before = run.timeoutMs;
+    run.timeoutMs = timeoutMs;
+    const elapsed = this.clock() - run.t0;
+    const left = Math.round(timeoutMs - elapsed);
+    this.log(
+      left > 0
+        ? `${run.key} #${run.runId}: time limit ${duration(before)} → ${duration(timeoutMs)} while it runs (${duration(left)} left)`
+        : `${run.key} #${run.runId}: time limit ${duration(before)} → ${duration(timeoutMs)}, and it has run ${duration(Math.round(elapsed))}: stopping it`,
+    );
+    run.handle.retime?.(left);
+  }
+
   private startRun(slot: Slot, runId: number) {
     const b = slot.button;
     const startedAt = slot.state.phase === 'running' ? slot.state.startedAt : this.now();
     // Before its own action starts.
-    const stopped = b.stops?.length ? this.stopOthers(slot) : 0;
+    const stopped = stopsAny(b) ? this.stopOthers(slot) : 0;
     const record: RunRecord = { runId, pad: slot.pad, button: b.id, startedAt, stdout: '', stderr: '' };
     this.addRecord(slot.key, record);
 
@@ -774,6 +845,7 @@ export class StateStore {
     rec.stdout = o.stdout;
     rec.stderr = o.stderr;
     this.grewRecord(run.key, rec, before);
+    this.runsFile?.request();
     this.live.delete(run);
     if (run.handle.dying()) this.dying.add(run);
     if (slot.run === run) slot.run = undefined;
@@ -844,6 +916,34 @@ export class StateStore {
       this.toRecover = r.state.live;
     }
     this.persist = new StateFile(path, () => this.snapshot(), { log: (m) => this.log(m), write: this.opts.stateWrite, clock: this.clock });
+    this.loadRuns(this.opts.runsPath ?? runsPathFor(path), clean);
+  }
+
+  /**
+   * Read the run log a previous host saved (buttpad.runs.json): the runs of the buttons still in the
+   * config come back (setConfig drops the rest). Display data, checked and capped like the state
+   * file's; a file someone else could have written is used too, and written back 0600 right away.
+   * A missing file is the usual first start: nothing to say.
+   */
+  private loadRuns(path: string, clean: (s: string, max: number) => string) {
+    const r = loadRuns(path, clean);
+    if (r.ok) {
+      for (const [key, list] of Object.entries(r.runs.runs)) {
+        this.history.set(key, list);
+        for (const rec of list) this.historyChars += outputChars(rec);
+      }
+      this.capHistory();
+    } else if (!r.missing) this.loadNotes.push(`runs: can't use ${path} (${r.error}); the run log starts empty`);
+    this.runsFile = new StateFile(path, () => runsFileText(this.history, this.now()), {
+      log: (m) => this.log(m),
+      write: this.opts.runsWrite,
+      clock: this.clock,
+      intervalMs: RUNS_SAVE_INTERVAL_MS,
+      urgentIntervalMs: RUNS_SAVE_INTERVAL_MS,
+      name: 'runs',
+      stake: "the run log won't survive a restart",
+    });
+    if (r.ok && r.notPrivate) this.runsFile.request();
   }
 
   private snapshot(): PersistedState {

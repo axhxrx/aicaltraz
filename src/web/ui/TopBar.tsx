@@ -125,6 +125,8 @@ export function TopBar(p: {
   title?: string;
   showTabs: boolean;
   status: ConnStatus;
+  /** Back from a long stretch away, catching up with the host (Snapshot.syncing). */
+  syncing?: boolean;
   demo: boolean;
   hostFull: boolean;
   lock: boolean;
@@ -144,7 +146,9 @@ export function TopBar(p: {
     return () => ro.disconnect();
   }, [p.showTabs]);
   const sleepy = useSleepy();
-  const label = p.status === 'online' && p.demo ? 'DEMO' : (p.status === 'offline' || p.status === 'connecting') && p.hostFull ? 'HOST FULL' : CONN[p.status];
+  const syncing = p.status === 'online' && !!p.syncing;
+  const label =
+    p.status === 'online' && p.demo ? 'DEMO' : syncing ? 'SYNCING' : (p.status === 'offline' || p.status === 'connecting') && p.hostFull ? 'HOST FULL' : CONN[p.status];
   return (
     <header class="bp-bar">
       {p.showTabs ? (
@@ -162,7 +166,15 @@ export function TopBar(p: {
           <span>SCREEN MAY SLEEP</span>
         </span>
       )}
-      <div class="bp-conn" data-status={p.status} data-demo={p.demo ? '' : undefined} data-testid="conn" role="status" aria-label={`connection: ${p.demo && p.status === 'online' ? 'demo' : p.status}`}>
+      <div
+        class="bp-conn"
+        data-status={p.status}
+        data-syncing={syncing ? '' : undefined}
+        data-demo={p.demo ? '' : undefined}
+        data-testid="conn"
+        role="status"
+        aria-label={`connection: ${p.demo && p.status === 'online' ? 'demo' : syncing ? 'catching up' : p.status}`}
+      >
         <i class="bp-dot" />
         <span>{label}</span>
       </div>

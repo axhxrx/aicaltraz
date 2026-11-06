@@ -15,14 +15,15 @@
  * mean the runs remembered here are gone: that memory starts over.
  */
 import type { LastResult, RunState } from '../../core/machine.ts';
-import { PRESS_MAX_AGE_MS, type PressResult, type WireButton } from '../../core/protocol.ts';
-import { PressError, type PressAck } from '../backend/types.ts';
+import type { PressResult, WireButton } from '../../core/protocol.ts';
+import { latenessOf, PressError, type PressAck } from '../backend/types.ts';
 import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
-import { cue, haptic, unlockAudio } from '../lib/feedback.ts';
+import { cue, haptic, unlockAudio, type Cue } from '../lib/feedback.ts';
 import { createStore } from '../lib/store.ts';
 
 export const DOUBLE_TAP_MS = 400;
+/** How long a press waits for its ack before NO RESPONSE, unless the backend knows its link better (Backend.ackTimeoutMs). */
 export const ACK_TIMEOUT_MS = 2000;
 /** A tap held longer than this is a resting thumb, not a tap: letting go doesn't fire. */
 export const TAP_MAX_MS = 1500;
@@ -36,13 +37,13 @@ export const ROUGH = { tapMinMs: 80, cooldownMs: 800, drift: 1.5 };
 const KEY_DOUBLE_MIN_MS = 60;
 /**
  * After NO RESPONSE, a host state showing that the press did run counts as ours for this long (a
- * run that started more than PRESS_MAX_AGE_MS after the press was made never does: the host drops
- * a press that old).
+ * run that started more than the button's maxLatenessMs after the press was made never does: the
+ * host drops a press that old).
  */
 const OUTCOME_WINDOW_MS = 30_000;
 /**
- * NO RESPONSE: the host drops a press older than PRESS_MAX_AGE_MS. This long past that (the error
- * of the clock offset's estimate), a fresh hello that shows no run of it means it never ran.
+ * NO RESPONSE: the host drops a press older than the button's maxLatenessMs. This long past that
+ * (the error of the clock offset's estimate), a fresh hello that shows no run of it means it never ran.
  */
 const LOST_MARGIN_MS = 1000;
 const FLASH_MS = 1200;
@@ -62,9 +63,10 @@ const REMEMBER = 12;
  * it just now (rate limit, its last run still dying): try again. already: someone else's run
  * started while this press was on its way (it wasn't sent, or the host ignored it). queued: the
  * re-run is queued already. unknown: the host has no such button. denied: offline. slipped: a
- * hold let go early, or a press that slid off.
+ * hold let go early, or a press that slid off. syncing: pressed while catching up with the host
+ * after a long stretch in the background (what the button shows may be minutes old).
  */
-export type FlashKind = 'busy' | 'cooldown' | 'later' | 'already' | 'queued' | 'unknown' | 'denied' | 'slipped';
+export type FlashKind = 'busy' | 'cooldown' | 'later' | 'already' | 'queued' | 'unknown' | 'denied' | 'slipped' | 'syncing';
 
 /** How the press that asked for a confirmation was made: the CONFIRM face says it the same way. */
 export type Via = 'key' | 'hold' | 'tap' | 'double';
@@ -73,9 +75,10 @@ export type Via = 'key' | 'hold' | 'tap' | 'double';
  * What a press did (a key for a button on another pad says it in a toast): sent; confirm (the
  * confirm step: press again); again (the first press of a double); cooldown (too soon after the
  * last fire, ignored); busy (the last press is still on its way); queued (a queued re-run starts in
- * a moment: nothing sent); offline (not connected); none (a bounce, a finger on the button).
+ * a moment: nothing sent); offline (not connected); syncing (catching up with the host after a long
+ * stretch in the background: nothing sent); none (a bounce, a finger on the button).
  */
-export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'queued' | 'offline' | 'none';
+export type KeyResult = 'sent' | 'confirm' | 'again' | 'cooldown' | 'busy' | 'queued' | 'offline' | 'syncing' | 'none';
 
 /**
  * A result this device shows on its own, on top of what the host says:
@@ -105,6 +108,9 @@ export interface LocalResult {
   last?: LastResult;
   /** notsent: why. */
   text?: string;
+  /** noresponse: how long it waited for the answer, or `dropped`: the link went before one came. */
+  waitedMs?: number;
+  dropped?: true;
 }
 
 export interface Local {
@@ -146,6 +152,13 @@ export interface ControllerCtx {
    * a palm)? Every contact counts for palm detection, also the ones refused.
    */
   mayStart(t: number): boolean;
+  /** How long a press that is on the wire waits for its ack (absent: ACK_TIMEOUT_MS). */
+  ackTimeout?(): number;
+  /**
+   * Catching up with the host after a long stretch in the background: presses wait, and what the
+   * backlog replays (runs that ended minutes ago) is settled without a buzz.
+   */
+  syncing?(): boolean;
 }
 
 /** A press that went out: what NO RESPONSE needs to tell, later, whether a run was its doing. */
@@ -159,6 +172,8 @@ interface Sent {
   queue: boolean;
   /** It would start (or queue) a run: not a cancel, nor a press the host ignores while it runs. */
   starts: boolean;
+  /** The button's maxLatenessMs when it went out: the host drops it once it is older than that. */
+  lateness: number;
 }
 
 /** NO RESPONSE: if the host turns out to have run the press, show that (onHost). */
@@ -356,15 +371,29 @@ export class ButtonController {
   }
 
   /**
-   * NO RESPONSE, and the press can't run any more (the host drops one older than PRESS_MAX_AGE_MS):
-   * reconnected since, with no run of it on the host, it never ran, and never will: DIDN'T RUN.
-   * (Its late `expired` answer, if any, went to the socket that died.) A newer run is resolve()'s
-   * business; a re-run that may be its doing is still coming; a cancel isn't a run.
+   * How long the host may still take a press of this button made at `o.made`: its maxLatenessMs,
+   * as it was when the press went out or as the config says now, whichever is longer (a config
+   * change on the way must not make a press that can still run look settled).
+   */
+  private lateness(o: Sent): number {
+    return Math.max(o.lateness, latenessOf(this.ctx?.button()));
+  }
+
+  /** An outcome cue for one of this device's runs: none for what a backlog replays after a long stretch away. */
+  private outcomeCue(c: Cue) {
+    if (!this.ctx?.syncing?.()) cue(c);
+  }
+
+  /**
+   * NO RESPONSE, and the press can't run any more (the host drops one older than the button's
+   * maxLatenessMs): reconnected since, with no run of it on the host, it never ran, and never will:
+   * DIDN'T RUN. (Its late `expired` answer, if any, went to the socket that died.) A newer run is
+   * resolve()'s business; a re-run that may be its doing is still coming; a cancel isn't a run.
    */
   private checkLost() {
     const o = this.outcome;
     const ctx = this.ctx;
-    if (!o || !ctx || !o.fresh || !o.starts || !ctx.online() || wall() < o.made + PRESS_MAX_AGE_MS + LOST_MARGIN_MS) return;
+    if (!o || !ctx || !o.fresh || !o.starts || !ctx.online() || wall() < o.made + this.lateness(o) + LOST_MARGIN_MS) return;
     const host = ctx.host();
     if (host.runId !== o.baseRunId || (o.queue && host.phase !== 'ready' && host.queued)) return;
     this.outcome = null;
@@ -373,9 +402,9 @@ export class ButtonController {
 
   /**
    * NO RESPONSE: does the host's state show that the press did reach it? A newer run is its doing,
-   * unless that run started more than PRESS_MAX_AGE_MS after the press was made (the host drops a
-   * press that old, so that's someone else's), or, for a press on a running queue button, it is the
-   * re-run after the run it pressed on, and that run ended with the re-run still coming.
+   * unless that run started more than the button's maxLatenessMs after the press was made (the host
+   * drops a press that old, so that's someone else's), or, for a press on a running queue button,
+   * it is the re-run after the run it pressed on, and that run ended with the re-run still coming.
    */
   private resolve(o: Outcome, host: RunState) {
     if (host.runId === o.baseRunId) {
@@ -386,7 +415,7 @@ export class ButtonController {
     if (host.runId < o.baseRunId) return;
     this.outcome = null;
     const ran = host.phase === 'ready' ? host.last?.runId ?? host.runId : host.runId;
-    const late = host.phase !== 'ready' && host.startedAt + o.skew > o.made + PRESS_MAX_AGE_MS + 1;
+    const late = host.phase !== 'ready' && host.startedAt + o.skew > o.made + this.lateness(o) + 1;
     if (late && !(o.queue && o.requeued && ran === o.baseRunId + 1)) return;
     // The press that got no answer did reach the host: show what it did, not NO RESPONSE.
     this.claim(ran);
@@ -397,7 +426,7 @@ export class ButtonController {
       const holdMs = this.ctx?.button().resultHoldMs ?? 2500;
       const last = host.last?.runId === ran ? host.last : undefined;
       this.setResult({ kind: 'ran', runId: ran, at: wall(), until: wall() + Math.max(holdMs, 1500), ...(last ? { last } : {}) });
-      if (last) cue(last.ok ? 'success' : last.reason === 'interrupted' ? 'unknown' : 'failure');
+      if (last) this.outcomeCue(last.ok ? 'success' : last.reason === 'interrupted' ? 'unknown' : 'failure');
     }
   }
 
@@ -452,10 +481,10 @@ export class ButtonController {
     const o = outcomeOf(host);
     if (!o || !this.isOwn(o.runId) || this.handled.includes(o.runId)) return;
     this.markHandled(o.runId);
-    if (o.ok) return cue('success');
+    if (o.ok) return this.outcomeCue('success');
     // Stopped on purpose (a cancel, a `stops`): not a failure, no failure buzz.
     if (o.reason === 'cancelled') return;
-    cue(o.reason === 'interrupted' ? 'unknown' : 'failure');
+    this.outcomeCue(o.reason === 'interrupted' ? 'unknown' : 'failure');
     const state: Extract<RunState, { phase: 'failure' }> = o.state ?? {
       phase: 'failure',
       runId: o.runId,
@@ -491,6 +520,11 @@ export class ButtonController {
       this.deny();
       // The host may be back already: try now rather than at the next retry.
       ctx.kick();
+      return false;
+    }
+    // Back from a long stretch away, the host's current word not in yet: this face may be minutes old.
+    if (ctx.syncing?.()) {
+      this.deny('syncing');
       return false;
     }
     if (!ctx.mayStart(t)) return false;
@@ -638,6 +672,10 @@ export class ButtonController {
       ctx.kick();
       return 'offline';
     }
+    if (ctx.syncing?.()) {
+      this.deny('syncing');
+      return 'syncing';
+    }
     // A finger is on it already.
     if (this.g) return 'none';
     const now = wall();
@@ -659,8 +697,8 @@ export class ButtonController {
     return 'again';
   }
 
-  private deny() {
-    this.flash('denied');
+  private deny(kind: 'denied' | 'syncing' = 'denied') {
+    this.flash(kind);
     cue('denied');
   }
 
@@ -743,6 +781,7 @@ export class ButtonController {
       skew: ctx.skew(),
       queue: host.phase === 'running' && ctx.button().whileRunning === 'queue',
       starts: host.phase !== 'running' || ctx.button().whileRunning === 'queue',
+      lateness: latenessOf(ctx.button()),
     };
     this.outcome = null;
     this.lateSeq = 0;
@@ -759,14 +798,16 @@ export class ButtonController {
         onSent: () => {
           if (seq !== this.sendSeq || sent) return;
           sent = true;
-          // The 2 s NO RESPONSE clock starts when the press is on the wire.
-          this.after('ack', ACK_TIMEOUT_MS, () => seq === this.sendSeq && this.noResponse(press));
+          // The NO RESPONSE clock starts when the press is on the wire. How long it runs is the
+          // backend's call: 2 s, longer on a link whose round trips have been slow (never past 6 s).
+          const wait = Math.max(ACK_TIMEOUT_MS, ctx.ackTimeout?.() ?? ACK_TIMEOUT_MS);
+          this.after('ack', wait, () => seq === this.sendSeq && this.noResponse(press, wait));
         },
         onAck: (ack) => (seq === this.sendSeq ? this.onAck(ack, baseRunId) : seq === this.lateSeq && this.onLateAck(ack)),
       })
       .catch((e: unknown) => {
         if (seq !== this.sendSeq || !this.l.sending || this.l.sending.acked) return;
-        if (sent && !(e instanceof PressError && !e.sent)) this.noResponse(press);
+        if (sent && !(e instanceof PressError && !e.sent)) this.noResponse(press, null);
         else this.notSent('not connected to the host');
       });
   }
@@ -782,8 +823,11 @@ export class ButtonController {
     cue('denied');
   }
 
-  /** Sent and not answered: it may or may not have run. The host's state will tell (onHost). */
-  private noResponse(press: Sent) {
+  /**
+   * Sent and not answered: it may or may not have run. The host's state will tell (onHost).
+   * `waitedMs`: how long it waited for the answer; null: the link dropped before one came.
+   */
+  private noResponse(press: Sent, waitedMs: number | null) {
     const s = this.l.sending;
     if (!s || s.acked) return;
     this.clear('ack');
@@ -791,10 +835,10 @@ export class ButtonController {
     this.lateSeq = this.sendSeq;
     this.sendSeq++;
     this.patch({ sending: null });
-    this.setResult({ kind: 'noresponse', runId: press.baseRunId, at: now });
-    this.outcome = { ...press, until: now + OUTCOME_WINDOW_MS, requeued: false, fresh: false };
+    this.setResult({ kind: 'noresponse', runId: press.baseRunId, at: now, ...(waitedMs === null ? { dropped: true as const } : { waitedMs: Math.round(waitedMs) }) });
+    this.outcome = { ...press, until: now + Math.max(OUTCOME_WINDOW_MS, this.lateness(press) * 3), requeued: false, fresh: false };
     // From when the host can no longer run it, a fresh hello settles it (checkLost).
-    this.after('lost', Math.max(0, press.made + PRESS_MAX_AGE_MS + LOST_MARGIN_MS - now) + 20, () => this.checkLost());
+    this.after('lost', Math.max(0, press.made + this.lateness(press) + LOST_MARGIN_MS - now) + 20, () => this.checkLost());
     // Not the failure buzz: we don't know that it failed.
     cue('unknown');
     this.ctx?.kick();

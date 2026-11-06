@@ -9,9 +9,11 @@ import { resultShown, type FlashKind, type Local, type LocalResult, type Via } f
  * success / failure: how a run ended. stopped: cancelled on purpose (a cancel press, another
  * button's `stops`, removed from the config): neutral, not red. unknown: amber "?", the outcome
  * isn't known (NO RESPONSE; IT RAN when the host no longer knows how). interrupted: amber, the
- * host stopped while it ran.
+ * host stopped while it ran. syncing: back from a long stretch in the background (or a frozen
+ * tab): what the screen last showed may be minutes old, and what the socket delivers first is a
+ * backlog, so nothing is shown as live until the host's current word is in.
  */
-export type Visual = 'ready' | 'arming' | 'confirm' | 'sending' | 'running' | 'success' | 'failure' | 'stopped' | 'unknown' | 'interrupted' | 'offline';
+export type Visual = 'ready' | 'arming' | 'confirm' | 'sending' | 'running' | 'success' | 'failure' | 'stopped' | 'unknown' | 'interrupted' | 'offline' | 'syncing';
 
 /** The visuals of a run (or a press) that ended. */
 export const RESULTS: readonly Visual[] = ['success', 'failure', 'stopped', 'unknown', 'interrupted'];
@@ -71,8 +73,11 @@ export interface ButtonVM {
   seenElapsed?: number;
   /** Latched device state (`@state`), e.g. "REC ●": shown in every state. */
   latched?: string;
-  /** READY: how the last run ended, and how long ago. */
-  last?: { tone: 'ok' | 'bad' | 'stopped' | 'warn'; ago: string };
+  /**
+   * READY: how the last run ended, how long ago, and its result text when that is short ("✓
+   * printing 37% · 3 s ago"; shown only where it fits whole).
+   */
+  last?: { tone: 'ok' | 'bad' | 'stopped' | 'warn'; ago: string; text?: string };
   /** The run on screen was started on another device. */
   other?: boolean;
 }
@@ -196,7 +201,14 @@ function localView(r: LocalResult, skew: number): Part {
       return { ...failure(h, r.fromLast), ...times, sticky: true };
     }
     case 'noresponse':
-      return { visual: 'unknown', title: 'NO RESPONSE', detail: 'The host didn’t answer in 2 s', code: 'NO RESPONSE', endedAt: r.at, sticky: true };
+      return {
+        visual: 'unknown',
+        title: 'NO RESPONSE',
+        detail: r.dropped ? 'The link dropped before the host answered' : `The host didn’t answer in ${waited(r.waitedMs ?? 2000)}`,
+        code: 'NO RESPONSE',
+        endedAt: r.at,
+        sticky: true,
+      };
     case 'notsent':
       return { visual: 'failure', title: 'NOT SENT', detail: r.text, code: 'NOT SENT', endedAt: r.at, sticky: true };
     case 'didntrun':
@@ -209,9 +221,16 @@ function localView(r: LocalResult, skew: number): Part {
   }
 }
 
+/** 2 s · 2.6 s */
+const waited = (ms: number) => `${Number((ms / 1000).toFixed(1))} s`;
+
+/** Result text longer than this isn't "short": READY's corner mark leaves it out. */
+export const LAST_TEXT_MAX = 40;
+
 function lastMark(last: LastResult, skew: number, now: number): ButtonVM['last'] {
   const tone = last.ok ? 'ok' : last.reason === 'cancelled' ? 'stopped' : last.reason === 'interrupted' ? 'warn' : 'bad';
-  return { tone, ago: ago(now - (last.endedAt + skew)) };
+  const text = last.text?.replace(/\s+/g, ' ').trim();
+  return { tone, ago: ago(now - (last.endedAt + skew)), ...(text && [...text].length <= LAST_TEXT_MAX ? { text } : {}) };
 }
 
 export interface ViewExtra {
@@ -219,6 +238,8 @@ export interface ViewExtra {
   latched?: string;
   /** While offline: local time the host was last heard from. */
   lastSeen?: number | null;
+  /** Back from a long stretch in the background: the host's current word isn't in yet (Snapshot.syncing). */
+  syncing?: boolean;
 }
 
 export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus, skew: number, now: number, extra: ViewExtra = {}): ButtonVM {
@@ -255,6 +276,9 @@ export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus
     if (under.visual === 'running') out.seenElapsed = Math.max(0, (extra.lastSeen ?? now) - (under.startedAt ?? now));
     return out;
   }
+  // Back from a long stretch away: neither what the screen showed before nor the backlog the socket
+  // replays first is news. Still and dimmed until the host's current word is in.
+  if (extra.syncing && link === 'online') return { ...vm, visual: 'syncing', arming: null, pressed: false, doubleWait: false, flash: l.flash };
   const running = fromHost.visual === 'running';
   const c = l.confirm && l.confirm.until > now ? l.confirm : null;
   if (l.sending && !running) return { ...vm, visual: 'sending' };
@@ -270,6 +294,7 @@ export function viewOf(b: WireButton, host: RunState, l: Local, link: ConnStatus
 
 /** Re-render cadence a VM needs (0 = none): running clocks, the cancel hint's grace, results running out, "12 s ago". */
 export function tickFor(vm: ButtonVM, now: number): number {
+  if (vm.visual === 'syncing') return 0;
   const under = vm.visual === 'offline' ? vm.under : vm.visual;
   // Offline: a host result runs out; a run's clock is stopped.
   if (vm.visual === 'offline') return isResult(under) ? 500 : 0;

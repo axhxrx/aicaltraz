@@ -365,10 +365,11 @@ describe.skipIf(!posix)('a state file someone else could have written', () => {
       expect(logs[0]).toStartWith(`state: ${path} is not private (`);
       expect(logs[0]).toContain(why);
       expect(logs[0]).toEndWith('): someone else could have written it, so the runs it lists as still running are left alone');
-      // Shown as interrupted, like any run the previous host lost; ids, results and latched state are kept.
+      // Shown as interrupted, like any run the previous host lost; ids, results and latched state are
+      // kept (the latched state marked uncertain: the run that set it was cut off).
       expect(store.get('p/a')).toMatchObject({ phase: 'failure', runId: 5, reason: 'interrupted', text: INTERRUPTED_TEXT });
       expect(store.runs()[0]).toMatchObject({ runId: 5, reason: 'interrupted', error: `interrupted: the host stopped while it ran (pid ${pid} left alone: the state file is not private)` });
-      expect(store.latched()).toEqual({ 'p/a': 'ON' });
+      expect(store.latched()).toEqual({ 'p/a': '? ON' });
       expect(store.press('p', 'a')).toMatchObject({ result: 'started', runId: 6 });
       await store.shutdown(20);
       // Saved again by this host: 0600, and the forged entry is gone.

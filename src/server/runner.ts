@@ -86,6 +86,12 @@ export interface RunHandle {
   kill(): boolean;
   /** SIGKILL the process group now. */
   forceKill(): void;
+  /**
+   * Re-arm the time limit: it now ends `remainingMs` from now (≤ 0: it times out at once, reason
+   * `timeout`). Nothing happens once the run is ending (exited, or killed). Optional: a run that
+   * spawns nothing has no time limit.
+   */
+  retime?(remainingMs: number): void;
   /** Whether anything in the run's process group is still alive (on Linux, zombies don't count). */
   alive(): boolean;
   /** Killed, and the process group was neither seen empty nor SIGKILLed yet (the grace period is running). */
@@ -485,9 +491,12 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
     clearInterval(pollTimer);
     killTimer = pollTimer = undefined;
   };
+  /** A SIGTERM (Windows: taskkill) reached it: no time limit changes any more. */
+  let killed = false;
   const kill = (): boolean => {
     if (killTimer) return true; // already on its way down
     if ((exited && !alive()) || !signalGroup('SIGTERM')) return false;
+    killed = true;
     if (isWindows) return true; // taskkill /F is final
     killTimer = setTimeout(() => {
       stopKillTimers();
@@ -502,12 +511,21 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
     return true;
   };
 
-  const timeout = child
-    ? setTimeout(() => {
-        timedOut = true;
-        kill();
-      }, Math.min(spec.timeoutMs, MAX_DELAY_MS))
-    : undefined;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeUp = () => {
+    timeout = undefined;
+    timedOut = true;
+    kill();
+  };
+  /** The time limit ends `ms` from now. */
+  const arm = (ms: number) => {
+    clearTimeout(timeout);
+    timeout = undefined;
+    if (!child || exited || killed) return;
+    if (ms <= 0) timeUp();
+    else timeout = setTimeout(timeUp, Math.min(ms, MAX_DELAY_MS));
+  };
+  arm(spec.timeoutMs);
 
   const done = new Promise<RunOutcome>((resolveDone) => {
     const finish = (exitCode: number | null, signal: string | null) => {
@@ -565,6 +583,7 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
       stopKillTimers();
       signalGroup('SIGKILL');
     },
+    retime: arm,
     alive,
     dying: () => killTimer !== undefined,
     stdout: () => outTail.text(),

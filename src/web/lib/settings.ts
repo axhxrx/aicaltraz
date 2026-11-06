@@ -30,6 +30,8 @@ export function lsJSON<T>(key: string): T | null {
 
 export const KEYS = {
   token: 'buttpad.token',
+  /** The token before a new one the host hasn't taken yet (lib/env.ts saveFallbackToken). */
+  tokenFallback: 'buttpad.token.fallback',
   pad: 'buttpad.pad',
   settings: 'buttpad.settings',
   configCache: 'buttpad.configCache',
@@ -45,9 +47,14 @@ export interface DeviceSettings {
    * a cooldown of at least 800 ms after each press, and 1.5× the drift tolerance.
    */
   rough: boolean;
+  /**
+   * Show mode (a dark house, a stage): every face dimmed to its hue, results as a colored edge,
+   * glyph and text instead of a bright full-tile flood, and no bright flashes.
+   */
+  show: boolean;
 }
 
-const DEFAULTS: DeviceSettings = { sound: false, haptics: true, keepAwake: true, rough: false };
+const DEFAULTS: DeviceSettings = { sound: false, haptics: true, keepAwake: true, rough: false, show: false };
 
 /** This browser refuses to store anything (private mode, "block all site data"). */
 export const storageBlocked = ((): boolean => {

@@ -5,7 +5,7 @@
 import { Fragment, type HTMLAttributes, type JSX } from 'preact';
 import { useLayoutEffect, useMemo, useRef } from 'preact/hooks';
 import { wall } from '../lib/clock.ts';
-import { inkFor } from '../lib/color.ts';
+import { inkFor, showPalette } from '../lib/color.ts';
 import { fmtElapsed } from '../lib/env.ts';
 import { chunks, fitFontSize, langOf, lineFontSize, lineWidths, useFontEpoch } from '../lib/fit.ts';
 import { Check, Cross, Devices, DoubleTap, Hold, Interrupted, Keyboard, Lock, Question, Stop, Tap, Warn } from '../ui/icons.tsx';
@@ -20,6 +20,11 @@ export interface FaceProps extends Omit<HTMLAttributes<HTMLDivElement>, 'style' 
   style?: Record<string, string>;
   /** The ✕ on a result kept on screen (run mode): clears it without a press. */
   onDismiss?: () => void;
+  /**
+   * Show mode (device setting, a dark house): the face dimmed to its hue, results as a colored
+   * edge + glyph + text instead of a full-tile flood, no bright flashes.
+   */
+  show?: boolean;
 }
 
 const POP: Keyframe[] = [{ transform: 'scale(1)' }, { transform: 'scale(1.045)', offset: 0.32 }, { transform: 'scale(0.99)', offset: 0.7 }, { transform: 'scale(1)' }];
@@ -95,20 +100,48 @@ function Hints({ vm }: { vm: ButtonVM }) {
 
 const LAST_GLYPH = { ok: '✓', bad: '✗', stopped: '■', warn: '!' } as const;
 
+/** Width (em) of `s` on one line at `weight`, with `track` em of letter-spacing per character (as the CSS sets it). */
+const emWidth = (s: string, weight: number, track: number) => (lineWidths(s, weight)[0] ?? 0) + track * [...s].length;
+
+/**
+ * How wide (in em of the top band's font) READY's corner mark is with its result text, plus the
+ * latched chip beside it: the text shows only where all of it fits (the CSS compares this with the
+ * button's width), never as "Still pri…". Mirrors the paddings and letter-spacings in button.css.
+ */
+function lastNeedEm(text: string, ago: string, latched: string | undefined): number {
+  // glyph (1.3em at 0.95em) + its gap + the mark's paddings
+  let em = 1.235 + 0.4 + 0.82 + emWidth(`${text} ·`, 700, 0.02) + 0.3 + emWidth(ago, 900, 0.06);
+  // the latched chip: its paddings, its text, and the 6 px gap (≤ 0.6em at the band's smallest font)
+  if (latched) em += 1.4 + emWidth(latched, 900, 0.05) + 0.6;
+  return Math.ceil((em + 0.6) * 100) / 100;
+}
+
 /**
  * The top edge: another device's run, how the last run ended, or the ✕ of a result kept on screen
  * (left); latched device state (right).
  */
 function TopBand({ vm, onDismiss }: { vm: ButtonVM; onDismiss?: () => void }) {
+  useFontEpoch();
+  const lastText = vm.last?.text;
   const left = vm.other ? (
     <span class="bp-mark bp-other" data-testid={`other-${vm.id}`}>
       <Devices />
       <span class="bp-chip-text">OTHER DEVICE</span>
     </span>
   ) : vm.last ? (
-    <span class={`bp-mark bp-last is-${vm.last.tone}`} data-testid={`last-${vm.id}`}>
+    <span
+      class={`bp-mark bp-last is-${vm.last.tone}`}
+      data-testid={`last-${vm.id}`}
+      style={lastText ? { '--need': String(lastNeedEm(lastText, vm.last.ago, vm.latched)) } : undefined}
+    >
       <i>{LAST_GLYPH[vm.last.tone]}</i>
       <span class="bp-chip-text">
+        {lastText && (
+          <span class="bp-last-text" data-testid={`last-text-${vm.id}`}>
+            {lastText}
+            {' · '}
+          </span>
+        )}
         <span class="bp-long">{vm.last.ago}</span>
         <span class="bp-short">{vm.last.ago.replace(/ (\w) ago$/, '$1')}</span>
       </span>
@@ -209,6 +242,13 @@ function Content({ vm, now }: { vm: ButtonVM; now: number }) {
         </>
       );
     }
+    case 'syncing':
+      return (
+        <>
+          {label}
+          <div class="bp-sub bp-syncing-tag">SYNCING…</div>
+        </>
+      );
     case 'offline': {
       // What the host was last seen doing (its look stays underneath, dimmed and still).
       const u = vm.under;
@@ -258,11 +298,13 @@ function badgeOf(kind: FlashKind, vm: ButtonVM): [string, string?] | undefined {
       return ['NOT ON HOST'];
     case 'slipped':
       return ['SLIPPED', `${verbOf(vm.trigger)} AGAIN`];
+    case 'syncing':
+      return ['WAIT', 'SYNCING'];
     case 'denied':
       return undefined;
   }
 }
-const SHAKES: FlashKind[] = ['busy', 'later', 'denied', 'already'];
+const SHAKES: FlashKind[] = ['busy', 'later', 'denied', 'already', 'syncing'];
 /** As big as the button allows: the word (plus padding) fits 88% of the width. */
 const badgeSize = (word: string) => `clamp(12px, min(17cqh, calc(88cqw / ${((lineWidths(word)[0] ?? 3) + 1.1 + 0.04 * word.length).toFixed(3)})), 110px)`;
 
@@ -277,9 +319,13 @@ const FC_WORD: Partial<Record<Visual, string>> = {
   unknown: 'UNKNOWN',
   interrupted: 'INTERRUPTED',
   offline: 'OFFLINE',
+  syncing: 'SYNCING',
 };
 
-export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: FaceProps) {
+/** The visuals with FAILURE's texture: cross-hatching (so a failure isn't "just red" next to a red E-STOP). */
+const HATCHED: readonly Visual[] = ['failure'];
+
+export function ButtonFace({ vm, now, class: cls, style, onDismiss, show, ...rest }: FaceProps) {
   const face = useRef<HTMLDivElement>(null);
   const arm = useRef<HTMLDivElement>(null);
   const flash = useRef<HTMLDivElement>(null);
@@ -310,11 +356,11 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: F
     });
   }, [vm.disarmAt]);
 
-  // Fired: pop + flash, and the full fill fades away.
+  // Fired: pop + flash, and the full fill fades away. In show mode the flash is a faint one (a dark house).
   useLayoutEffect(() => {
     if (!vm.firedAt || wall() - vm.firedAt > 400) return;
     move(face.current, POP, { duration: 320, easing: 'cubic-bezier(.2,.8,.3,1)' });
-    flash.current?.animate([{ opacity: 0.65 }, { opacity: 0 }], { duration: 420, easing: 'ease-out' });
+    flash.current?.animate([{ opacity: show ? 0.14 : 0.65 }, { opacity: 0 }], { duration: 420, easing: 'ease-out' });
     const el = arm.current;
     if (el && armAnim.current) {
       armAnim.current.cancel();
@@ -334,7 +380,9 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: F
     return null;
   }, [v, vm.endedAt, vm.confirmUntil, vm.resultHoldMs]);
 
-  const ink = inkFor(vm.color);
+  // Show mode: the hue dimmed (a dark house), with an ink that keeps its contrast on it.
+  const pal = show ? showPalette(vm.color) : null;
+  const colors: Record<string, string> = pal ? { '--bg': pal.bg, '--ink': pal.ink, '--edge': pal.edge } : { '--bg': vm.color, '--ink': inkFor(vm.color) };
   // Offline: the last-known state's layers stay, under the OFFLINE look.
   const u = v === 'offline' ? vm.under : v;
   const badge = vm.flash ? badgeOf(vm.flash.kind, vm) : undefined;
@@ -347,9 +395,10 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: F
       data-testid={`btn-${vm.id}`}
       data-flash={vm.flash?.kind}
       data-sticky={vm.sticky ? '' : undefined}
+      data-show={show ? '' : undefined}
       role="button"
       aria-label={`${vm.label || vm.id}: ${v}${vm.title ? ` (${vm.title})` : ''}${v === 'offline' && vm.under && vm.under !== 'ready' ? ` (last seen ${vm.under})` : ''}${vm.latched ? `, ${vm.latched}` : ''}`}
-      style={{ '--bg': vm.color, '--ink': ink, ...style }}
+      style={{ ...colors, ...style }}
       {...rest}
     >
       <div ref={face} class={`bp-face${vm.pressed ? ' is-pressed' : ''}`}>
@@ -358,10 +407,11 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, ...rest }: F
         {u === 'running' && vm.progress !== undefined && <div class="bp-prog" style={{ '--p': String(vm.progress / 100) }} />}
         {isResult(v) && <div key={`${v}${vm.endedAt}`} class="bp-flood" />}
         {v === 'offline' && isResult(u) && <div class={`bp-tint is-${u}`} />}
+        {u && HATCHED.includes(u) && <div class="bp-hatch" />}
         {(v === 'failure' || v === 'interrupted') && <div class="bp-pulse" />}
         <div ref={arm} class="bp-arm" />
         <div ref={flash} class="bp-flash" />
-        {(v === 'confirm' || v === 'offline' || v === 'unknown' || v === 'interrupted') && <div class="bp-frame" />}
+        {(v === 'confirm' || v === 'offline' || v === 'unknown' || v === 'interrupted' || (show && isResult(v))) && <div class="bp-frame" />}
         <TopBand vm={vm} onDismiss={onDismiss} />
         <div class="bp-content">
           <Content vm={vm} now={now} />

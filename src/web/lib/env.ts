@@ -34,11 +34,21 @@ export function parseToken(input: string): string | null {
  * app says so) rather than not working at all.
  */
 let memoryToken: string | null = null;
+/** The `#token=` this page was opened with, not stored yet: it may be a typo (the app tries it first). */
+let incomingToken: string | null = null;
+/** See saveFallbackToken. */
+let memoryFallback: string | null = null;
 
-/** Moves `#token=` from the URL into storage and strips it from the address bar. */
+/** Takes `#token=` out of the URL (stripped from the address bar); the app decides whether to store it (takeIncomingToken). */
 export function takeHashToken(): void {
-  const t = readHashToken();
-  if (t) saveToken(t);
+  incomingToken = readHashToken();
+}
+
+/** The `#token=` the page was opened with, once. */
+export function takeIncomingToken(): string | null {
+  const t = incomingToken;
+  incomingToken = null;
+  return t;
 }
 
 /** The `#token=` in the URL, stripped from the address bar (not stored). */
@@ -53,6 +63,16 @@ export const loadToken = () => lsGet(KEYS.token) ?? memoryToken;
 export function saveToken(t: string | null): void {
   memoryToken = t;
   lsSet(KEYS.token, t);
+}
+
+/**
+ * The token this device used before a new one that the host couldn't be asked about first (no
+ * answer): kept until the host takes the new one, so a rejected new token falls back to it.
+ */
+export const loadFallbackToken = () => lsGet(KEYS.tokenFallback) ?? memoryFallback;
+export function saveFallbackToken(t: string | null): void {
+  memoryFallback = t;
+  lsSet(KEYS.tokenFallback, t);
 }
 
 // ---- fullscreen -------------------------------------------------------------------------------

@@ -7,12 +7,14 @@
  *   RUNNING     diagonal stripes scrolling; label big, elapsed clock under it; or a left→right
  *               fill with the %, slow stripes still moving underneath
  *   SUCCESS     green flood from the center, giant ✓ popping in, then still; drain bar
- *   FAILURE     red flood, ✗ shaking in, the reason in big type, slow dark pulse; this device's own
- *               stays until its next run (a press retries; its ✕ clears it)
+ *   FAILURE     red flood with thin cross-hatching, ✗ shaking in, the reason in big type, slow
+ *               dark pulse; this device's own stays until its next run (a press retries; ✕ clears)
  *   STOPPED     slate flood, ■, still: stopped on purpose, not a failure
  *   UNKNOWN     amber flood, "?", dashed frame: NO RESPONSE / IT RAN
  *   INTERRUPTED amber flood with dark hazard stripes, lightning glyph, pulse
  *   OFFLINE     grey, dashed border, ⚠, dim label; shakes when pressed
+ *   SYNCING     dimmed, still, "SYNCING…": back from a long stretch away, until the host's word is in
+ * Show mode (data-show, a dark house): faces dimmed to their hue; results as an edge + glyph + text.
  * Only transform/opacity animate. Sizes come from container query units of .bp-btn.
  */
 
@@ -287,10 +289,31 @@
 }
 
 /* Small buttons: drop the extras, keep the label. */
-@container (max-height: 130px) or (max-width: 110px) {
+@container (max-height: 130px) {
   .bp-hints,
   .bp-time {
     display: none;
+  }
+}
+/* Narrow ones (4 columns on a phone: ~90 px) keep what is about safety, as glyphs: how to press it
+   (hold / tap / double, and a hold's duration) and the confirm lock. The key chip goes. */
+@container (max-width: 110px) {
+  .bp-time,
+  .bp-key,
+  .bp-trigger .bp-chip-word {
+    display: none;
+  }
+  .bp-hints {
+    justify-content: center;
+    letter-spacing: 0.02em;
+  }
+  .bp-chip.bp-trigger {
+    gap: 0.2em;
+    padding: 0.3em 0.45em;
+  }
+  .bp-trigger svg {
+    width: 1.45em;
+    height: 1.45em;
   }
 }
 @container (max-height: 170px) {
@@ -310,7 +333,7 @@
 .bp-btn[data-visual='arming'] .bp-label {
   animation: bp-settle 0.28s ease-out both;
 }
-@container (min-height: 131px) and (min-width: 111px) {
+@container (min-height: 131px) {
   .bp-btn[data-visual='ready'] .bp-content,
   .bp-btn[data-visual='arming'] .bp-content {
     padding-bottom: 1.4em;
@@ -526,6 +549,26 @@
   opacity: 0;
   animation: bp-pulse 1.6s ease-in-out 0.5s infinite;
 }
+/* FAILURE's texture: thin cross-hatching (✗✗✗), still. A failure isn't "just red" next to a red
+   E-STOP, in grayscale too; RUNNING's stripes are wide and move, INTERRUPTED's are wide hazard
+   bands. Comes in after the flood. */
+.bp-hatch {
+  --hw: max(2px, 0.9cqmin);
+  --hs: max(11px, 6.4cqmin);
+  --hc: rgb(0 0 0 / 0.32);
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(45deg, transparent 0 calc(var(--hs) - var(--hw)), var(--hc) 0 var(--hs)),
+    repeating-linear-gradient(-45deg, transparent 0 calc(var(--hs) - var(--hw)), var(--hc) 0 var(--hs));
+  animation: bp-fade 0.45s ease-out 0.2s both;
+}
+/* Under the OFFLINE look ("LAST RUN: EXIT 3"): the same texture, in the failure red, faint. */
+.bp-btn[data-visual='offline'] .bp-hatch {
+  --hc: rgb(227 38 43 / 0.3);
+  animation: none;
+}
 .bp-drain {
   position: absolute;
   left: 0;
@@ -643,6 +686,31 @@
   --line-max: clamp(10px, min(5cqh, 4.6cqw), 22px);
 }
 
+/* ---- SYNCING: back from a long stretch away, the host's current word not in yet -------- */
+
+/* Still and dimmed: neither the minutes-old picture nor the backlog the socket replays is news. */
+.bp-btn[data-visual='syncing'] .bp-face {
+  --ink: #e6e9ee;
+}
+.bp-btn[data-visual='syncing'] .bp-base {
+  filter: brightness(0.45) saturate(0.6);
+  box-shadow: none;
+}
+.bp-btn[data-visual='syncing'] .bp-label {
+  --fit-h: calc(var(--ih) * 0.34);
+  --fit-max: 22cqh;
+  opacity: 0.7;
+}
+.bp-btn[data-visual='syncing'] .bp-latched {
+  opacity: 0.5;
+}
+.bp-syncing-tag {
+  font-size: clamp(10px, min(5.4cqh, 5cqw), 22px);
+  font-weight: 900;
+  letter-spacing: 0.14em;
+  opacity: 0.75;
+}
+
 /* ---- the top edge: the last result / another device's run (left), latched state (right) -- */
 
 .bp-btn.has-top .bp-face {
@@ -701,6 +769,18 @@
 .bp-last.is-warn i {
   background: var(--amber);
   color: var(--warn-ink);
+}
+/* "✓ printing 37% · 3 s ago": the result text, whole or not at all. --need (ButtonFace) is the
+   mark's width with it (and the latched chip beside it), in em of this font; where the band is
+   narrower, max-width comes out 0 and only "3 s ago" shows. */
+.bp-last-text {
+  display: inline-block;
+  vertical-align: top;
+  overflow: hidden;
+  white-space: pre;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  max-width: clamp(0px, (100cqw - 1.4 * var(--pad) - var(--top-fs) * var(--need, 99)) * 999, 100cqw);
 }
 .bp-other {
   padding-left: 0.5em;
@@ -1032,6 +1112,156 @@
   cursor: default;
 }
 
+/* ---- SHOW MODE (device setting): a dark house -------------------------------------------
+   Every face is its hue dimmed to the same low lightness (ButtonFace sets --bg/--ink/--edge from
+   lib/color.ts showPalette: ink ≥ 7:1 on it), with a thin edge in the hue. A result is a colored
+   edge + glyph + text on a near-black face, never a full-tile flood; FAILURE keeps its hatching
+   (in red), and its pulse moves the edge, not the brightness. No white flashes: the fire flash is
+   faint, badges and pills are dim. Motion and shape still tell the states apart. */
+.bp-btn[data-show] {
+  --ok: #3fb56c;
+  --bad: #e5484d;
+  --stop: #8a94a3;
+  --amber: #d29a1e;
+  --ok-ink: #04140a;
+  --warn-ink: #1a1200;
+  --sh-face: #0c0d10;
+}
+.bp-btn[data-show] .bp-base {
+  background: var(--bg);
+  box-shadow: inset 0 0 0 max(2px, 0.9cqmin) var(--edge);
+}
+.bp-btn[data-show] .bp-arm::after {
+  opacity: 0.2;
+}
+.bp-btn[data-show] .bp-flash {
+  background: var(--ink);
+}
+.bp-btn[data-show] .bp-flood,
+.bp-btn[data-show] .bp-pulse {
+  display: none;
+}
+/* CONFIRM: the amber frame still blinks, dim and softer. */
+.bp-btn[data-show][data-visual='confirm'] .bp-face {
+  --ink: inherit;
+}
+.bp-btn[data-show][data-visual='confirm'] .bp-base {
+  filter: brightness(0.75);
+}
+.bp-btn[data-show][data-visual='confirm'] .bp-frame {
+  border-color: var(--amber);
+  animation: bp-blink-soft 1s steps(1, end) infinite;
+}
+.bp-btn[data-show][data-visual='running'] .bp-base {
+  filter: none;
+}
+.bp-btn[data-show] .bp-stripes {
+  opacity: 0.14;
+}
+.bp-btn[data-show] .bp-stripes.is-under {
+  opacity: 0.08;
+}
+.bp-btn[data-show] .bp-prog::before {
+  opacity: 0.16;
+}
+.bp-btn[data-show] .bp-prog::after {
+  opacity: 0.4;
+}
+/* Results: --res is the result's color (edge, glyph, countdown), --res-text its lighter tint (text). */
+.bp-btn[data-show][data-visual='success'] .bp-face {
+  --ink: inherit;
+  --res: var(--ok);
+  --res-text: #8fd9aa;
+}
+.bp-btn[data-show][data-visual='failure'] .bp-face {
+  --ink: inherit;
+  --res: var(--bad);
+  --res-text: #f3a1a3;
+}
+.bp-btn[data-show][data-visual='stopped'] .bp-face {
+  --ink: inherit;
+  --res: var(--stop);
+  --res-text: #c6ccd5;
+}
+.bp-btn[data-show]:is([data-visual='unknown'], [data-visual='interrupted']) .bp-face {
+  --ink: inherit;
+  --res: var(--amber);
+  --res-text: #ecc673;
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-base {
+  background: color-mix(in srgb, var(--res) 9%, var(--sh-face));
+  box-shadow: none;
+}
+.bp-btn[data-show][data-visual='interrupted'] .bp-base {
+  background:
+    repeating-linear-gradient(-45deg, color-mix(in srgb, var(--amber) 15%, transparent) 0 max(10px, 6cqmin), transparent 0 max(20px, 12cqmin)),
+    var(--sh-face);
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-frame {
+  border: max(4px, 2.6cqmin) solid var(--res);
+  opacity: 1;
+  animation: bp-fade 0.35s ease-out both;
+}
+.bp-btn[data-show][data-visual='unknown'] .bp-frame {
+  border-style: dashed;
+}
+/* The pulse of a failure (and INTERRUPTED) moves the edge: motion without a flash. */
+.bp-btn[data-show]:is([data-visual='failure'], [data-visual='interrupted']) .bp-frame {
+  animation:
+    bp-fade 0.35s ease-out both,
+    bp-pulse-edge 1.6s ease-in-out 0.5s infinite;
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) .bp-icon {
+  color: var(--res);
+}
+.bp-btn[data-show]:is([data-visual='success'], [data-visual='failure'], [data-visual='stopped'], [data-visual='unknown'], [data-visual='interrupted']) :is(.bp-headline, .bp-sub, .bp-sticky) {
+  color: var(--res-text);
+}
+.bp-btn[data-show] .bp-hatch {
+  --hc: color-mix(in srgb, var(--bad) 30%, transparent);
+}
+.bp-btn[data-show] .bp-drain {
+  background: var(--res, var(--ink));
+  opacity: 0.75;
+}
+.bp-btn[data-show] .bp-drain-confirm {
+  background: var(--amber);
+}
+.bp-btn[data-show] :is(.bp-pill, .bp-next) {
+  background: transparent;
+  color: var(--res-text, var(--ink));
+  box-shadow: inset 0 0 0 0.12em currentColor;
+}
+.bp-btn[data-show] .bp-badge {
+  color: #c9ced6;
+  box-shadow: 0 0 0 0.07em #c9ced666;
+}
+.bp-btn[data-show][data-visual='offline'] .bp-face {
+  --ink: #a3abb6;
+}
+.bp-btn[data-show][data-visual='offline'] .bp-base {
+  background: #1b1e23;
+}
+.bp-btn[data-show][data-visual='offline'] .bp-frame {
+  border-color: #5d6672;
+}
+.bp-btn[data-show][data-visual='syncing'] .bp-base {
+  filter: brightness(0.7) saturate(0.6);
+}
+.bp-btn[data-show][data-visual='syncing'] .bp-face {
+  --ink: inherit;
+}
+@keyframes bp-blink-soft {
+  50% {
+    opacity: 0.4;
+  }
+}
+@keyframes bp-pulse-edge {
+  50% {
+    opacity: 0.45;
+  }
+}
+
 /* ---- keyframes ------------------------------------------------------------------------ */
 
 @keyframes bp-stripes {
@@ -1162,10 +1392,12 @@
   .bp-head,
   .bp-icon,
   .bp-flood,
+  .bp-hatch,
   .bp-label {
     animation: none !important;
   }
-  .bp-btn[data-visual='confirm'] .bp-frame {
+  .bp-btn[data-visual='confirm'] .bp-frame,
+  .bp-btn[data-show] .bp-frame {
     animation: none;
   }
 }
@@ -1175,6 +1407,12 @@
 @media (forced-colors: active) {
   .bp-face {
     border: 2px solid ButtonText;
+  }
+  /* FAILURE's cross-hatching survives in the text color. */
+  .bp-hatch {
+    forced-color-adjust: none;
+    --hc: CanvasText;
+    opacity: 0.3;
   }
   .bp-arm::before,
   .bp-arm::after,

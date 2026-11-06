@@ -12,7 +12,7 @@ import { wall } from '../lib/clock.ts';
 import { eventTime } from '../lib/env.ts';
 import { settings } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { ButtonController, resultShown, type KeyResult } from './controller.ts';
+import { ACK_TIMEOUT_MS, ButtonController, resultShown, type KeyResult } from './controller.ts';
 import { keyName, READY } from './view.ts';
 
 /** Contacts landing on this many buttons within PALM_MS: a palm or a sleeve, not presses. */
@@ -81,8 +81,9 @@ export class RunSession {
     const p = this.prev;
     this.prev = s;
     if (s.config !== p.config) this.sync(s);
-    // A hello (or the demo coming back) brings states whose runs this device didn't see start.
-    const live = p.status === 'online' && s.status === 'online';
+    // A hello (or the demo coming back) brings states whose runs this device didn't see start; so
+    // does the backlog a socket delivers to a page back from a long stretch away (syncing).
+    const live = p.status === 'online' && s.status === 'online' && !s.syncing;
     if (s.states !== p.states)
       for (const e of this.entries.values()) {
         // A state that's gone (the demo's Reset) is READY, run ids started over.
@@ -90,6 +91,8 @@ export class RunSession {
         if (st && st !== p.states[e.key]) e.ctrl.onHost(st, live);
       }
     if (s.status !== p.status) for (const e of this.entries.values()) e.ctrl.onLink(s.status === 'online');
+    // Caught up (the answer to the ping sent on waking came after the backlog): as good as a hello.
+    else if (p.syncing && !s.syncing && s.status === 'online') for (const e of this.entries.values()) e.ctrl.onLink(true);
     this.updateMarks();
   }
 
@@ -145,6 +148,8 @@ export class RunSession {
       },
       kick: () => this.backend.kick(),
       mayStart: (t) => this.mayStart(e, t),
+      ackTimeout: () => this.backend.ackTimeoutMs?.() ?? ACK_TIMEOUT_MS,
+      syncing: () => snap().syncing && snap().status === 'online',
     });
     e.off = ctrl.local.subscribe(() => this.updateMarks());
     return e;
@@ -213,6 +218,7 @@ export class RunSession {
     else if (what === 'busy') this.say(`${name}: busy, the last press is still on its way`, 'warn');
     else if (what === 'queued') this.say(`${name}: already queued, its next run starts in a moment`, 'warn');
     else if (what === 'offline') this.say(`${name}: not sent, not connected to the host`, 'warn');
+    else if (what === 'syncing') this.say(`${name}: not sent, catching up with the host (a moment)`, 'warn');
   }
 
   /**

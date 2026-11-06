@@ -1,28 +1,40 @@
 /** Full-screen states outside the pad: pairing, token rejected, first connection, a pad that isn't there. */
 import type { ComponentChildren } from 'preact';
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import type { Role } from '../../core/protocol.ts';
 import { parseToken } from '../lib/env.ts';
-import { Link, Warn } from './icons.tsx';
+import { CODE_MAX, CODE_MIN, codeDigits, pairWithCode } from '../lib/pairing.ts';
+import { Key, Link, Warn } from './icons.tsx';
 
-function Screen(p: { children: ComponentChildren; testid: string; tone?: 'warn' }) {
+function Screen(p: { children: ComponentChildren; testid: string; tone?: 'warn'; class?: string }) {
   return (
-    <main class={`bp-screen${p.tone ? ` is-${p.tone}` : ''}`} data-testid={p.testid} data-scroll>
+    <main class={`bp-screen${p.tone ? ` is-${p.tone}` : ''}${p.class ? ` ${p.class}` : ''}`} data-testid={p.testid} data-scroll>
       <div class="bp-screen-card">{p.children}</div>
     </main>
   );
 }
 
-function PasteToken(p: { onToken(t: string): void; cta: string }) {
+/**
+ * A pairing link (or token) pasted in. `onToken` may answer with why the token isn't in use (the
+ * host rejected it): the field says so, and nothing else changes.
+ */
+function PasteToken(p: { onToken(t: string): void | Promise<string | null>; cta: string }) {
   const [value, setValue] = useState('');
-  const [bad, setBad] = useState(false);
-  const submit = (e: Event) => {
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const submit = async (e: Event) => {
     e.preventDefault();
     const t = parseToken(value);
-    if (t) p.onToken(t);
-    else setBad(true);
+    if (!t) return setErr("That doesn't look like a pairing link or token.");
+    setBusy(true);
+    try {
+      setErr((await p.onToken(t)) ?? null);
+    } finally {
+      setBusy(false);
+    }
   };
   return (
-    <form class="bp-paste" onSubmit={submit}>
+    <form class="bp-paste" onSubmit={(e) => void submit(e)}>
       <label class="bp-paste-label" for="bp-token">
         Pairing link or token
       </label>
@@ -31,25 +43,29 @@ function PasteToken(p: { onToken(t: string): void; cta: string }) {
           id="bp-token"
           data-testid="token-input"
           value={value}
-          onInput={(e) => (setValue(e.currentTarget.value), setBad(false))}
+          onInput={(e) => (setValue(e.currentTarget.value), setErr(null))}
           placeholder="http://192.168.1.20:8787/#token=…"
           autocomplete="off"
           autocapitalize="off"
           spellcheck={false}
           inputMode="url"
         />
-        <button type="submit" class="bp-cta" data-testid="token-submit">
+        <button type="submit" class="bp-cta" data-testid="token-submit" disabled={busy}>
           {p.cta}
         </button>
       </div>
-      {bad && <div class="bp-paste-err">That doesn't look like a pairing link or token.</div>}
+      {err && (
+        <div class="bp-paste-err" role="alert" data-testid="token-error">
+          {err}
+        </div>
+      )}
     </form>
   );
 }
 
 const demoHref = () => `${location.pathname}?demo`;
 
-export function PairingScreen(p: { onToken(t: string): void }) {
+export function PairingScreen(p: { onToken(t: string): void | Promise<string | null>; onCode(): void }) {
   return (
     <Screen testid="pairing">
       <div class="bp-screen-icon">
@@ -65,6 +81,10 @@ export function PairingScreen(p: { onToken(t: string): void }) {
         <li>Or paste the link below.</li>
       </ol>
       <PasteToken onToken={p.onToken} cta="Pair" />
+      <button type="button" class="bp-ghost bp-code-entry" data-testid="pair-with-code" onClick={p.onCode}>
+        Pair with a code…
+      </button>
+      <p class="bp-screen-note">The host prints a one-time pairing code when it starts; an admin device can show one too.</p>
       <a class="bp-demo-link" href={demoHref()} data-testid="try-demo">
         No host handy? Try the demo →
       </a>
@@ -72,7 +92,7 @@ export function PairingScreen(p: { onToken(t: string): void }) {
   );
 }
 
-export function RejectedScreen(p: { onToken(t: string): void; onRetry(): void }) {
+export function RejectedScreen(p: { onToken(t: string): void | Promise<string | null>; onRetry(): void; onCode(): void }) {
   return (
     <Screen testid="rejected" tone="warn">
       <div class="bp-screen-icon">
@@ -83,11 +103,116 @@ export function RejectedScreen(p: { onToken(t: string): void; onRetry(): void })
         The host didn't accept this device's pairing token. Tokens change when the host runs with <code>--rotate-tokens</code>, or the
         link may be for another host.
       </p>
-      <p>Pair again: scan the host's QR code, open its pairing link, or paste it here.</p>
+      <p>Pair again: scan the host's QR code, open its pairing link, paste it here, or use a pairing code.</p>
       <PasteToken onToken={p.onToken} cta="Pair" />
-      <button type="button" class="bp-ghost" data-testid="retry" onClick={p.onRetry}>
-        Try the old token again
-      </button>
+      <div class="bp-screen-actions">
+        <button type="button" class="bp-ghost" data-testid="pair-with-code" onClick={p.onCode}>
+          Pair with a code…
+        </button>
+        <button type="button" class="bp-ghost" data-testid="retry" onClick={p.onRetry}>
+          Try the old token again
+        </button>
+      </div>
+    </Screen>
+  );
+}
+
+/** A pairing link's token being tried on the host before it replaces the one in use. */
+export function CheckingScreen() {
+  return (
+    <Screen testid="checking-link">
+      <div class="bp-spinner" />
+      <h1>Checking the pairing link…</h1>
+      <p>Asking {location.host} whether it takes this link's token. This device stays paired as it is if it doesn't.</p>
+    </Screen>
+  );
+}
+
+const PAIR_ERRORS = {
+  bad: 'That code didn’t work: it’s mistyped, used already, or expired (a code works once, for a few minutes). Get a new one from the host.',
+  limited: 'Too many tries.',
+  unreachable: 'Can’t reach the host. Check that this device is on the same network as the host.',
+  old: 'This host doesn’t take pairing codes (it runs an older ButtPad): open its pairing link instead.',
+} as const;
+
+/**
+ * Pairing by code: the digits the host printed at startup (next to its `…/#pair` link), or that an
+ * admin device shows (Menu → Pair another device). Big digits, the number pad, one tap to pair. A
+ * code that came with the link (`#pair=123456`) is tried at once.
+ */
+export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(token: string, role: Role): void; onCancel(): void }) {
+  const [code, setCode] = useState(p.initial ?? '');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const submit = async () => {
+    const digits = codeDigits(code);
+    if (digits.length < CODE_MIN) return setErr(`Type the whole code: ${CODE_MIN} or more digits.`);
+    setBusy(true);
+    setErr(null);
+    const r = await pairWithCode(digits);
+    setBusy(false);
+    if (r.ok) return p.onPaired(r.token, r.role);
+    setErr(r.why === 'limited' ? `${PAIR_ERRORS.limited} Wait ${r.retryAfter ? `${r.retryAfter} s` : 'a minute'}, then try again.` : PAIR_ERRORS[r.why]);
+    input.current?.focus();
+    input.current?.select();
+  };
+  useEffect(() => {
+    if (codeDigits(p.initial ?? '').length >= CODE_MIN) void submit();
+    else input.current?.focus();
+    const k = (e: KeyboardEvent) => e.key === 'Escape' && p.onCancel();
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, []);
+  return (
+    <Screen testid="pair-code" class="bp-code-screen">
+      <div class="bp-screen-icon">
+        <Key />
+      </div>
+      <h1>{p.paired ? 'Unlock with a pairing code' : 'Pair with a code'}</h1>
+      <p>
+        Type the code the host printed when it started (next to its <code>…/#pair</code> link), or the one an admin device shows under{' '}
+        <b>Menu → Pair another device</b>. A code works once, for a few minutes.
+      </p>
+      <form
+        class="bp-code-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void submit();
+        }}
+      >
+        <label class="bp-paste-label" for="bp-code">
+          Pairing code
+        </label>
+        <input
+          ref={input}
+          id="bp-code"
+          class="bp-code-input"
+          data-testid="code-input"
+          value={code}
+          onInput={(e) => (setCode(e.currentTarget.value), setErr(null))}
+          inputMode="numeric"
+          pattern="[0-9 \-]*"
+          autocomplete="one-time-code"
+          maxLength={CODE_MAX + 4}
+          placeholder="••••••"
+          spellcheck={false}
+          disabled={busy}
+        />
+        {err && (
+          <div class="bp-paste-err" role="alert" data-testid="code-error">
+            {err}
+          </div>
+        )}
+        <div class="bp-code-actions">
+          <button type="submit" class="bp-cta" data-testid="code-submit" disabled={busy}>
+            {busy ? 'Pairing…' : 'Pair'}
+          </button>
+          <button type="button" class="bp-ghost" data-testid="code-cancel" onClick={p.onCancel}>
+            {p.paired ? 'Cancel' : 'Back'}
+          </button>
+        </div>
+      </form>
     </Screen>
   );
 }

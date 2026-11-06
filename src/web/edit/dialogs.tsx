@@ -112,8 +112,17 @@ export function MergeDialog(p: { conflicts: Conflict[]; taken: number; choices: 
   );
 }
 
-export function StopDialog(p: { runs: { name: string; ms: number }[]; onSave(): void; onCancel(): void }) {
-  const list = p.runs.map((r) => `${r.name} (running ${ran(r.ms)})`);
+/** A run a save would end: its button goes (deleted, its or its pad's id changed), or `limit`: its new time limit is shorter than it has run. */
+export interface StopRun {
+  name: string;
+  ms: number;
+  limit?: number;
+}
+
+export function StopDialog(p: { runs: StopRun[]; onSave(): void; onCancel(): void }) {
+  const list = p.runs.map((r) => `${r.name} (running ${ran(r.ms)}${r.limit !== undefined ? `, new limit ${ran(r.limit)}` : ''})`);
+  const gone = p.runs.filter((r) => r.limit === undefined).length;
+  const timedOut = p.runs.length - gone;
   return (
     <Dialog
       title={p.runs.length === 1 ? 'Saving stops a running action' : 'Saving stops running actions'}
@@ -134,7 +143,16 @@ export function StopDialog(p: { runs: { name: string; ms: number }[]; onSave(): 
       <p>
         This will stop: <b data-testid="stop-list">{list.join(', ')}</b>.
       </p>
-      <p>Your draft deletes {p.runs.length === 1 ? 'that button' : 'those buttons'} or changes {p.runs.length === 1 ? 'its' : 'their'} id (or the pad's), so the host ends the run.</p>
+      {gone > 0 && (
+        <p>
+          Your draft deletes {gone === 1 ? 'that button' : 'those buttons'} or changes {gone === 1 ? 'its' : 'their'} id (or the pad's), so the host ends the run.
+        </p>
+      )}
+      {timedOut > 0 && (
+        <p data-testid="stop-timeout">
+          A new time limit applies to the run in progress too, and {timedOut === 1 ? 'it has' : 'they have'} run longer than {timedOut === 1 ? 'that' : 'theirs'} already.
+        </p>
+      )}
     </Dialog>
   );
 }

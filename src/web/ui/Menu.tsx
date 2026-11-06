@@ -1,14 +1,15 @@
 /** The menu sheet: fullscreen, keep-awake status, device settings, edit entry, pairing. */
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import type { Backend } from '../backend/types.ts';
+import type { Backend, PairCode } from '../backend/types.ts';
 import { DemoBackend } from '../backend/demo.ts';
+import { wall } from '../lib/clock.ts';
 import { fullscreenSupported, isFullscreen, toggleFullscreen } from '../lib/env.ts';
 import { haptic, hapticsSupported, sound, unlockAudio } from '../lib/feedback.ts';
 import { awake } from '../lib/keepawake.ts';
 import { setSetting, settings } from '../lib/settings.ts';
 import { useStore } from '../lib/store.ts';
-import { Bolt, Close, Expand, Hold, Link, Pencil, Speaker, Sun, Vibrate } from './icons.tsx';
+import { Bolt, Close, Expand, Hold, Key, Link, Pencil, Speaker, Stage, Sun, Vibrate } from './icons.tsx';
 
 function Row(p: { icon: ComponentChildren; title: string; note?: string; children?: ComponentChildren; onClick?: () => void; testid?: string; danger?: boolean }) {
   const body = (
@@ -60,7 +61,69 @@ function RepairRow(p: { onRepair(): void }) {
   );
 }
 
-export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void; onEdit(): void; onRepair(): void }) {
+/** 123456 → "123 456", 12345678 → "1234 5678": easier to read out and type. */
+const grouped = (code: string) => (code.length >= 6 && /^\d+$/.test(code) ? code.replace(new RegExp(`(\\d{${Math.ceil(code.length / 2)}})(?=\\d)`), '$1 ') : code);
+
+/** m:ss */
+const mmss = (ms: number) => {
+  const s = Math.max(0, Math.ceil(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+/**
+ * Admin: a one-time code for another device (POST /api/pair-code), big, with when it runs out.
+ * The other device types it at `…/#pair` (or "Pair with a code…" on its pairing screen).
+ */
+function PairDevicePanel({ backend }: { backend: Backend }) {
+  const [st, setSt] = useState<{ code: PairCode } | { error: string } | null>(null);
+  const [, tick] = useState(0);
+  const skew = useStore(backend.snapshot, (s) => s.clockSkew);
+  const get = () => {
+    setSt(null);
+    backend.pairCode!().then(
+      (code) => setSt({ code }),
+      (e: unknown) => setSt({ error: e instanceof Error ? e.message : String(e) }),
+    );
+  };
+  useEffect(get, []);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  if (!st) return <div class="bp-paircode" data-testid="pair-device-panel">Getting a code…</div>;
+  if ('error' in st)
+    return (
+      <div class="bp-paircode" data-testid="pair-device-panel">
+        <div class="bp-paste-err" role="alert" data-testid="pair-device-error">
+          {st.error}
+        </div>
+      </div>
+    );
+  const left = st.code.expiresAt + skew - wall();
+  return (
+    <div class="bp-paircode" data-testid="pair-device-panel">
+      <div class={`bp-paircode-digits${left <= 0 ? ' is-expired' : ''}`} data-testid="pair-device-code">
+        {grouped(st.code.code)}
+      </div>
+      <div class="bp-paircode-note">
+        On the other device, open <b>{location.host}/#pair</b> (or “Pair with a code…” on its pairing screen) and type this code. It pairs it as{' '}
+        {st.code.role === 'admin' ? 'an admin device (it can edit pads)' : 'a press-only device'}, once.
+      </div>
+      {left > 0 ? (
+        <div class="bp-paircode-left" data-testid="pair-device-left">
+          Expires in {mmss(left)}
+        </div>
+      ) : (
+        <button type="button" class="bp-ghost" data-testid="pair-device-again" onClick={get}>
+          Expired: make a new code
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void; onEdit(): void; onRepair(): void; onCode(): void }) {
+  const [pairing, setPairing] = useState(false);
   const snap = useStore(p.backend.snapshot);
   const s = useStore(settings);
   const aw = useStore(awake);
@@ -127,8 +190,33 @@ export function MenuSheet(p: { backend: Backend; lock: boolean; onClose(): void;
         <Row icon={<Hold />} title="Rough mode" note="Gloves, a shaky mount: one button at a time, firmer taps, a pause after each press" testid="rough">
           <Toggle label="Rough mode" on={s.rough} onChange={(v) => setSetting('rough', v)} testid="toggle-rough" />
         </Row>
+        <Row icon={<Stage />} title="Show mode" note="A dark room: dim buttons, results as a colored edge instead of a bright flood, no flashes" testid="show-mode">
+          <Toggle label="Show mode" on={s.show} onChange={(v) => setSetting('show', v)} testid="toggle-show" />
+        </Row>
 
         {snap.role === 'admin' && !p.lock && <Row icon={<Pencil />} title="Edit pads" note="Add, move and configure buttons" onClick={p.onEdit} testid="menu-edit" />}
+        {/* Press only: how this device can become an admin one, without typing a 43-character token. */}
+        {snap.role === 'press' && p.backend.kind === 'ws' && !p.lock && (
+          <Row
+            icon={<Key />}
+            title="Unlock editing…"
+            note="This device can only press buttons. To edit pads here, type a pairing code: the host prints one when it starts, and an admin device can show one (Menu → Pair another device). Or open the admin link the host printed."
+            onClick={p.onCode}
+            testid="menu-unlock"
+          />
+        )}
+        {snap.role === 'admin' && p.backend.kind === 'ws' && p.backend.pairCode && !p.lock && (
+          <>
+            <Row
+              icon={<Key />}
+              title="Pair another device…"
+              note="Shows a one-time code to type on a phone or tablet: no long link to send it"
+              onClick={() => setPairing((v) => !v)}
+              testid="menu-pair-device"
+            />
+            {pairing && <PairDevicePanel backend={p.backend} />}
+          </>
+        )}
 
         {demo && (
           <>

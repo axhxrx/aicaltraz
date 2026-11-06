@@ -11,10 +11,19 @@ import { serializeConfig } from './config-store.ts';
 
 type ButtonInput = NonNullable<ConfigInput['pads'][number]['buttons']>[number];
 
+/**
+ * The help button's answer. It must fit the button on a 360 px phone (2 cells wide, one row): one
+ * line of result text there holds ~32 characters at a readable size, so no file path (the startup
+ * output says where the config is). Measured: this one renders at ~15 px, unclipped.
+ */
+export const HELP_TEXT = 'Menu › Edit mode (admin link)';
+/** cmd.exe's echo writes in the console code page: ASCII only (and no > < & | ^). */
+export const HELP_TEXT_WINDOWS = 'Menu, then Edit mode (admin link)';
+
 /** Runs nothing itself: cancels whatever else is running (Count to 5, say). */
 const STOP_ALL: ButtonInput = { id: 'stop', label: 'Stop all', color: '#212529', x: 1, y: 2, trigger: 'tap', stops: ['*'], action: { type: 'none' } };
 
-function posixButtons(configPath: string): ButtonInput[] {
+function posixButtons(): ButtonInput[] {
   return [
     { id: 'hello', label: 'Hello', color: '#3a86ff', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo "Hello from $(uname -n)"' } },
     { id: 'time', label: 'Time', color: '#457b9d', x: 1, y: 0, trigger: 'tap', action: { type: 'exec', command: 'date', args: ['+%H:%M:%S %a %d %b'] } },
@@ -57,12 +66,12 @@ function posixButtons(configPath: string): ButtonInput[] {
       w: 2,
       trigger: 'tap',
       resultHoldMs: 10000,
-      action: { type: 'exec', command: 'echo', args: [`@result Edit ${configPath} (saves reload live) or use Edit mode from the admin URL`] },
+      action: { type: 'exec', command: 'echo', args: [`@result ${HELP_TEXT}`] },
     },
   ];
 }
 
-function windowsButtons(configPath: string): ButtonInput[] {
+function windowsButtons(): ButtonInput[] {
   return [
     { id: 'hello', label: 'Hello', color: '#3a86ff', x: 0, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo Hello from %COMPUTERNAME%' } },
     { id: 'time', label: 'Time', color: '#457b9d', x: 1, y: 0, trigger: 'tap', action: { type: 'shell', script: 'echo %TIME% %DATE%' } },
@@ -98,7 +107,7 @@ function windowsButtons(configPath: string): ButtonInput[] {
       w: 2,
       trigger: 'tap',
       resultHoldMs: 10000,
-      action: { type: 'shell', script: `echo @result Edit ${configPath} (saves reload live) or use Edit mode from the admin URL` },
+      action: { type: 'shell', script: `echo @result ${HELP_TEXT_WINDOWS}` },
     },
   ];
 }
@@ -123,7 +132,7 @@ export function starterConfig(configPath: string, platform: NodeJS.Platform = pr
         name: 'This computer',
         cols: 2,
         rows: 4,
-        buttons: platform === 'win32' ? windowsButtons(configPath) : posixButtons(configPath),
+        buttons: platform === 'win32' ? windowsButtons() : posixButtons(),
       },
     ],
   };

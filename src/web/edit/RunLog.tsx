@@ -14,6 +14,7 @@ import { wall } from '../lib/clock.ts';
 import { fmtElapsed } from '../lib/env.ts';
 import { useStore } from '../lib/store.ts';
 import { Check, Close, Cross } from '../ui/icons.tsx';
+import { edgeSpace, Exact } from './fields.tsx';
 import { ChevronDown, Play, Refresh } from './icons.tsx';
 import { nameOf } from './ops.ts';
 
@@ -40,9 +41,38 @@ function ago(ms: number): string {
 
 const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
+/**
+ * A spawn failure as the host words it (src/server/runner.ts: `what: path`), split so the path can
+ * be shown exactly: a blank at its end is invisible otherwise.
+ */
+function spawnParts(error: string): { what: string; path: string } | null {
+  const m = /^(command not found|shell not found|cwd not found|interpreter not found[^:]*|is a directory|not a regular file|permission denied[^:]*|not executable[^:]*): ([\s\S]*)$/.exec(error);
+  return m ? { what: m[1]!, path: m[2]! } : null;
+}
+
+/** Why it couldn't start, the path in quotes with its blanks shown (“/srv/x.sh␣”). */
+function SpawnError({ error }: { error: string }) {
+  const parts = spawnParts(error);
+  if (!parts) return <>{error}</>;
+  const blank = edgeSpace(parts.path);
+  return (
+    <>
+      {parts.what}: <Exact text={parts.path} />
+      {blank && (
+        <span class="ed-run-blank" data-testid="run-error-blank">
+          {'\n'}It {blank === 'both' ? 'starts and ends' : blank === 'start' ? 'starts' : 'ends'} with a space: check the field it comes from.
+        </span>
+      )}
+    </>
+  );
+}
+
 /** What the button would have shown: @result, else the last plain stdout line, else stderr (or why it couldn't start) on failure. */
 function resultText(r: RunRecord, failed: boolean): string | undefined {
-  if (r.reason === 'spawn' && r.error) return r.error;
+  if (r.reason === 'spawn' && r.error) {
+    const parts = spawnParts(r.error);
+    return parts ? `${parts.what}: “${parts.path}”` : r.error;
+  }
   const out = r.stdout.split('\n');
   const res = out.findLast((l) => l.startsWith('@result'))?.replace(/^@result\s*/, '');
   if (res !== undefined) return res;
@@ -89,13 +119,13 @@ function Run({ r, skew, open, onToggle }: { r: RunRecord; skew: number; open: bo
             <div class="ed-out">
               <div class="ed-out-name">{r.reason === 'spawn' ? "Why it couldn't start" : 'Why it stopped'}</div>
               <pre class="ed-pre is-err" data-testid="run-error" data-selectable>
-                {r.error}
+                {r.reason === 'spawn' ? <SpawnError error={r.error} /> : r.error}
               </pre>
             </div>
           )}
           {r.command !== undefined && (
             <div class="ed-out">
-              <div class="ed-out-name">Ran</div>
+              <div class="ed-out-name">{r.reason === 'spawn' ? 'Tried to run' : 'Ran'}</div>
               <pre class="ed-pre" data-testid="run-command" data-selectable>
                 {r.command}
               </pre>
@@ -221,7 +251,7 @@ export function RunLog(p: {
   /** What a press does now, by the host's version: while it runs, only a `cancel` button does something deliberate. */
   const canCancel = running && host?.whileRunning === 'cancel';
   const cancelling = running && !!st.cancelling;
-  const stops = !!p.button.stops?.length;
+  const stops = !!p.button.stops?.length || !!p.button.group?.trim();
   /** A `confirm` button: Run now / Save & run ask first, then the press says it was confirmed. */
   const ask = (what: 'run' | 'save') =>
     p.onAsk({

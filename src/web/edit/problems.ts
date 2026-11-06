@@ -6,6 +6,7 @@
  * the config they're about.
  */
 import { ENV_NAME_MESSAGE, type Button, type Config } from '../../core/config.ts';
+import { bound, TIME_FIELDS } from './time.ts';
 
 export interface Problem {
   pad: number | null;
@@ -31,7 +32,9 @@ const FIELD: Record<string, string> = {
   timeoutMs: 'Timeout',
   resultHoldMs: 'Result time',
   cooldownMs: 'Ignore presses after',
+  maxLatenessMs: 'Max lateness',
   stops: 'Stops',
+  group: 'Group',
   key: 'Key',
   action: 'Action',
   'action.type': 'Action type',
@@ -83,7 +86,17 @@ function warningField(msg: string, b: Pick<Button, 'action'> | undefined): { fie
   if ((m = /^(command|shell) not found: ([\s\S]*)$/.exec(msg))) return { field: m[1] === 'shell' ? 'action.shell' : 'action.command', message: `not found: ${m[2]}` };
   if ((m = /^stops "(.*)" matches no other button$/.exec(msg))) return { field: 'stops', message: `“${m[1]}” matches no other button` };
   if (/^(is a directory|not a regular file|permission denied|not executable|interpreter not found)/.test(msg)) return { field: program, message: msg };
+  // A key no remote can send on its own (a modifier), a script that needs bash but runs in sh, a group of one.
+  if (/^key\b|modifier key/i.test(msg)) return { field: 'key', message: msg.replace(/^key\s+/i, '') };
+  if (b?.action.type === 'shell' && /\bbash\b/i.test(msg)) return { field: 'action.shell', message: msg.replace(/: add "shell": "bash"$/, ': set Shell to bash') };
+  if ((m = /^group "(.*)" ([\s\S]*)$/.exec(msg))) return { field: 'group', message: `“${m[1]}” ${m[2]}` };
   return { field: null, message: msg };
+}
+
+/** A time field's range error in seconds, the unit its field is typed in ("Must be at most 60 s (1 min)"). */
+function inSeconds(field: string | null, message: string): string {
+  const m = field && TIME_FIELDS.has(field) ? /^Must be at (most|least) (\d+)$/.exec(message) : null;
+  return m ? `Must be at ${m[1]} ${bound(Number(m[2]))}` : message;
 }
 
 /**
@@ -111,7 +124,7 @@ export function toProblems(errors: string[], cfg?: Pick<Config, 'pads'>): Proble
     const pad = Number(seg[1]);
     if (seg[2] === 'buttons' && seg[3] !== undefined && /^\d+$/.test(seg[3])) {
       const rest = seg.slice(4).join('.');
-      return { pad, button: Number(seg[3]), field: rest || null, message };
+      return { pad, button: Number(seg[3]), field: rest || null, message: inSeconds(rest, message) };
     }
     return { pad, button: null, field: seg.slice(2).join('.') || null, message };
   });

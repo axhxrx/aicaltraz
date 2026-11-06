@@ -5,6 +5,7 @@ import { buttonKey } from '../../core/config.ts';
 import type { WireButton, WirePad } from '../../core/protocol.ts';
 import { wall } from '../lib/clock.ts';
 import { eventTime } from '../lib/env.ts';
+import { settings } from '../lib/settings.ts';
 import { useStore } from '../lib/store.ts';
 import { ButtonFace } from './ButtonFace.tsx';
 import type { RunSession } from './session.ts';
@@ -37,7 +38,7 @@ function useTicker(ms: number): void {
   }, [ms]);
 }
 
-function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad; button: WireButton }) {
+function RunButton({ session, pad, button, show }: { session: RunSession; pad: WirePad; button: WireButton; show: boolean }) {
   const { backend } = session;
   const key = buttonKey(pad.id, button.id);
   const ctrl = session.controller(pad, button);
@@ -46,10 +47,11 @@ function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad
   const skew = useStore(backend.snapshot, (s) => s.clockSkew);
   const latched = useStore(backend.snapshot, (s) => s.latched[key]);
   const lastSeen = useStore(backend.snapshot, (s) => s.lastSeen);
+  const syncing = useStore(backend.snapshot, (s) => s.syncing);
   const local = useStore(ctrl.local);
 
   const now = wall();
-  const vm = viewOf(button, host, local, link, skew, now, { latched, lastSeen });
+  const vm = viewOf(button, host, local, link, skew, now, { latched, lastSeen, syncing });
   useTicker(tickFor(vm, now));
 
   const src = (e: PointerEvent) => `p${e.pointerId}`;
@@ -57,6 +59,7 @@ function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad
     <ButtonFace
       vm={vm}
       now={now}
+      show={show}
       style={cellStyle(button)}
       onPointerDown={(e) => {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -79,14 +82,16 @@ function RunButton({ session, pad, button }: { session: RunSession; pad: WirePad
 
 export function RunPad({ session, pad }: { session: RunSession; pad: WirePad }) {
   const link = useStore(session.backend.snapshot, (s) => s.status);
+  const syncing = useStore(session.backend.snapshot, (s) => s.syncing);
+  const show = useStore(settings, (s) => s.show);
   useEffect(() => {
     session.setVisible(pad.id);
     return () => session.setVisible(null);
   }, [session, pad.id]);
   return (
-    <PadGrid pad={pad} data-link={link} data-pad={pad.id} data-run="">
+    <PadGrid pad={pad} data-link={link} data-pad={pad.id} data-run="" data-syncing={syncing && link === 'online' ? '' : undefined} data-show={show ? '' : undefined}>
       {pad.buttons.map((b) => (
-        <RunButton key={buttonKey(pad.id, b.id)} session={session} pad={pad} button={b} />
+        <RunButton key={buttonKey(pad.id, b.id)} session={session} pad={pad} button={b} show={show} />
       ))}
     </PadGrid>
   );

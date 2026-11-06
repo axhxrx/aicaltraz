@@ -19,8 +19,20 @@
  * link takes seconds more), corrected for the link's one-way delay as the handshake measured it,
  * and kept with a clock the device's clock setting can't move (lib/clock.ts). A press that sat in
  * a dead link (or a stalled page) for seconds is dropped by the host (`expired`) instead of running
- * late. One that comes back `expired` within a second of being made can't have been held up: the
- * offset is wrong (the host's clock was set, say), so a new socket (and hello) gets a fresh one.
+ * late. One that comes back `expired` too soon after being made to have been held up (a second, or
+ * a third of the button's maxLatenessMs) means the offset is wrong (the host's clock was set, say),
+ * so a new socket (and hello) gets a fresh one.
+ *
+ * Round trips are measured (pings answered, presses acked): on a link that has been slow, a press
+ * waits longer for its ack before the UI says NO RESPONSE (4 × the 90th percentile, 2–6 s), and the
+ * liveness checks give the link as long (OFFLINE is not shown for a link that is merely slow).
+ *
+ * Back from a long stretch in the background (hidden ≥ 5 s), from a frozen tab, or after the page
+ * didn't get to run for a while (a heartbeat that comes ≥ 8 s late): `syncing`. What the screen
+ * showed may be minutes old, and a socket that stayed up delivers the frames it queued meanwhile
+ * first, a backlog of runs that started and ended long ago. A ping goes out at once; the host
+ * answers it after everything it sent before, so its answer (or a fresh hello, if the socket
+ * turned out dead) ends `syncing`.
  */
 import type { Config } from '../../core/config.ts';
 import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
@@ -28,7 +40,21 @@ import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
-import { emptySnapshot, MAX_CONFIG_BYTES, PressError, statesIn, TOO_LARGE, type Backend, type PressAck, type PressOpts, type SaveResult, type Snapshot } from './types.ts';
+import {
+  emptySnapshot,
+  latenessOf,
+  MAX_CONFIG_BYTES,
+  PressError,
+  statesIn,
+  TOO_LARGE,
+  wireButton,
+  type Backend,
+  type PairCode,
+  type PressAck,
+  type PressOpts,
+  type SaveResult,
+  type Snapshot,
+} from './types.ts';
 
 const BACKOFF_MIN = 250;
 const BACKOFF_MAX = 5000;
@@ -49,14 +75,29 @@ const KICK_STALE_CONNECT = 1500;
 const FRESH_PRESS_MS = 1000;
 /** Visible and not a single frame for this long → probe. */
 const IDLE_PROBE = 5000;
-/** How long a probe waits for a frame. */
+/** How long a probe waits for a frame (at least; up to PROBE_MAX on a link whose round trips are slow). */
 const PROBE_TIMEOUT = 3000;
+const PROBE_MAX = 8000;
 /** …when the link is in doubt already. */
 const QUICK_PROBE_TIMEOUT = 1500;
-/** A press with no ack and no other frame for this long puts the link in doubt. */
+const QUICK_PROBE_MAX = 5000;
+/** A press with no ack and no other frame for this long puts the link in doubt (longer on a slow link, up to PRESS_DOUBT_MAX). */
 const PRESS_DOUBT_AFTER = 600;
+const PRESS_DOUBT_MAX = 3000;
+/** How long a press waits for its ack before NO RESPONSE: 4 × the p90 round trip, within these. */
+const ACK_TIMEOUT = 2000;
+const ACK_TIMEOUT_MAX = 6000;
+/** Round trips kept, and how many it takes to trust their p90. A "round trip" longer than RTT_SAMPLE_MAX was a page that didn't run. */
+const RTT_WINDOW = 20;
+const RTT_MIN_SAMPLES = 3;
+const RTT_SAMPLE_MAX = 15_000;
 /** Back from at least this long in the background → probe. */
 const HIDDEN_DOUBT_AFTER = 1000;
+/** …this long → syncing (the screen may be minutes old). */
+const SYNC_AFTER_HIDDEN = 5000;
+/** A heartbeat this late: the page didn't get to run (frozen, asleep) → syncing. (A 4 s stalled main thread isn't that.) */
+const BEAT_MS = 1000;
+const STALE_GAP = 8000;
 /** The probe. Not part of the protocol: the host answers it with `error`, which is the point. */
 const PING = JSON.stringify({ t: 'ping' });
 /** A config save with no answer by then is given up on (it may have landed: the caller checks). */
@@ -82,6 +123,13 @@ interface Conn {
   pending: Map<string, Pending>;
   /** Pings whose `error` answer hasn't come yet (those errors are expected, not worth a warning). */
   pings: number;
+  /** When each of those went out (mono()) and in which stretch of the page's life (WsBackend.epoch): their round trips. */
+  pingTimes: { at: number; epoch: number }[];
+  /** Pings sent on this socket, and answers to them so far (they come in order). */
+  pingsSent: number;
+  answers: number;
+  /** Syncing: the ping whose answer means the backlog is in (its number; 0: none). */
+  syncPing: number;
   helloTimer?: ReturnType<typeof setTimeout>;
   idleTimer?: ReturnType<typeof setTimeout>;
   probeTimer?: ReturnType<typeof setTimeout>;
@@ -108,6 +156,16 @@ export class WsBackend implements Backend {
   /** Sockets in a row that died waiting for their hello. */
   private helloMisses = 0;
   private readonly offs: (() => void)[] = [];
+  /** Recent round trips (ms): pings answered, presses acked. */
+  private rtts: number[] = [];
+  /**
+   * Bumped whenever the page may not have run for a while (hidden, frozen, asleep): a "round trip"
+   * that spans one measures the page, not the link.
+   */
+  private epoch = 0;
+  /** mono() of the last heartbeat (or frame): a page that doesn't get to run misses them. */
+  private beat = mono();
+  private beatTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private readonly token: string,
@@ -115,27 +173,103 @@ export class WsBackend implements Backend {
   ) {
     const cached = lsJSON<Cached>(KEYS.configCache);
     if (cached?.config?.pads) this.patch({ config: cached.config, rev: cached.rev });
-    const on = (target: EventTarget, type: string, fn: () => void) => {
+    const on = (target: EventTarget, type: string, fn: (e: Event) => void) => {
       target.addEventListener(type, fn);
       this.offs.push(() => target.removeEventListener(type, fn));
     };
     on(document, 'visibilitychange', () => {
-      if (document.visibilityState === 'hidden') return void (this.hiddenAt = mono());
+      if (document.visibilityState === 'hidden') {
+        this.epoch++;
+        return void (this.hiddenAt = mono());
+      }
       const away = this.hiddenAt ? mono() - this.hiddenAt : 0;
       this.hiddenAt = 0;
       const c = this.conn;
-      if (!c) this.connectNow();
+      // Long enough for the picture on screen to be stale: nothing shown as live until the host's word is in.
+      if (away >= SYNC_AFTER_HIDDEN) this.startSync();
+      else if (!c) this.connectNow();
       // The socket may have died while we were away (phones freeze background pages).
-      else if (away >= HIDDEN_DOUBT_AFTER) this.probe(c, QUICK_PROBE_TIMEOUT);
+      else if (away >= HIDDEN_DOUBT_AFTER) this.probe(c, this.probeTimeout(true));
       else this.armIdle(c);
     });
+    // Page Lifecycle (Chrome): a frozen page that resumes, a page restored from the back/forward cache.
+    on(document, 'freeze', () => void this.epoch++);
+    on(document, 'resume', () => this.startSync());
+    on(window, 'pageshow', (e) => (e as PageTransitionEvent).persisted && this.startSync());
     // The network changed: whatever the socket says, check it (or connect now, not at the next retry).
-    on(window, 'online', () => (this.conn?.greeted ? this.probe(this.conn, QUICK_PROBE_TIMEOUT) : this.connectNow()));
-    on(window, 'offline', () => this.conn?.greeted && this.probe(this.conn, QUICK_PROBE_TIMEOUT));
+    on(window, 'online', () => (this.conn?.greeted ? this.probe(this.conn, this.probeTimeout(true)) : this.connectNow()));
+    on(window, 'offline', () => this.conn?.greeted && this.probe(this.conn, this.probeTimeout(true)));
+    // A page that didn't get to run for a while (frozen without the events above, a device asleep).
+    this.beatTimer = setInterval(() => this.awake(), BEAT_MS);
     // Alongside the first socket: a rejected token shows at once, and if the socket hangs, the
     // pad still shows what the host is doing (a running action, not a dimmed READY).
     void this.probeHttp();
     this.connect();
+  }
+
+  /**
+   * The page is running now (a heartbeat, a frame): if it hadn't for STALE_GAP, what is on screen
+   * and what the socket has queued up are old news (syncing).
+   */
+  private awake() {
+    const now = mono();
+    const gap = now - this.beat;
+    this.beat = now;
+    if (gap > STALE_GAP) this.startSync();
+  }
+
+  // ---- round trips --------------------------------------------------------------------------
+
+  private noteRtt(ms: number, epoch: number) {
+    if (epoch !== this.epoch || !(ms >= 0) || ms > RTT_SAMPLE_MAX) return;
+    this.rtts.push(ms);
+    if (this.rtts.length > RTT_WINDOW) this.rtts.shift();
+  }
+
+  /** The 90th percentile of the recent round trips; null: too few to say. */
+  private rttP90(): number | null {
+    if (this.rtts.length < RTT_MIN_SAMPLES) return null;
+    const s = [...this.rtts].sort((a, b) => a - b);
+    return s[Math.min(s.length - 1, Math.ceil(0.9 * s.length) - 1)]!;
+  }
+
+  /** `k` × the p90 round trip, within [min, max] (min while there is nothing to go by). */
+  private scaled(k: number, min: number, max: number): number {
+    const p = this.rttP90();
+    return p === null ? min : Math.round(Math.min(max, Math.max(min, k * p)));
+  }
+
+  /** NO RESPONSE after this long without an ack: 2 s, more on a link that has been slow (≤ 6 s). */
+  ackTimeoutMs(): number {
+    return this.scaled(4, ACK_TIMEOUT, ACK_TIMEOUT_MAX);
+  }
+
+  private probeTimeout(quick: boolean): number {
+    return quick ? this.scaled(3, QUICK_PROBE_TIMEOUT, QUICK_PROBE_MAX) : this.scaled(4, PROBE_TIMEOUT, PROBE_MAX);
+  }
+
+  /** Recent round trips (debugging and tests). */
+  get roundTrips(): readonly number[] {
+    return this.rtts;
+  }
+
+  // ---- syncing ------------------------------------------------------------------------------
+
+  /** Back from a long stretch away: nothing is live until the host's current word is in. */
+  private startSync() {
+    if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
+    this.epoch++;
+    const c = this.conn;
+    // Nothing was ever shown from the host: there is no stale picture to hold back.
+    if (this.everGreeted && !this.snapshot.get().syncing) this.patch({ syncing: true });
+    // No socket, or one still opening: its hello settles it.
+    if (!c) return this.connectNow();
+    if (!c.greeted) return;
+    this.probe(c, this.probeTimeout(true), true);
+  }
+
+  private endSync() {
+    if (this.snapshot.get().syncing) this.patch({ syncing: false });
   }
 
   /** The current socket (debugging and tests). */
@@ -160,7 +294,22 @@ export class WsBackend implements Backend {
     } catch {
       return this.scheduleRetry(null);
     }
-    const c: Conn = { ws, greeted: false, openedAt: mono(), upAt: 0, greetedAt: 0, lastFrame: mono(), pending: new Map(), pings: 0, probeDeadline: 0, probeSentAt: 0 };
+    const c: Conn = {
+      ws,
+      greeted: false,
+      openedAt: mono(),
+      upAt: 0,
+      greetedAt: 0,
+      lastFrame: mono(),
+      pending: new Map(),
+      pings: 0,
+      pingTimes: [],
+      pingsSent: 0,
+      answers: 0,
+      syncPing: 0,
+      probeDeadline: 0,
+      probeSentAt: 0,
+    };
     this.conn = c;
     c.helloTimer = setTimeout(
       () => {
@@ -187,6 +336,8 @@ export class WsBackend implements Backend {
   }
 
   private onFrame(c: Conn, data: unknown) {
+    // A page that didn't get to run for a while: this frame may be the start of a backlog.
+    this.awake();
     // Any frame at all proves the link: a probe in flight is answered.
     c.lastFrame = mono();
     clearTimeout(c.probeTimer);
@@ -212,24 +363,41 @@ export class WsBackend implements Backend {
   private armIdle(c: Conn) {
     clearTimeout(c.idleTimer);
     c.idleTimer = setTimeout(() => {
-      if (this.conn === c && document.visibilityState === 'visible') this.probe(c, PROBE_TIMEOUT);
+      if (this.conn === c && document.visibilityState === 'visible') this.probe(c, this.probeTimeout(false));
     }, IDLE_PROBE);
   }
 
-  /** Ask the host for a frame; none within `timeout` → the socket is dead. */
-  private probe(c: Conn, timeout: number) {
+  /** `sample`: its answer's round trip says how the link is (not one sent behind a backlog). */
+  private sendPing(c: Conn, sample = true): boolean {
+    try {
+      c.ws.send(PING);
+    } catch {
+      this.lost(c);
+      return false;
+    }
+    c.pings++;
+    c.pingsSent++;
+    c.pingTimes.push({ at: mono(), epoch: sample ? this.epoch : -1 });
+    return true;
+  }
+
+  /**
+   * Ask the host for a frame; none within `timeout` → the socket is dead. `sync`: a ping of its
+   * own even with one in flight, whose answer (it comes after everything the host sent before it)
+   * ends syncing.
+   */
+  private probe(c: Conn, timeout: number, sync = false) {
     if (this.conn !== c || !c.greeted) return;
     if (c.ws.readyState !== WebSocket.OPEN) return this.lost(c);
     const deadline = mono() + timeout;
     const inFlight = c.probeTimer !== undefined;
-    if (inFlight && c.probeDeadline <= deadline) return;
-    if (!inFlight) {
-      try {
-        c.ws.send(PING);
-      } catch {
-        return this.lost(c);
-      }
-      c.pings++;
+    if (sync) {
+      if (!this.sendPing(c, false)) return;
+      c.syncPing = c.pingsSent;
+      c.probeSentAt = mono();
+    } else if (inFlight && c.probeDeadline <= deadline) return;
+    else if (!inFlight) {
+      if (!this.sendPing(c)) return;
       c.probeSentAt = mono();
     }
     clearTimeout(c.probeTimer);
@@ -348,6 +516,8 @@ export class WsBackend implements Backend {
           latched: m.latched ?? {},
           hostFull: false,
           lastSeen: null,
+          // The host's word as it is now: whatever this device was catching up on, it has.
+          syncing: false,
         });
         this.cache(m.config, m.rev);
         break;
@@ -377,10 +547,19 @@ export class WsBackend implements Backend {
       case 'configError':
         this.patch({ configErrors: m.errors });
         break;
-      case 'error':
-        if (c.pings > 0) c.pings--; // a probe's answer
-        else console.warn('[buttpad] host error:', m.message);
+      case 'error': {
+        // A probe's answer (in order: the host answers each ping after what it sent before it).
+        if (c.pings <= 0) return void console.warn('[buttpad] host error:', m.message);
+        c.pings--;
+        c.answers++;
+        const sent = c.pingTimes.shift();
+        if (sent) this.noteRtt(mono() - sent.at, sent.epoch);
+        if (c.syncPing && c.answers >= c.syncPing) {
+          c.syncPing = 0;
+          this.endSync();
+        }
         break;
+      }
     }
   }
 
@@ -395,9 +574,10 @@ export class WsBackend implements Backend {
     if (this.snapshot.get().status !== 'online' || this.conn !== c || !c?.greeted) return Promise.reject(new PressError(false, 'not connected to the host'));
     const id = `${Date.now().toString(36)}${(++this.seq).toString(36)}`;
     // When it was made (the gesture's time: a stalled page gets here late), in the host's clock:
-    // the host drops it if it got there too late.
+    // the host drops it if it got there too late (the button's maxLatenessMs).
     const made = Math.min(mono(), opts.at ?? Infinity);
     const at = Math.round(wall() - (mono() - made) - this.snapshot.get().clockSkew);
+    const lateness = latenessOf(wireButton(this.snapshot.get().config, pad, button));
     const msg: ClientMsg = { t: 'press', id, pad, button, at, ...(opts.confirm ? { confirm: true } : {}) };
     return new Promise((resolve, reject) => {
       try {
@@ -406,12 +586,15 @@ export class WsBackend implements Backend {
         return reject(new PressError(false, e instanceof Error ? e.message : String(e)));
       }
       const sentAt = mono();
+      const epoch = this.epoch;
       c.pending.set(id, {
         resolve: (ack) => {
+          this.noteRtt(mono() - sentAt, epoch);
           opts.onAck?.(ack);
           resolve(ack.result);
-          // Too old by the host's clock, yet made just now: our idea of the host's clock is off.
-          if (ack.result === 'expired' && mono() - made < FRESH_PRESS_MS && this.conn === c) {
+          // Too old by the host's clock, yet answered too soon after it was made to have been held
+          // up that long: our idea of the host's clock is off.
+          if (ack.result === 'expired' && mono() - made < Math.min(FRESH_PRESS_MS, lateness / 3) && this.conn === c) {
             console.warn('[buttpad] a fresh press was dropped as too old: the clock offset is off; reconnecting for a new one');
             this.lost(c);
           }
@@ -419,8 +602,10 @@ export class WsBackend implements Backend {
         reject,
       });
       opts.onSent?.();
-      // No ack, and not one frame since: check the link now rather than at the next idle probe.
-      setTimeout(() => this.conn === c && c.pending.has(id) && c.lastFrame < sentAt && this.probe(c, QUICK_PROBE_TIMEOUT), PRESS_DOUBT_AFTER);
+      // No ack, and not one frame since: check the link now rather than at the next idle probe (on
+      // a link whose round trips have been slow, a little later, and with more patience).
+      const doubt = this.scaled(2, PRESS_DOUBT_AFTER, PRESS_DOUBT_MAX);
+      setTimeout(() => this.conn === c && c.pending.has(id) && c.lastFrame < sentAt && this.probe(c, this.probeTimeout(true)), doubt);
     });
   }
 
@@ -491,9 +676,30 @@ export class WsBackend implements Backend {
     return (await r.json()) as RunRecord[];
   }
 
+  async pairCode(): Promise<PairCode> {
+    let r: Response;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), GET_TIMEOUT);
+    try {
+      r = await this.http('POST', '/api/pair-code', '{}', ctl.signal);
+    } catch {
+      throw new Error('Can’t reach the host.');
+    } finally {
+      clearTimeout(timer);
+    }
+    if (r.status === 401 || r.status === 403) throw new Error('Only an admin device can make pairing codes.');
+    if (r.status === 404 || r.status === 405) throw new Error('This host doesn’t make pairing codes (it runs an older ButtPad).');
+    if (r.status === 429 || r.status === 503) throw new Error('Too many codes just now: try again in a minute.');
+    if (!r.ok) throw new Error(`The host answered HTTP ${r.status}.`);
+    const j = (await r.json().catch(() => null)) as Partial<PairCode> | null;
+    if (!j || (typeof j.code !== 'string' && typeof j.code !== 'number') || typeof j.expiresAt !== 'number') throw new Error('Unexpected answer from the host.');
+    return { code: String(j.code), expiresAt: j.expiresAt, role: j.role === 'press' ? 'press' : 'admin' };
+  }
+
   dispose(): void {
     this.disposed = true;
     clearTimeout(this.retryTimer);
+    clearInterval(this.beatTimer);
     for (const off of this.offs) off();
     if (this.conn) this.drop(this.conn);
   }

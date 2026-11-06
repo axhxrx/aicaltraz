@@ -1,12 +1,12 @@
 /**
  * The config file is the source of truth. This store loads it, watches it for hand edits, and
- * writes UI saves back safely (src/server/files.ts) in a compact form (button fields at their
- * defaults omitted).
+ * writes UI saves back safely (src/server/files.ts) in a compact form that stays close to what the
+ * author wrote (see serializeConfig).
  */
 import { createHash } from 'node:crypto';
 import { lstatSync, mkdirSync, readlinkSync, realpathSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
-import { Button, parseConfig, type Action, type Config } from '../core/config.ts';
+import { Button, Config as ConfigSchema, ExecAction, Pad, parseConfig, ShellAction, type Action, type Config } from '../core/config.ts';
 import type { Role, WireConfig } from '../core/protocol.ts';
 import { describeJsonError, explainConfigErrors } from './config-errors.ts';
 import { errCode, errnoText } from './errors.ts';
@@ -28,28 +28,141 @@ const BUTTON_DEFAULTS: Record<string, unknown> = (() => {
   const { id: _id, x: _x, y: _y, action: _a, ...defaults } = Button.parse({ id: 'x', x: 0, y: 0, action: { type: 'shell', script: 'x' } });
   return defaults;
 })();
+const SERVER_DEFAULTS: Record<string, unknown> = ConfigSchema.shape.server.parse(undefined);
+/** Schema order of each object's keys: where a key the author's file doesn't have yet goes. */
+const KEY_ORDER = {
+  config: Object.keys(ConfigSchema.shape),
+  server: Object.keys(SERVER_DEFAULTS),
+  pad: Object.keys(Pad.shape),
+  button: Object.keys(Button.shape),
+  exec: Object.keys(ExecAction.shape),
+  shell: Object.keys(ShellAction.shape),
+  none: ['type'],
+};
+/** Arrays of strings/numbers, and objects of only those, go on one line when it stays this short (indent included). */
+export const INLINE_WIDTH = 100;
 
-function compactAction(a: Action): Record<string, unknown> {
-  if (a.type === 'exec' && a.args.length === 0) {
-    const { args: _args, ...rest } = a;
-    return rest;
-  }
-  return a;
-}
+type Obj = Record<string, unknown>;
+const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
+const objects = (v: unknown): Obj[] => (Array.isArray(v) ? v.filter(isObj) : []);
+const isPrimitive = (v: unknown) => v === null || (typeof v !== 'object' && typeof v !== 'function');
 
-function compactButton(b: Button): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(b)) {
-    if (v === undefined || (k in BUTTON_DEFAULTS && BUTTON_DEFAULTS[k] === v)) continue;
-    out[k] = k === 'action' ? compactAction(v as Action) : v;
+/**
+ * `keys` (schema order) arranged like the author's `template` keys; a key the template lacks goes
+ * before the first template key that comes after it in schema order (`timeoutMs` lands next to
+ * `holdMs`, not after `action`).
+ */
+function arrange(keys: string[], template: Obj | undefined, schema: string[]): string[] {
+  if (!template) return keys;
+  const rank = (k: string) => (schema.includes(k) ? schema.indexOf(k) : schema.length);
+  const out = Object.keys(template).filter((k) => keys.includes(k));
+  for (const k of keys) {
+    if (out.includes(k)) continue;
+    const at = out.findIndex((o) => rank(o) > rank(k));
+    if (at < 0) out.push(k);
+    else out.splice(at, 0, k);
   }
   return out;
 }
 
-/** 2-space JSON with button defaults omitted, newline-terminated. */
-export function serializeConfig(cfg: Config): string {
-  const compact = { ...cfg, pads: cfg.pads.map((p) => ({ ...p, buttons: p.buttons.map(compactButton) })) };
-  return JSON.stringify(compact, null, 2) + '\n';
+function ordered(obj: Obj, template: Obj | undefined, schema: string[]): Obj {
+  const out: Obj = {};
+  for (const k of arrange(Object.keys(obj), template, schema)) out[k] = obj[k];
+  return out;
+}
+
+/**
+ * A button without its fields at their defaults — except those the author wrote for this button
+ * (`same`, its version in the file the save replaces): an explicit `"trigger": "hold"` stays.
+ */
+function compactButton(b: Button, same: Obj | undefined, template: Obj | undefined): Obj {
+  const out: Obj = {};
+  for (const [k, v] of Object.entries(b)) {
+    if (v === undefined || (k in BUTTON_DEFAULTS && BUTTON_DEFAULTS[k] === v && !(same && k in same))) continue;
+    out[k] = v;
+  }
+  const a: Action = b.action;
+  const sameAction = isObj(same?.action) && same.action.type === a.type ? same.action : undefined;
+  const action: Obj = {};
+  for (const [k, v] of Object.entries(a)) {
+    if (v === undefined || (k === 'args' && Array.isArray(v) && v.length === 0 && !(sameAction && 'args' in sameAction))) continue;
+    action[k] = v;
+  }
+  const templateAction = sameAction ?? (isObj(template?.action) && template.action.type === a.type ? template.action : undefined);
+  out.action = ordered(action, templateAction, KEY_ORDER[a.type]);
+  return ordered(out, template, KEY_ORDER.button);
+}
+
+/** `server` without fields at their defaults (unless the author wrote them); none at all when nothing is left. */
+function compactServer(server: Config['server'], same: unknown): Obj | undefined {
+  const own = isObj(same) ? same : undefined;
+  const out: Obj = {};
+  for (const [k, v] of Object.entries(server)) if (v !== SERVER_DEFAULTS[k] || (own && k in own)) out[k] = v;
+  return Object.keys(out).length || own ? ordered(out, own, KEY_ORDER.server) : undefined;
+}
+
+/**
+ * JSON, 2-space indented; an array of strings/numbers, or an object of only those (and such arrays),
+ * on one line when that fits in INLINE_WIDTH — `"args": ["wash", "100", "10"]`,
+ * `"action": { "type": "exec", "command": "./fade.sh" }`.
+ */
+export function formatJson(v: unknown, indent = 0, lead = 0): string {
+  if (isPrimitive(v)) return JSON.stringify(v) ?? 'null';
+  const inner = ' '.repeat(indent + 2);
+  const fits = (s: string) => indent + lead + s.length <= INLINE_WIDTH && !s.includes('\n');
+  if (Array.isArray(v)) {
+    if (!v.length) return '[]';
+    if (v.every(isPrimitive)) {
+      const line = `[${v.map((x) => JSON.stringify(x)).join(', ')}]`;
+      if (fits(line)) return line;
+    }
+    return `[\n${v.map((x) => inner + formatJson(x, indent + 2)).join(',\n')}\n${' '.repeat(indent)}]`;
+  }
+  const entries = Object.entries(v as Obj).filter(([, x]) => x !== undefined);
+  if (!entries.length) return '{}';
+  if (entries.every(([, x]) => isPrimitive(x) || (Array.isArray(x) && x.every(isPrimitive)))) {
+    const line = `{ ${entries.map(([k, x]) => `${JSON.stringify(k)}: ${Array.isArray(x) ? (x.length ? `[${x.map((y) => JSON.stringify(y)).join(', ')}]` : '[]') : JSON.stringify(x)}`).join(', ')} }`;
+    if (fits(line)) return line;
+  }
+  return `{\n${entries
+    .map(([k, x]) => {
+      const key = `${JSON.stringify(k)}: `;
+      return inner + key + formatJson(x, indent + 2, key.length);
+    })
+    .join(',\n')}\n${' '.repeat(indent)}}`;
+}
+
+/**
+ * The config as a file, newline-terminated: button fields at their defaults left out (and exec's
+ * empty `args`, and `server` when it is the default), short arrays and objects on one line.
+ * `original` (the file's JSON as the author last wrote it) keeps their key order — top level, pads,
+ * buttons and actions, matched by id; new ones follow the file's first pad/button — and the fields
+ * they wrote out even at a default. Values round-trip exactly: parseConfig(JSON.parse(result))
+ * equals `cfg`.
+ */
+export function serializeConfig(cfg: Config, original?: unknown): string {
+  const orig = isObj(original) ? original : undefined;
+  const origPads = objects(orig?.pads);
+  const everyButton = origPads.flatMap((p) => objects(p.buttons));
+  const pads = cfg.pads.map((p) => {
+    const samePad = origPads.find((o) => o.id === p.id);
+    const padButtons = objects(samePad?.buttons);
+    const buttons = p.buttons.map((b) => {
+      const same = padButtons.find((o) => o.id === b.id);
+      const template = same ?? everyButton.find((o) => o.id === b.id) ?? padButtons[0] ?? everyButton[0];
+      return compactButton(b, same, template);
+    });
+    return ordered({ ...p, buttons }, samePad ?? origPads[0], KEY_ORDER.pad);
+  });
+  const top: Obj = {};
+  for (const [k, v] of Object.entries(cfg)) {
+    if (v === undefined) continue;
+    if (k === 'server') {
+      const server = compactServer(cfg.server, orig?.server);
+      if (server) top.server = server;
+    } else top[k] = k === 'pads' ? pads : v;
+  }
+  return formatJson(ordered(top, orig, KEY_ORDER.config)) + '\n';
 }
 
 /** What a press-role client may see: everything but `action`. */
@@ -60,8 +173,9 @@ export function redactConfig(cfg: Config): WireConfig {
 /**
  * `errors` are worded for people (config-errors.ts): `pad "lights" › button "key": holdMs must be ≤ 5000
  * (line 42)`, `invalid JSON at line 3, column 7: …`. `rev` is missing when the file can't be read.
+ * `raw` is the file's JSON as written (when it is JSON at all): what a save keeps the key order of.
  */
-export type ReadResult = { ok: true; config: Config; rev: string } | { ok: false; errors: string[]; rev?: string };
+export type ReadResult = { ok: true; config: Config; rev: string; raw: unknown } | { ok: false; errors: string[]; rev?: string; raw?: unknown };
 
 /** Why the file can't be read at all, in words. */
 export function describeReadError(path: string, e: unknown): string {
@@ -87,7 +201,7 @@ export function readConfigFile(path: string): ReadResult {
     return { ok: false, rev, errors: [describeJsonError(text, e)] };
   }
   const r = parseConfig(raw);
-  return r.ok ? { ok: true, config: r.config, rev } : { ok: false, rev, errors: explainConfigErrors(raw, r.errors, text) };
+  return r.ok ? { ok: true, config: r.config, rev, raw } : { ok: false, rev, raw, errors: explainConfigErrors(raw, r.errors, text) };
 }
 
 /** Rev of the file's bytes as they are now, valid config or not; undefined if it can't be read (or isn't a regular file). */
@@ -205,6 +319,8 @@ export class ConfigStore {
     readonly dir: string,
     public config: Config,
     public rev: string,
+    /** The file's JSON as last read (or written): a save keeps its key order (serializeConfig). */
+    private raw: unknown,
   ) {
     this.diskRev = rev;
   }
@@ -233,7 +349,7 @@ export class ConfigStore {
     }
     const r = readConfigFile(abs);
     if (!r.ok) throw new ConfigLoadError(abs, r.errors, r.rev === undefined);
-    return { store: new ConfigStore(abs, configDir(abs), r.config, r.rev), created };
+    return { store: new ConfigStore(abs, configDir(abs), r.config, r.rev, r.raw), created };
   }
 
   subscribe(l: ConfigListener): () => void {
@@ -249,6 +365,7 @@ export class ConfigStore {
   sync(): 'unchanged' | 'changed' | 'error' {
     const r = readConfigFile(this.path);
     this.diskRev = r.rev;
+    if (r.raw !== undefined) this.raw = r.raw;
     if (!r.ok) {
       const key = r.rev ?? r.errors.join('\n');
       if (key !== this.brokenRev) {
@@ -281,7 +398,8 @@ export class ConfigStore {
       const { $schema: _none, ...rest } = config;
       config = { $schema: this.config.$schema, ...rest };
     }
-    const text = serializeConfig(config);
+    // Laid out like the file the author wrote (key order, short lines), not regenerated from scratch.
+    const text = serializeConfig(config, this.raw);
     const rev = revOf(text);
     const checked = this.diskRev;
     // A last look right before the rename: a write that landed since the check stays (409 instead).
@@ -290,6 +408,7 @@ export class ConfigStore {
       return this.conflict();
     }
     this.diskRev = rev;
+    this.raw = JSON.parse(text);
     if (rev !== this.rev || this.fileErrors !== null) this.activate(config, rev);
     return { ok: true, rev };
   }

@@ -1,6 +1,7 @@
 /**
- * `?gallery`: every button state side by side, for design QA and screenshots (incl. grayscale).
- * Also exports `vmFor`, a static view model for a button (edit mode previews).
+ * `?gallery`: every button state side by side, for design QA and screenshots (incl. grayscale);
+ * `?gallery&show` in show mode. Also exports `vmFor`, a static view model for a button (edit mode
+ * previews).
  */
 import { useEffect, useState } from 'preact/hooks';
 import type { WireButton } from '../../core/protocol.ts';
@@ -45,6 +46,8 @@ function tiles(now: number): [string, ButtonVM][] {
     ['RUNNING 42%', vmFor(b('progress', 'Backdrop sunset', '#7c3aed'), { visual: 'running', startedAt: now - 2100, progress: 42, status: 'fading in' })],
     ['SUCCESS', vmFor(b('success', 'Upload selects', '#2f6fde'), { visual: 'success', endedAt: now - 120, elapsedMs: 2180, text: '12 photos uploaded', resultHoldMs: LONG })],
     ['FAILURE', vmFor(b('failure', 'Card backup', '#f97316'), { visual: 'failure', endedAt: now - 120, title: 'card full: 0 bytes free', detail: 'EXIT 3', code: 'EXIT 3', sticky: true })],
+    // A red READY button next to FAILURE: the failure's hatching tells them apart (in grayscale too).
+    ['READY (red)', vmFor(b('estop', 'E-STOP', '#c1121f', { trigger: 'tap', confirm: true }), { last: { tone: 'stopped', ago: '4 m ago' } })],
     ['STOPPED', vmFor(b('stopped', 'Haze', '#0d9488', { trigger: 'tap' }), { visual: 'stopped', endedAt: now - 120, title: 'STOPPED', detail: 'stopped by ALL OFF', code: 'STOPPED', resultHoldMs: LONG })],
     ['NO RESPONSE', vmFor(b('noresp', 'Fill light', '#2f6fde', { trigger: 'tap' }), { visual: 'unknown', endedAt: now - 120, title: 'NO RESPONSE', detail: 'The host didn’t answer in 2 s', code: 'NO RESPONSE', sticky: true })],
     ['INTERRUPTED', vmFor(b('interrupted', 'REC', '#f97316'), { visual: 'interrupted', endedAt: now - 120, title: 'INTERRUPTED', detail: 'the host stopped while it ran', code: 'INTERRUPTED', sticky: true, latched: 'REC ●' })],
@@ -53,6 +56,8 @@ function tiles(now: number): [string, ButtonVM][] {
     ['SLIPPED', vmFor(b('slipped', 'Hazer', '#ea580c'), { flash: { kind: 'slipped', at: now } })],
     ['2× TAP: 1st', vmFor(b('double', 'Strobe', '#db2777', { trigger: 'double', key: ' ' }), { doubleWait: true })],
     ['OFFLINE', vmFor(b('offline', 'Mark clip', '#2f6fde', { trigger: 'tap' }), { visual: 'offline' })],
+    ['SYNCING', vmFor(b('syncing', 'Porch light', '#facc15', { trigger: 'tap' }), { visual: 'syncing', latched: 'ON' })],
+    ['NOT SENT', vmFor(b('notsent', 'Garage door', '#2f6fde', { holdMs: 1000, confirm: true }), { visual: 'failure', endedAt: now - 120, title: 'NOT SENT', detail: 'not connected to the host', code: 'NOT SENT', sticky: true })],
   ];
 }
 
@@ -66,22 +71,23 @@ export function Gallery() {
     addEventListener('resize', r);
     return () => (clearInterval(t), removeEventListener('resize', r));
   }, []);
-  // ?gallery&cols=4&rows=6 repeats the tiles in a denser grid (small-button check).
+  // ?gallery&cols=4&rows=6 repeats the tiles in a denser grid (small-button check); &show: show mode.
   const q = new URLSearchParams(location.search);
-  const cols = Number(q.get('cols')) || (wide ? 5 : 3);
-  const rows = Number(q.get('rows')) || (wide ? 3 : 5);
+  const cols = Number(q.get('cols')) || (wide ? 6 : 3);
+  const rows = Number(q.get('rows')) || (wide ? 3 : 6);
+  const show = q.has('show') && q.get('show') !== '0';
   const base = tiles(t0);
   const list = Array.from({ length: cols * rows }, (_, i) => {
     const [name, vm] = base[i % base.length]!;
     return [name, { ...vm, id: `${vm.id}${i >= base.length ? i : ''}` }] as const;
   });
   return (
-    <div class="app bp-gallery" style={{ '--cols': String(cols), '--rows': String(rows) }}>
+    <div class="app bp-gallery" data-show={show ? '' : undefined} style={{ '--cols': String(cols), '--rows': String(rows) }}>
       <div class="bp-grid">
         {list.map(([name, vm]) => (
           <div class="bp-gallery-cell" key={vm.id}>
             <div class="bp-gallery-name">{name}</div>
-            <ButtonFace vm={vm} now={now} />
+            <ButtonFace vm={vm} now={now} show={show} />
           </div>
         ))}
       </div>

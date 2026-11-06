@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { Config, parseConfig, type ConfigInput } from '../src/core/config.ts';
 import { describeJsonError, explainConfigErrors, findJsonError } from '../src/server/config-errors.ts';
 import { readConfigFile } from '../src/server/config-store.ts';
-import { configWarnings, MAX_WARNINGS } from '../src/server/config-warnings.ts';
+import { bashisms, configWarnings, MAX_WARNINGS, shellViews } from '../src/server/config-warnings.ts';
 import { listenError, ListenError } from '../src/server/errors.ts';
 import { startHost, type Host } from '../src/server/host.ts';
 import { toProblems } from '../src/web/edit/problems.ts';
@@ -305,5 +305,108 @@ describe('warnings: what would fail when pressed, found at save time', () => {
     expect((await again.json()).warnings).toEqual([]);
     // The operator sees them in the log too.
     expect(logs).toContain(`⚠ pad "p" › button "b": permission denied (chmod +x?): ${join(dir, 'scripts', 'noexec.sh')}`);
+  });
+});
+
+describe('warnings: bash syntax under /bin/sh, keys that never fire, a group of one', () => {
+  const cfgOf = (buttons: object[]) => Config.parse({ version: 1, pads: [{ id: 'p', name: 'P', cols: 4, rows: 4, buttons }] });
+  const shellAction = (script: string, shell?: string) => ({ type: 'shell', script, ...(shell ? { shell } : {}) });
+
+  test("bash-only syntax in a script (QA: the rider's $RANDOM button failed 0/8 under dash, silently)", () => {
+    const cases: [string, string[]][] = [
+      ["sleep 0.3; [ $((RANDOM % 3)) -ne 0 ] || { echo 'network down' >&2; exit 1; }", ['$RANDOM']],
+      ['echo "take $RANDOM"', ['$RANDOM']],
+      ['if [[ -f x ]]; then echo y; fi', ['[[ … ]]']],
+      ['function greet { echo hi; }; greet', ['function name']],
+      ['test -f env && source ./env.sh', ['source']],
+      ['files=(a b c); echo "$files"', ['arrays (name=(…))']],
+      ['name=Bob; echo "${name,,} ${name^^}"', ['${var,,} / ${var^^}']],
+      ['grep -q x <<< "$v"', ['<<< (here-string)']],
+      ['for i in {1..9}; do echo $i; done', ['{1..9} (brace ranges)']],
+      ['make &> build.log', ['&> (redirect both)']],
+      ['a=(1 2)\n[[ -n $a ]] && echo $RANDOM', ['$RANDOM', '[[ … ]]', 'arrays (name=(…))']],
+    ];
+    for (const [script, want] of cases) expect({ script, found: bashisms(script) }).toEqual({ script, found: want });
+    // POSIX, or bash syntax only inside quotes and comments: nothing.
+    for (const script of [
+      `df -Ph . | awk 'NR==2 {print $4 " free of " $2}'`,
+      `echo "use [[ in bash, source it, a=(1), {1..3}, <<<" '$RANDOM \${x,,}' # function foo; source x; [[ y ]]`,
+      'x=$(date); y=$((1 + 2)); . ./env.sh; echo "$x" >&2; cmd 2>&1 >/dev/null',
+      'echo "${HOME:-/}" ${#PATH} \\$RANDOM',
+      'test "$a" = "(b)" && echo source of truth; echo [[ is just a word here',
+      'printf "%s\\n" "$1"; echo $#',
+    ])
+      expect({ script, found: bashisms(script) }).toEqual({ script, found: [] });
+    expect(shellViews(`a 'b c' "d $e" # f`)).toEqual({ code: `a '' "" `, expanded: `a '' "d $e" ` });
+  });
+
+  test('warned for the default /bin/sh (and an explicit sh), never once the button says bash', () => {
+    const cfg = cfgOf([
+      btn('rand', 0, 0, { action: shellAction('[ $((RANDOM % 3)) -ne 0 ] || exit 1') }),
+      btn('sh', 1, 0, { action: shellAction('[[ -n x ]] && source ./a', 'sh') }),
+      btn('bash', 2, 0, { action: shellAction('[[ -n x ]] && echo $RANDOM', 'bash') }),
+      btn('many', 3, 0, { action: shellAction('a=(1 2); [[ x ]]; source y; echo $RANDOM') }),
+      btn('posix', 0, 1, { action: shellAction('[ -n "$x" ] && . ./env') }),
+      btn('exec', 1, 1, { action: { type: 'exec', command: 'echo', args: ['$RANDOM', '[[', 'x'] } }),
+    ]);
+    const tail = 'which is not bash on many systems (dash on Debian, Ubuntu, Raspberry Pi OS): add "shell": "bash"';
+    expect(configWarnings(cfg, tmpDir()).filter((w) => w.includes('bash syntax'))).toEqual(
+      process.platform === 'win32'
+        ? []
+        : [
+            `pad "p" › button "rand": the script uses bash syntax ($RANDOM), but runs with /bin/sh, ${tail}`,
+            `pad "p" › button "sh": the script uses bash syntax ([[ … ]], source), but runs with sh, ${tail}`,
+            `pad "p" › button "many": the script uses bash syntax ($RANDOM, [[ … ]], source, …), but runs with /bin/sh, ${tail}`,
+          ],
+    );
+  });
+
+  test('a key that never presses its button: a modifier on its own', () => {
+    const cfg = cfgOf([
+      btn('ctrl', 0, 0, { key: 'Control' }),
+      btn('alt', 1, 0, { key: 'Alt' }),
+      btn('meta', 2, 0, { key: 'Meta' }),
+      btn('altgr', 3, 0, { key: 'AltGraph' }),
+      btn('ctrl2', 0, 1, { key: 'ctrl' }),
+      btn('shift', 1, 1, { key: 'Shift' }),
+      btn('letter', 2, 1, { key: 'a' }),
+      btn('space', 3, 1, { key: ' ' }),
+    ]);
+    const why = 'never presses it: a modifier key on its own (Control, Alt, Meta/⌘, AltGr) is kept for shortcuts; pick another key';
+    expect(configWarnings(cfg, tmpDir())).toEqual([
+      `pad "p" › button "ctrl": key "Control" ${why}`,
+      `pad "p" › button "alt": key "Alt" ${why}`,
+      `pad "p" › button "meta": key "Meta" ${why}`,
+      `pad "p" › button "altgr": key "AltGraph" ${why}`,
+      `pad "p" › button "ctrl2": key "ctrl" ${why}`,
+    ]);
+  });
+
+  test('a group of one stops nothing', () => {
+    const cfg = Config.parse({
+      version: 1,
+      pads: [
+        { id: 'p', name: 'P', cols: 3, rows: 1, buttons: [btn('a', 0, 0, { group: 'wash' }), btn('c', 2, 0, { group: 'solo' })] },
+        { id: 'q', name: 'Q', cols: 1, rows: 1, buttons: [btn('b', 0, 0, { group: 'wash' })] },
+      ],
+    });
+    expect(configWarnings(cfg, tmpDir())).toEqual(['pad "p" › button "c": group "solo" has no other button: it stops nothing']);
+  });
+
+  test.skipIf(process.platform === 'win32')('PUT /api/config carries them (the editor shows them on the button)', async () => {
+    const dir = tmpDir();
+    const configPath = join(dir, 'buttpad.config.json');
+    writeJson(configPath, padConfig([btn('a', 0, 0)]));
+    const host = await startHost({ configPath, host: '127.0.0.1', port: 0, log: () => {} });
+    hosts.push(host);
+    const cfg = padConfig([btn('pull-over', 0, 0, { key: 'Meta', action: shellAction("[ $((RANDOM % 3)) -ne 0 ] || { echo 'network down' >&2; exit 1; }") })]);
+    const r = await fetch(`http://127.0.0.1:${host.port}/api/config`, {
+      method: 'PUT',
+      headers: { authorization: `Bearer ${host.secrets.adminToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ config: cfg, baseRev: host.config.rev }),
+    });
+    expect(r.status).toBe(200);
+    const { warnings } = (await r.json()) as { warnings: string[] };
+    expect(warnings).toEqual([expect.stringContaining('button "pull-over": the script uses bash syntax ($RANDOM)'), expect.stringContaining('button "pull-over": key "Meta" never presses it')]);
   });
 });

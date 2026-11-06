@@ -31,3 +31,7 @@ export const ChevronDown = (p: P) => svg(p, <path d="M5.5 9.5L12 16l6.5-6.5" str
 export const Info = (p: P) =>
   svg(p, [<circle key="c" cx="12" cy="12" r="9" stroke-width="2.2" />, <path key="i" d="M12 11v5.5M12 7.6v.1" stroke-width="2.6" />]);
 export const Dot = (p: P) => svg(p, <circle cx="12" cy="12" r="5" fill="currentColor" stroke="none" />);
+/** An exclusive group: like a radio button, one of its buttons at a time. */
+export const GroupIcon = (p: P) => svg(p, [<circle key="o" cx="12" cy="12" r="8" stroke-width="2.6" />, <circle key="i" cx="12" cy="12" r="3.6" fill="currentColor" stroke="none" />]);
+/** A time limit. */
+export const Timer = (p: P) => svg(p, [<circle key="c" cx="12" cy="13.5" r="7.5" stroke-width="2.2" />, <path key="h" d="M12 13.5V9.5M9.5 3h5" stroke-width="2.2" />]);

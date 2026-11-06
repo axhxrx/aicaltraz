@@ -44,7 +44,7 @@
 }
 /* Narrow phones: the green dot alone says LIVE; words appear when something is wrong. */
 @media (max-width: 420px) {
-  .bp-conn[data-status='online']:not([data-demo]) span {
+  .bp-conn[data-status='online']:not([data-demo]):not([data-syncing]) span {
     display: none;
   }
   .bp-conn {
@@ -270,6 +270,12 @@ button {
 .bp-conn[data-status='connecting'] .bp-dot {
   border: 2.5px solid var(--amber);
   animation: bp-blink 0.8s steps(1, end) infinite;
+}
+/* Catching up after a long stretch away: a hollow dot, no green until the host's word is in. */
+.bp-conn[data-syncing] .bp-dot {
+  background: transparent;
+  box-shadow: none;
+  border: 2.5px solid var(--muted);
 }
 /* Offline: red diamond + red text (shape and color both change). */
 .bp-conn[data-status='offline'],
@@ -668,6 +674,119 @@ button.bp-row:active {
 .bp-banner-x svg {
   width: 20px;
   height: 20px;
+}
+.bp-banner.is-ok {
+  background: #06200ff2;
+  border-color: var(--ok);
+  color: #c9f2d7;
+}
+.bp-banner.is-ok b {
+  color: var(--ok);
+}
+
+/* ---- pairing by code ---------------------------------------------------------------------- */
+
+/* Over the pad when this device is paired already ("Unlock editing…", a #pair link). */
+.bp-screen.bp-code-screen {
+  z-index: 30;
+}
+.bp-screen .bp-screen-note {
+  font-size: 15px;
+  color: var(--muted);
+}
+.bp-ghost.bp-code-entry {
+  margin: 4px 0 10px;
+}
+.bp-screen-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.bp-code-form {
+  margin: 22px 0 8px;
+}
+/* Big digits, the number pad, one field (pasting "123 456" works too). */
+.bp-code-input {
+  display: block;
+  width: 100%;
+  height: 84px;
+  padding: 0 16px;
+  border-radius: 18px;
+  border: 3px solid var(--line);
+  background: #0f1115;
+  color: var(--text);
+  font: 900 46px var(--font);
+  letter-spacing: 0.32em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  touch-action: manipulation;
+}
+.bp-code-input::placeholder {
+  color: #3a3f48;
+}
+.bp-code-input:focus {
+  border-color: #5b8cff;
+}
+.bp-code-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+.bp-code-actions .bp-cta {
+  flex: 1;
+}
+.bp-code-actions .bp-ghost {
+  height: 56px;
+}
+.bp-cta:disabled {
+  opacity: 0.6;
+}
+/* Admin: the code another device types (menu → Pair another device). */
+.bp-paircode {
+  margin: 4px 6px 10px;
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--panel-2);
+  font-weight: 700;
+  font-size: 14px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.bp-paircode-digits {
+  font-weight: 900;
+  font-size: 44px;
+  letter-spacing: 0.12em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.bp-paircode-digits.is-expired {
+  text-decoration: line-through;
+  opacity: 0.4;
+}
+.bp-paircode-note b {
+  color: var(--text);
+}
+.bp-paircode-left {
+  margin-top: 8px;
+  font-weight: 900;
+  color: var(--amber);
+}
+
+/* ---- show mode: the chrome dims with the buttons (button.css has the faces) --------------- */
+
+.app[data-show] {
+  --text: #c3c9d1;
+  --muted: #7d8692;
+  --ok: #3fb56c;
+  --bad: #e5484d;
+  --amber: #d29a1e;
+}
+.app[data-show] .bp-conn[data-status='online'] .bp-dot {
+  box-shadow: none;
 }
 
 /* ---- gallery (?gallery) ----------------------------------------------------------------- */

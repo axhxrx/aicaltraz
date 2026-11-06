@@ -3,9 +3,9 @@ import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, rea
 import { dirname, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { Button, Config, findButton, parseConfig, type ConfigInput } from '../src/core/config.ts';
-import { atomicWrite, ConfigLoadError, ConfigStore, redactConfig, revOf, serializeConfig } from '../src/server/config-store.ts';
+import { atomicWrite, ConfigLoadError, ConfigStore, formatJson, INLINE_WIDTH, redactConfig, revOf, serializeConfig } from '../src/server/config-store.ts';
 import { configWarnings } from '../src/server/config-warnings.ts';
-import { starterConfig, starterConfigText } from '../src/server/starter.ts';
+import { HELP_TEXT, HELP_TEXT_WINDOWS, starterConfig, starterConfigText } from '../src/server/starter.ts';
 import { cleanupTmp, padConfig, tmpDir, waitFor, writeJson } from './helpers.ts';
 
 afterAll(cleanupTmp);
@@ -176,7 +176,8 @@ describe('serializeConfig / redactConfig / revOf', () => {
       { id: 'b', label: 'B', x: 1, y: 0, w: 2, trigger: 'tap', holdMs: 900, key: 'b', action: { type: 'exec', command: 'echo', args: ['x'], env: { A: '1' } } },
       { id: 'c', x: 0, y: 1, timeoutMs: 30000, confirm: true, action: { type: 'shell', script: 'true', shell: '/bin/sh', cwd: 'sub' } },
     ]);
-    expect(Object.keys(out)).toEqual(['$schema', 'version', 'server', 'pads']);
+    // `server` at its defaults is left out too.
+    expect(Object.keys(out)).toEqual(['$schema', 'version', 'pads']);
     expect(out.pads[0]).toMatchObject({ cols: 3, rows: 2 });
   });
 
@@ -186,6 +187,107 @@ describe('serializeConfig / redactConfig / revOf', () => {
     expect(text).toContain('\n  "version": 1,');
     expect(Config.parse(JSON.parse(text))).toEqual(cfg);
     expect(serializeConfig(Config.parse(JSON.parse(text)))).toBe(text);
+  });
+
+  test('short arrays of strings/numbers, and short flat objects, go on one line; long ones do not', () => {
+    const text = serializeConfig(
+      Config.parse(
+        padConfig([
+          { id: 'a', x: 0, y: 0, stops: ['p/b'], action: { type: 'exec', command: './fade.sh', args: ['wash', '100', '10'], env: { LEVEL: '1' } } },
+          { id: 'b', x: 1, y: 0, action: { type: 'exec', command: 'echo', args: Array.from({ length: 12 }, (_, i) => `argument-${i}`) } },
+          { id: 'c', x: 2, y: 0, action: { type: 'shell', script: 'echo "a fairly long script that goes on and on" && sleep 1 && echo done' } },
+        ]),
+      ),
+    );
+    expect(text).toContain('\n          "stops": ["p/b"],\n');
+    expect(text).toContain('\n          "action": { "type": "exec", "command": "./fade.sh", "args": ["wash", "100", "10"], "env": { "LEVEL": "1" } }\n');
+    expect(text).toContain('"args": [\n              "argument-0",\n');
+    expect(text).toContain('"action": {\n            "type": "shell",\n            "script": "echo \\"a fairly long script');
+    for (const line of text.split('\n')) if (/[[{] "|\["/.test(line) && !line.trimEnd().endsWith('[') && !line.trimEnd().endsWith('{')) expect(line.length).toBeLessThanOrEqual(INLINE_WIDTH);
+    expect(formatJson({ a: [], b: {}, c: [1, 'x', null, true] })).toBe('{ "a": [], "b": {}, "c": [1, "x", null, true] }');
+  });
+
+  test('server: left out at its defaults; only what differs (or what the author wrote) otherwise', () => {
+    const at = (server: object | undefined, original?: unknown) => {
+      const cfg = Config.parse({ ...padConfig([{ id: 'a', x: 0, y: 0, action: { type: 'none' } }]), ...(server ? { server } : {}) });
+      return JSON.parse(serializeConfig(cfg, original)).server;
+    };
+    expect(at(undefined)).toBeUndefined();
+    expect(at({ host: '0.0.0.0', port: 8787 })).toBeUndefined();
+    expect(at({ port: 9000 })).toEqual({ port: 9000 });
+    expect(at({ host: '127.0.0.1' })).toEqual({ host: '127.0.0.1' });
+    expect(at({ port: 8787 }, { version: 1, server: { port: 8787 } })).toEqual({ port: 8787 });
+  });
+
+  test("a save keeps the author's key order (top level, pads, buttons, actions); new keys go next to their schema neighbours", () => {
+    const original = {
+      pads: [
+        {
+          name: 'Show',
+          id: 'show',
+          rows: 1,
+          cols: 3,
+          buttons: [
+            { action: { command: './a.sh', type: 'exec', args: ['1'] }, y: 0, x: 0, id: 'a', label: 'A', holdMs: 300, key: 'a' },
+            { id: 'b', x: 1, y: 0, trigger: 'hold', action: { type: 'none' } },
+          ],
+        },
+      ],
+      version: 1,
+    };
+    const cfg = Config.parse(original);
+    const next = structuredClone(cfg);
+    const a = next.pads[0]!.buttons[0]!;
+    a.timeoutMs = 60_000; // new: lands next to holdMs (schema neighbours), not at the end
+    a.action = { type: 'exec', command: './a.sh', args: ['1'], cwd: 'sub' };
+    next.pads[0]!.buttons.push({ ...next.pads[0]!.buttons[1]!, id: 'c', x: 2, label: 'C' });
+    const out = JSON.parse(serializeConfig(next, original));
+    expect(Object.keys(out)).toEqual(['pads', 'version']);
+    expect(Object.keys(out.pads[0])).toEqual(['name', 'id', 'rows', 'cols', 'buttons']);
+    expect(Object.keys(out.pads[0].buttons[0])).toEqual(['action', 'y', 'x', 'id', 'label', 'holdMs', 'timeoutMs', 'key']);
+    expect(Object.keys(out.pads[0].buttons[0].action)).toEqual(['command', 'type', 'args', 'cwd']);
+    // An explicit default the author wrote stays; a new button follows the pad's first button's order.
+    expect(out.pads[0].buttons[1]).toEqual({ id: 'b', x: 1, y: 0, trigger: 'hold', action: { type: 'none' } });
+    expect(Object.keys(out.pads[0].buttons[2])).toEqual(['action', 'y', 'x', 'id', 'label']);
+    expect(Config.parse(out)).toEqual(next);
+    // Without the original: schema order, defaults left out.
+    expect(Object.keys(JSON.parse(serializeConfig(next)).pads[0].buttons[1])).toEqual(['id', 'x', 'y', 'action']);
+  });
+
+  test('QA (stage): one UI save of a 69-line hand-written file no longer makes 302 lines, and keeps its order', () => {
+    const text = readFileSync(join(root, 'test', 'fixtures', 'stage-show.json'), 'utf8');
+    const raw = JSON.parse(text);
+    const cfg = Config.parse(raw);
+    cfg.pads[0]!.buttons.find((b) => b.id === 'video')!.timeoutMs = 240_000; // the edit made mid-show
+    const saved = serializeConfig(cfg, raw);
+    expect(text.split('\n').length).toBe(70);
+    expect(saved.split('\n').length).toBeLessThan(200);
+    expect(saved).not.toContain('"server"');
+    expect(saved).toContain('"stops": ["show/fade-in", "show/fade-out", "show/fade-slow", "show/spot"],');
+    expect(saved).toContain('"action": { "type": "exec", "command": "./cues/fade.sh", "args": ["wash", "100", "10"] }');
+    expect(Config.parse(JSON.parse(saved))).toEqual(cfg);
+    // Saving the saved file again changes nothing.
+    expect(serializeConfig(Config.parse(JSON.parse(saved)), JSON.parse(saved))).toBe(saved);
+  });
+
+  test('ConfigStore.save lays the file out like the one it replaces', () => {
+    const dir = tmpDir();
+    const path = join(dir, 'c.json');
+    writeFileSync(path, '{ "version": 1, "pads": [ { "name": "P", "id": "p", "buttons": [ { "id": "a", "y": 0, "x": 0, "action": { "type": "none" } } ] } ] }\n');
+    const { store } = ConfigStore.open(path);
+    const next = structuredClone(store.config);
+    next.pads[0]!.buttons[0]!.label = 'Hello';
+    const r = store.save(next, store.rev);
+    expect(r.ok).toBe(true);
+    const out = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.keys(out)).toEqual(['version', 'pads']);
+    expect(Object.keys(out.pads[0])).toEqual(['name', 'id', 'cols', 'rows', 'buttons']);
+    expect(Object.keys(out.pads[0].buttons[0])).toEqual(['id', 'label', 'y', 'x', 'action']);
+    // A second save follows what the first one wrote.
+    const again = structuredClone(store.config);
+    again.pads[0]!.buttons[0]!.holdMs = 900;
+    expect(store.save(again, store.rev).ok).toBe(true);
+    expect(Object.keys(JSON.parse(readFileSync(path, 'utf8')).pads[0].buttons[0])).toEqual(['id', 'label', 'y', 'x', 'holdMs', 'action']);
   });
 
   test('redactConfig strips every action and nothing else, without mutating', () => {
@@ -566,10 +668,28 @@ describe('examples and starter config', () => {
     for (const platform of ['linux', 'darwin', 'win32'] as const) {
       const cfg = Config.parse(starterConfig('/x/buttpad.config.json', platform));
       expect(cfg.pads[0]!.buttons.length).toBeGreaterThanOrEqual(5);
-      expect(JSON.stringify(cfg)).toContain('/x/buttpad.config.json');
     }
     const text = starterConfigText('/x/buttpad.config.json');
     expect(serializeConfig(Config.parse(JSON.parse(text)))).toBe(text);
+    expect(text).not.toContain('"server"');
+  });
+
+  test("the help button's answer fits a 360 px phone: one short line, no file path (QA: \"Edit /tmp/claude-…\")", () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      const help = findButton(Config.parse(starterConfig('/home/pi/some/long/folder/buttpad.config.json', platform)), 'host', 'edit-me')!;
+      const text = JSON.stringify(help.action);
+      expect(text).toContain(platform === 'win32' ? HELP_TEXT_WINDOWS : HELP_TEXT);
+      expect(text).not.toContain('/home/pi');
+      expect(help).toMatchObject({ w: 2, h: 1 });
+    }
+    // Measured in Chromium at 360×640: one line of result text there holds ~32 characters at a readable size.
+    for (const t of [HELP_TEXT, HELP_TEXT_WINDOWS]) expect(t.length).toBeLessThanOrEqual(34);
+    expect(HELP_TEXT_WINDOWS).toMatch(/^[\x20-\x7e]+$/);
+    expect(HELP_TEXT_WINDOWS).not.toMatch(/[<>&|^]/);
+    if (process.platform !== 'win32') {
+      const r = Bun.spawnSync(['echo', `@result ${HELP_TEXT}`]);
+      expect(r.stdout.toString()).toBe(`@result ${HELP_TEXT}\n`);
+    }
   });
 
   test('schema/buttpad.config.schema.json is up to date (bun run schema)', () => {

@@ -95,15 +95,102 @@ function deadStops(b: Button, padId: string, cfg: Config): string[] {
   });
 }
 
+/**
+ * A script as a POSIX shell parses it, roughly: `code` without quoted strings and comments (what is
+ * syntax), `expanded` without single-quoted strings and comments (where `$…` expands: unquoted and
+ * in double quotes). Good enough to spot bash syntax without flagging an awk program or an echo.
+ */
+export function shellViews(script: string): { code: string; expanded: string } {
+  let code = '';
+  let expanded = '';
+  let i = 0;
+  const n = script.length;
+  /** At the start of a word: where a `#` starts a comment. */
+  const wordStart = () => i === 0 || /[\s;&|()<>]/.test(script[i - 1]!);
+  while (i < n) {
+    const c = script[i]!;
+    if (c === '\\') {
+      code += '  ';
+      expanded += '  ';
+      i += 2;
+    } else if (c === "'") {
+      const end = script.indexOf("'", i + 1);
+      const stop = end < 0 ? n : end + 1;
+      code += "''";
+      expanded += "''";
+      i = stop;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (j < n && script[j] !== '"') j += script[j] === '\\' ? 2 : 1;
+      code += '""';
+      expanded += script.slice(i, Math.min(j + 1, n));
+      i = j + 1;
+    } else if (c === '#' && wordStart()) {
+      while (i < n && script[i] !== '\n') i++;
+    } else {
+      code += c;
+      expanded += c;
+      i++;
+    }
+  }
+  return { code, expanded };
+}
+
+/** Where a command starts: the start of a line, after ; & | ( ) { } !, or after a keyword that takes a command. */
+const CMD = String.raw`(?:^|[;&|(){}!]|\b(?:then|do|else|elif|if|while|until|time))[ \t]*`;
+
+/** Bash-only syntax that /bin/sh (dash on Debian, Ubuntu, Raspberry Pi OS) fails on or, worse, runs differently. */
+const BASHISMS: { name: string; in: 'code' | 'expanded'; re: RegExp }[] = [
+  // dash has no RANDOM: `$((RANDOM % 3))` is always 0 there.
+  { name: '$RANDOM', in: 'expanded', re: /\$\{?RANDOM\b|\$\(\([^)]*\bRANDOM\b/ },
+  { name: '[[ … ]]', in: 'code', re: new RegExp(`${CMD}\\[\\[[ \\t]`, 'm') },
+  { name: 'function name', in: 'code', re: new RegExp(`${CMD}function[ \\t]+[A-Za-z_]`, 'm') },
+  { name: 'source', in: 'code', re: new RegExp(`${CMD}source[ \\t]+\\S`, 'm') },
+  { name: 'arrays (name=(…))', in: 'code', re: /(?:^|[\s;&|(){}])[A-Za-z_]\w*\+?=\(/m },
+  { name: '${var,,} / ${var^^}', in: 'expanded', re: /\$\{[A-Za-z_]\w*(?:,,?|\^\^?)[^}]*\}/ },
+  { name: '<<< (here-string)', in: 'code', re: /<<</ },
+  { name: '{1..9} (brace ranges)', in: 'code', re: /\{-?(?:\d+|[A-Za-z])\.\.-?(?:\d+|[A-Za-z])(?:\.\.-?\d+)?\}/ },
+  // dash reads `cmd &> f` as `cmd &` then `> f`: it runs in the background and f is emptied.
+  { name: '&> (redirect both)', in: 'code', re: /&>/ },
+];
+
+/** The bash-only syntax in `script` (names, in BASHISMS order). */
+export function bashisms(script: string): string[] {
+  const views = shellViews(script);
+  return BASHISMS.filter((b) => b.re.test(views[b.in])).map((b) => b.name);
+}
+
+/** A shell action whose shell is /bin/sh, as written or by default (not bash, zsh…). */
+function runsUnderSh(b: Button): boolean {
+  if (isWindows || b.action.type !== 'shell') return false;
+  const shell = b.action.shell;
+  return shell === undefined || ['sh', 'dash', 'ash'].includes(basename(shell));
+}
+
+/** Modifier keys: a browser keeps them for shortcuts (keydown with ctrlKey/altKey/metaKey), so on their own they never press a button. */
+const MODIFIER_KEYS = new Set(['control', 'ctrl', 'alt', 'option', 'meta', 'cmd', 'command', 'os', 'super', 'win', 'altgraph', 'altgr']);
+
 /** Problems a press would run into, per button, in config order; at most MAX_WARNINGS (+ a count). */
 export function configWarnings(cfg: Config, baseDir: string, env: Record<string, string | undefined> = process.env): string[] {
   const out: string[] = [];
+  const groups = new Map<string, number>();
+  for (const pad of cfg.pads) for (const b of pad.buttons) if (b.group !== undefined) groups.set(b.group, (groups.get(b.group) ?? 0) + 1);
   for (const pad of cfg.pads)
     for (const b of pad.buttons) {
       const where = `pad "${pad.id}" › button "${b.id}"`;
       const problem = checkAction(b, baseDir, env);
       if (problem) out.push(`${where}: ${problem}`);
+      if (runsUnderSh(b) && b.action.type === 'shell') {
+        const found = bashisms(b.action.script);
+        if (found.length)
+          out.push(
+            `${where}: the script uses bash syntax (${found.slice(0, 3).join(', ')}${found.length > 3 ? ', …' : ''}), but runs with ${b.action.shell ?? '/bin/sh'}, which is not bash on many systems (dash on Debian, Ubuntu, Raspberry Pi OS): add "shell": "bash"`,
+          );
+      }
+      if (b.key !== undefined && MODIFIER_KEYS.has(b.key.trim().toLowerCase()))
+        out.push(`${where}: key "${b.key}" never presses it: a modifier key on its own (Control, Alt, Meta/⌘, AltGr) is kept for shortcuts; pick another key`);
       for (const p of deadStops(b, pad.id, cfg)) out.push(`${where}: stops "${p}" matches no other button`);
+      if (b.group !== undefined && groups.get(b.group) === 1) out.push(`${where}: group "${b.group}" has no other button: it stops nothing`);
     }
   return out.length > MAX_WARNINGS ? [...out.slice(0, MAX_WARNINGS - 1), `…and ${out.length - MAX_WARNINGS + 1} more`] : out;
 }

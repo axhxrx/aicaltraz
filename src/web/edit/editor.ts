@@ -268,8 +268,8 @@ export class Editor {
   }
 
   /**
-   * Labels and pad names as the host keeps them (trimmed), so what's saved is exactly the draft.
-   * Not an undo step of its own.
+   * What the host keeps trimmed (labels, pad names, groups, a program's path, folders and shell),
+   * trimmed here too, so what's saved is exactly the draft. Not an undo step of its own.
    */
   tidy(): void {
     const s = this.state;
@@ -277,7 +277,8 @@ export class Editor {
     s.draft.pads.forEach((p, pi) => {
       if (p.name !== p.name.trim()) next = this.withPad(next, pi, (x) => ({ ...x, name: x.name.trim() }));
       p.buttons.forEach((b, bi) => {
-        if (b.label !== b.label.trim()) next = this.withButton(next, pi, bi, (x) => ({ ...x, label: x.label.trim() }));
+        const t = tidyButton(b);
+        if (t !== b) next = this.withButton(next, pi, bi, () => t);
       });
     });
     if (next !== s.draft) this.store.set({ ...s, draft: next });
@@ -500,5 +501,36 @@ export class Editor {
 }
 
 const clampIx = (i: number, n: number) => Math.max(0, Math.min(n - 1, i));
+
+/** `b` as the schema trims it (the same object when nothing changes). An optional field left blank goes. */
+export function tidyButton(b: Button): Button {
+  let out = b;
+  const set = (patch: Partial<Button>) => (out = { ...out, ...patch });
+  if (b.label !== b.label.trim()) set({ label: b.label.trim() });
+  if (b.group !== undefined && b.group !== b.group.trim()) {
+    if (b.group.trim()) set({ group: b.group.trim() });
+    else {
+      const { group: _g, ...rest } = out;
+      out = rest;
+    }
+  }
+  const a = b.action;
+  if (a.type !== 'none') {
+    let na: Action = a;
+    const trim = <K extends 'command' | 'cwd' | 'shell'>(k: K, optional: boolean) => {
+      const v = (na as Record<string, unknown>)[k];
+      if (typeof v !== 'string' || v === v.trim()) return;
+      if (optional && !v.trim()) {
+        const { [k]: _x, ...rest } = na as Record<string, unknown>;
+        na = rest as Action;
+      } else na = { ...na, [k]: v.trim() } as Action;
+    };
+    if (a.type === 'exec') trim('command', false);
+    else trim('shell', true);
+    trim('cwd', true);
+    if (na !== a) set({ action: na });
+  }
+  return out;
+}
 /** Would `patch` change nothing on `o`? (No-op edits make no undo steps.) */
 const same = (o: object, patch: object) => Object.entries(patch).every(([k, v]) => stable(v) === stable((o as Record<string, unknown>)[k]));

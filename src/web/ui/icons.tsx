@@ -51,5 +51,14 @@ export const Interrupted = (p: P) => svg(p, [<path key="z" d="M13.5 2.8L6 13.2h5
 /** A run started on another device. */
 export const Devices = (p: P) =>
   svg(p, [<rect key="a" x="2.8" y="5" width="9.5" height="14.5" rx="1.8" stroke-width="2.2" />, <rect key="b" x="14.6" y="8.4" width="6.6" height="11.1" rx="1.5" stroke-width="2.2" />]);
+/** A pairing code / unlocking. */
+export const Key = (p: P) =>
+  svg(p, [<circle key="c" cx="8" cy="15" r="4.6" stroke-width="2.4" />, <path key="s" d="M11.4 11.6L20 3M16.5 6.5l2.6 2.6M14 9l2 2" stroke-width="2.4" />]);
+/** Show mode: theatre, a dark house. */
+export const Stage = (p: P) =>
+  svg(p, [
+    <path key="m" d="M3 4.5h18v4.2c0 5.6-4 10.8-9 10.8S3 14.3 3 8.7z" stroke-width="2.2" />,
+    <path key="e" d="M7.6 9.6h2.2M14.2 9.6h2.2M8.6 14a4.6 4.6 0 0 0 6.8 0" stroke-width="2.2" />,
+  ]);
 /** The screen may sleep. */
 export const Moon = (p: P) => svg(p, <path d="M19.5 14.6A8 8 0 0 1 9.4 4.5a8 8 0 1 0 10.1 10.1z" fill="currentColor" stroke-width="1.6" />);
