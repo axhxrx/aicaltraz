@@ -156,8 +156,21 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
   const [code, setCode] = useState(p.initial ?? '');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /** Too many tries: Date.now() when the host takes one again (its Retry-After), counted down on screen. */
+  const [waitUntil, setWaitUntil] = useState<number | null>(null);
+  const [, tick] = useState(0);
   const input = useRef<HTMLInputElement>(null);
+  const left = waitUntil === null ? 0 : Math.max(0, Math.ceil((waitUntil - Date.now()) / 1000));
+  useEffect(() => {
+    if (waitUntil === null) return;
+    const t = setInterval(() => {
+      tick((n) => n + 1);
+      if (Date.now() >= waitUntil) (setWaitUntil(null), setErr(null), input.current?.focus());
+    }, 250);
+    return () => clearInterval(t);
+  }, [waitUntil]);
   const submit = async () => {
+    if (left > 0) return;
     const digits = codeDigits(code);
     if (digits.length < CODE_MIN) return setErr(`Type the whole code: ${CODE_MIN} or more digits.`);
     setBusy(true);
@@ -165,7 +178,11 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
     const r = await pairWithCode(digits);
     setBusy(false);
     if (r.ok) return p.onPaired(r.token, r.role);
-    setErr(r.why === 'limited' ? `${PAIR_ERRORS.limited} Wait ${r.retryAfter ? `${r.retryAfter} s` : 'a minute'}, then try again.` : PAIR_ERRORS[r.why]);
+    if (r.why === 'limited') {
+      setWaitUntil(Date.now() + (r.retryAfter ?? 60) * 1000);
+      return setErr(PAIR_ERRORS.limited);
+    }
+    setErr(PAIR_ERRORS[r.why]);
     input.current?.focus();
     input.current?.select();
   };
@@ -204,7 +221,6 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
           value={code}
           onInput={(e) => (setCode(e.currentTarget.value), setErr(null))}
           inputMode="numeric"
-          pattern="[0-9 \-]*"
           autocomplete="one-time-code"
           maxLength={CODE_MAX + 4}
           placeholder="••••••"
@@ -214,11 +230,12 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
         {err && (
           <div class="bp-paste-err" role="alert" data-testid="code-error">
             {err}
+            {left > 0 && ` Wait ${left} s, then try again.`}
           </div>
         )}
         <div class="bp-code-actions">
-          <button type="submit" class="bp-cta" data-testid="code-submit" disabled={busy}>
-            {busy ? 'Pairing…' : 'Pair'}
+          <button type="submit" class="bp-cta" data-testid="code-submit" disabled={busy || left > 0}>
+            {busy ? 'Pairing…' : left > 0 ? `Wait ${left} s` : 'Pair'}
           </button>
           <button type="button" class="bp-ghost" data-testid="code-cancel" onClick={p.onCancel}>
             {p.paired ? 'Cancel' : 'Back'}

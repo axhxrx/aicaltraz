@@ -47,10 +47,10 @@ function tiles(now: number): [string, ButtonVM][] {
     ['SUCCESS', vmFor(b('success', 'Upload selects', '#2f6fde'), { visual: 'success', endedAt: now - 120, elapsedMs: 2180, text: '12 photos uploaded', resultHoldMs: LONG })],
     ['FAILURE', vmFor(b('failure', 'Card backup', '#f97316'), { visual: 'failure', endedAt: now - 120, title: 'card full: 0 bytes free', detail: 'EXIT 3', code: 'EXIT 3', sticky: true })],
     // A red READY button next to FAILURE: the failure's hatching tells them apart (in grayscale too).
-    ['READY (red)', vmFor(b('estop', 'E-STOP', '#c1121f', { trigger: 'tap', confirm: true }), { last: { tone: 'stopped', ago: '4 m ago' } })],
+    ['READY (red)', vmFor(b('estop', 'EMERGENCY STOP', '#c1121f', { trigger: 'tap', confirm: true }), { last: { tone: 'stopped', ago: '4 m ago' } })],
     ['STOPPED', vmFor(b('stopped', 'Haze', '#0d9488', { trigger: 'tap' }), { visual: 'stopped', endedAt: now - 120, title: 'STOPPED', detail: 'stopped by ALL OFF', code: 'STOPPED', resultHoldMs: LONG })],
     ['NO RESPONSE', vmFor(b('noresp', 'Fill light', '#2f6fde', { trigger: 'tap' }), { visual: 'unknown', endedAt: now - 120, title: 'NO RESPONSE', detail: 'The host didn’t answer in 2 s', code: 'NO RESPONSE', sticky: true })],
-    ['INTERRUPTED', vmFor(b('interrupted', 'REC', '#f97316'), { visual: 'interrupted', endedAt: now - 120, title: 'INTERRUPTED', detail: 'the host stopped while it ran', code: 'INTERRUPTED', sticky: true, latched: 'REC ●' })],
+    ['INTERRUPTED', vmFor(b('interrupted', 'REC', '#f97316'), { visual: 'interrupted', endedAt: now - 120, title: 'INTERRUPTED', detail: 'the host stopped while it ran', code: 'INTERRUPTED', sticky: true, latched: '? REC ●' })],
     ['WAS RUNNING', vmFor(b('offrun', 'Fog machine', '#7c3aed'), { visual: 'offline', under: 'running', startedAt: now - 12_300, seenElapsed: 12_300 })],
     ['BUSY', vmFor(b('busy', 'Render preview', '#0891b2'), { visual: 'running', startedAt: now - 8200, flash: { kind: 'busy', at: now } })],
     ['SLIPPED', vmFor(b('slipped', 'Hazer', '#ea580c'), { flash: { kind: 'slipped', at: now } })],

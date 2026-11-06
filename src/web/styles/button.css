@@ -837,6 +837,18 @@
 .bp-btn[data-visual='offline'] .bp-latched {
   opacity: 0.6;
 }
+/* A latched state the host can't vouch for (a crash cut off the run that set it): hollow, dashed, "?". */
+.bp-latched.is-uncertain {
+  background: transparent;
+  color: var(--ink);
+  outline: 0.13em dashed currentColor;
+  outline-offset: -0.13em;
+  opacity: 0.85;
+}
+.bp-latched.is-uncertain i {
+  font-style: normal;
+  font-weight: 900;
+}
 @container (max-width: 112px) {
   .bp-mark .bp-chip-text {
     display: none;

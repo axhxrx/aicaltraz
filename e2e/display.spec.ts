@@ -182,7 +182,8 @@ test('chips: pretty key names, the hold duration, and they stay inside narrow bu
     [...document.querySelectorAll<HTMLElement>('.bp-chip')].filter((c) => {
       const r = c.getBoundingClientRect();
       const b = c.closest('.bp-btn')!.getBoundingClientRect();
-      return getComputedStyle(c.parentElement!).display !== 'none' && (r.left < b.left || r.right > b.right || c.scrollWidth > c.clientWidth + 1);
+      // (A chip a narrow button leaves out — the key chip under 110 px — isn't clipped: it's gone.)
+      return getComputedStyle(c.parentElement!).display !== 'none' && getComputedStyle(c).display !== 'none' && (r.left < b.left || r.right > b.right || c.scrollWidth > c.clientWidth + 1);
     }).length,
   );
   expect(clipped).toBe(0);

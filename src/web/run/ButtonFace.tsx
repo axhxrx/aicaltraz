@@ -116,6 +116,33 @@ function lastNeedEm(text: string, ago: string, latched: string | undefined): num
   return Math.ceil((em + 0.6) * 100) / 100;
 }
 
+/** How the host marks a latched state it can't vouch for: the run that set it was cut off by a crash ("? BGM ●"). */
+const UNCERTAIN = '? ';
+
+/**
+ * Latched device state (`@state`): a solid chip. One the host can't vouch for (a crash cut off the
+ * run that set it, so the device may be in any state now: "? BGM ●") is hollow and dashed instead.
+ */
+function Latched({ id, text }: { id: string; text: string }) {
+  if (!text.startsWith(UNCERTAIN))
+    return (
+      <span class="bp-latched" data-testid={`latched-${id}`}>
+        {text}
+      </span>
+    );
+  return (
+    <span
+      class="bp-latched is-uncertain"
+      data-testid={`latched-${id}`}
+      data-uncertain=""
+      title="Not sure: the host stopped while the run that set this was going"
+      aria-label={`${text.slice(UNCERTAIN.length)} (not sure: the host stopped while it was being set)`}
+    >
+      <i aria-hidden="true">?</i> {text.slice(UNCERTAIN.length)}
+    </span>
+  );
+}
+
 /**
  * The top edge: another device's run, how the last run ended, or the ✕ of a result kept on screen
  * (left); latched device state (right).
@@ -166,11 +193,7 @@ function TopBand({ vm, onDismiss }: { vm: ButtonVM; onDismiss?: () => void }) {
   return (
     <div class="bp-top">
       {left ?? <span />}
-      {vm.latched && (
-        <span class="bp-latched" data-testid={`latched-${vm.id}`}>
-          {vm.latched}
-        </span>
-      )}
+      {vm.latched && <Latched id={vm.id} text={vm.latched} />}
     </div>
   );
 }

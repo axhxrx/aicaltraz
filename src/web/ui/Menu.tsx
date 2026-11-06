@@ -106,7 +106,7 @@ function PairDevicePanel({ backend }: { backend: Backend }) {
         {grouped(st.code.code)}
       </div>
       <div class="bp-paircode-note">
-        On the other device, open <b>{location.host}/#pair</b> (or “Pair with a code…” on its pairing screen) and type this code. It pairs it as{' '}
+        On the other device, open <b>{location.host}/#pair</b> (or “Pair with a code” on its pairing screen) and type this code. It pairs it as{' '}
         {st.code.role === 'admin' ? 'an admin device (it can edit pads)' : 'a press-only device'}, once.
       </div>
       {left > 0 ? (

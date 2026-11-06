@@ -129,7 +129,10 @@ test('a #pair link opens the code entry (a code in the link is tried at once); t
   await limited.goto(`${host.url}/#pair`);
   await limited.getByTestId('code-input').fill('999999');
   await limited.getByTestId('code-submit').click();
-  await expect(limited.getByTestId('code-error')).toContainText('Too many tries. Wait 30 s');
+  // A countdown from the host's Retry-After; Pair waits meanwhile.
+  await expect(limited.getByTestId('code-error')).toContainText(/Too many tries\. Wait (30|29|28) s/);
+  await expect(limited.getByTestId('code-submit')).toBeDisabled();
+  await expect(limited.getByTestId('code-submit')).toContainText(/Wait 2\d s/, { timeout: 4000 });
   await limited.close();
 });
 

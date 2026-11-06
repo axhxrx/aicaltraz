@@ -417,10 +417,29 @@ is logged once and the log starts empty.
 
 ### Connection & pairing
 
-- Token from `location.hash` `#token=…` → `localStorage` (`buttpad.token`), then strip the hash
-  with `history.replaceState`. No token → pairing screen: explain how to pair (scan the QR the
-  host prints / open the pairing URL), with a paste field. Storage blocked (private mode, site data
-  blocked): the token is kept in memory for the tab, and the pad says pairing won't be remembered.
+- Token from `location.hash` `#token=…`, the hash stripped at once with `history.replaceState`.
+  With no token stored it is simply kept (`localStorage`, `buttpad.token`). One that would
+  **replace a working pairing** is tried on the host first (`GET /api/state` with it; "Checking the
+  pairing link…"): taken if the host takes it; rejected (a typo'd link, another host's) → this
+  device stays paired as before and says so ("That link's token was rejected — still paired as
+  before"); no answer either way (a flaky link) → taken, with the old token kept aside
+  (`buttpad.token.fallback`) until the host says hello to the new one: if it turns the new one down,
+  the old one is tried and, if the host still takes it, used again (same note). A token pasted on
+  the pairing or rejected screen is checked the same way; a rejected one is refused in place.
+  Storage blocked (private mode, site data blocked): tokens are kept in memory for the tab, and the
+  pad says pairing won't be remembered.
+- No token → pairing screen. First and big: **Pair with a code** — the way in from any address,
+  including a page served through a reverse proxy, tunnel or preview pane (nothing in the client
+  assumes the host's LAN address: every request goes to `location.origin`, `wss:` under https).
+  Then the QR / pairing link / paste field. The code entry (also `…/#pair`, or `#pair=123456`,
+  which is tried at once; and "Unlock editing…" in a press-only device's menu, whose note explains
+  the admin link and the codes): one big field (number pad, `autocomplete=one-time-code`; "123 456"
+  as read out works), `POST /api/pair {code}` → `{token, role}`, the token then used as above.
+  401 → "That code didn't work: mistyped, used already, or expired"; 429 → "Too many tries", a
+  countdown from `Retry-After`, Pair disabled meanwhile; 403 → the host turns this page's address
+  away: start it with `--allow-origin <this origin>` (said with the exact origin). An admin's menu
+  has **Pair another device…**: `POST /api/pair-code`, the code shown big ("123 456") with the time
+  it runs out (host clock, via the offset) and the `…/#pair` address to type it at.
 - WS with auto-reconnect (backoff 0, 250 ms → 5 s). The backoff starts over only after a
   connection held 10 s: a host or proxy that drops every socket right after `hello` is not
   hammered. A socket waits 5 s for its `hello`, then 10, 20… (≤ 60 s) after each one that timed
@@ -430,16 +449,35 @@ is logged once and the log starts empty.
 - Liveness: a link can die without a TCP close, and the host sends no heartbeats, so the client
   asks. A socket quiet for 5 s (page visible) gets `{"t":"ping"}`; the host answers a type it
   doesn't know with `error`, and any frame counts as the answer. Nothing back in 3 s (1.5 s when
-  in doubt: back from the background, a window `online`/`offline` event, a press with no ack) →
-  the socket is dropped on the spot (handlers detached, its unacked presses failed, OFFLINE) and
-  a new one opened; nobody waits for the browser's close handshake (up to a minute on a dead
-  link). Every socket keeps its own pending presses and timers: a stale socket's late events
-  can't touch the current one.
+  in doubt: back from the background, a window `online`/`offline` event, a press with no ack for
+  0.6 s) → the socket is dropped on the spot (handlers detached, its unacked presses failed,
+  OFFLINE) and a new one opened; nobody waits for the browser's close handshake (up to a minute on
+  a dead link). Every socket keeps its own pending presses and timers: a stale socket's late
+  events can't touch the current one.
+- Those waits follow the link (flaky Wi-Fi made 0.3–0.5 s false NO RESPONSE / OFFLINE flashes):
+  round trips are measured (pings answered, presses acked; the last 20, none that spans a stretch
+  in the background), and with ≥ 3 of them, their 90th percentile p sets: the ack wait 4p within
+  2–6 s, the probe 4p within 3–8 s, the doubtful probe 3p within 1.5–5 s, "no ack yet" 2p within
+  0.6–3 s. Slower to say NO RESPONSE on a slow link, never faster than before, never past 6 s; and
+  never a success that didn't happen (only the host's answer or state shows one).
+- **Syncing**: back from a stretch in the background (hidden ≥ 5 s), a frozen tab resuming
+  (Page Lifecycle `resume`, a back/forward-cache restore), or a page that didn't run for a while
+  (a 1 s heartbeat that comes ≥ 8 s late: a 4 s stall isn't that): what the screen shows may be
+  minutes old, and a socket that stayed up first delivers the frames it queued meanwhile (runs that
+  started and ended long ago: they flashed RUNNING "10:15" and ✓ OTHER DEVICE for ~350 ms). Until
+  the host's current word is in — a fresh hello, or the answer to a ping sent on waking, which the
+  host gives after everything it sent before — every button is SYNCING (dimmed, still, "SYNCING…"),
+  the bar says SYNCING, presses wait (a WAIT · SYNCING badge, nothing sent), and what the backlog
+  replays is settled without a buzz and isn't marked as another device's live run. A render that
+  comes before the backend has noticed (a running clock's tick first thing after a freeze) asks it
+  (`isStale()`) and shows SYNCING too.
 - Startup: alongside the first socket, `GET /api/state` (and `/api/config` when no layout is
   cached): a rejected token shows at once, and a socket that hangs doesn't show a running action
   as READY. While offline the last-known states stay on screen (see OFFLINE). A socket that never
-  got its hello is followed by a plain `GET /ws?token=…`, which answers what the upgrade got: 503 →
-  "Host is full (too many devices connected)" instead of "Can't reach the host" (426 = there's room).
+  got its hello is followed by a plain `POST /ws?token=…`, which answers what the upgrade got: 503 →
+  "Host is full (too many devices connected)" instead of "Can't reach the host"; 403 (a POST carries
+  the page's Origin, a same-origin GET doesn't) → the host turns this address away, with the exact
+  `--allow-origin` to start it with; 426 = there's room.
 - Clocks: everything the client times itself (elapsed counters, confirm windows, countdowns,
   cooldowns) runs on `wall()` (`src/web/lib/clock.ts`): epoch ms that follow `performance.now()`, so
   setting the device's clock moves no counter; after a stretch in the background it catches up with
@@ -452,18 +490,22 @@ is logged once and the log starts empty.
   made, host clock: the gesture's own time — a tap's release, a hold reaching `holdMs`, a keydown —
   so a press a stalled page sends late is still dropped as too old) and, after the confirm step,
   `confirm: true`. NOT SENT if it never left the device, NO RESPONSE if it was sent and no ack came
-  within 2 s; a late `expired` answer (the host dropped it: it sat in a dead link > 3 s) turns NO
-  RESPONSE into NOT SENT "too late — not sent", and it never runs. That answer goes to the socket it
-  came on, though, which may be dead: so once reconnected (a fresh hello), 3 s past the press's
-  `at` (and 1 s more for the offset's error), with no run of it on the host, NO RESPONSE turns into
-  DIDN'T RUN (it never will: the host drops a press that old). If the host's state shows the press
-  did run (`runId` past the one seen at press time, or a late `started` ack), the button shows that
-  (RUNNING, SUCCESS, FAILURE, or, when it already finished, its outcome from READY's `last`: "IT
-  RAN" only if the host no longer knows), not NO RESPONSE; a run that started more than 3 s after
-  the press was made isn't it (the host would have dropped the press), unless it is the queued
-  re-run behind the run a queue press was made on. A press answered `expired` within 1 s of being
-  made can't have been held up: the offset is wrong (the host's clock was set), so the socket is
-  renewed for a fresh hello.
+  within the ack wait (2 s; longer on a slow link, above; the face says how long it waited, or that
+  the link dropped); a late `expired` answer (the host dropped it: it sat in a dead link longer
+  than the button's `maxLatenessMs`, 3 s by default) turns NO RESPONSE into NOT SENT "too late —
+  not sent", and it never runs. That answer goes to the socket it came on, though, which may be
+  dead: so once reconnected (a fresh hello), `maxLatenessMs` past the press's `at` (the longer of
+  the button's value when it went out and now; and 1 s more for the offset's error), with no run of
+  it on the host, NO RESPONSE turns into DIDN'T RUN (it never will: the host drops a press that
+  old). If the host's state shows the press did run (`runId` past the one seen at press time, or a
+  late `started` ack), the button shows that (RUNNING, SUCCESS, FAILURE, or, when it already
+  finished, its outcome from READY's `last`: "IT RAN" only if the host no longer knows), not NO
+  RESPONSE; a run that started more than `maxLatenessMs` after the press was made isn't it (the host
+  would have dropped the press), unless it is the queued re-run behind the run a queue press was
+  made on. A press answered `expired` sooner after it was made than it could have been held up (1 s,
+  or a third of `maxLatenessMs` if that is less) means the offset is wrong (the host's clock was
+  set), so the socket is renewed for a fresh hello. A config without `maxLatenessMs` (an older host,
+  a cached layout) counts as 3 s.
 - Whose run is it: only a run an ack's `runId` says this device started (or queued) is "ours"
   (v1 hosts without `runId`: the next run). A queued re-run stops being ours once it is dropped:
   the run it waits for ends, or is being cancelled, without it (All off, a cancel, a host
@@ -476,14 +518,15 @@ is logged once and the log starts empty.
 - A config change that drops (or renames) a button takes that button's state with it: the host
   sends no last word about a key that's gone, so nothing shows it RUNNING forever (nor offers to
   "stop" it on the next save).
-- 401 → "token rejected" screen with re-pair option. "Pair again" in the menu takes a second tap,
-  and isn't there under `?lock`.
+- 401 → "token rejected" screen with re-pair options (paste, a pairing code, try the token again).
+  "Pair again" in the menu takes a second tap, and isn't there under `?lock` (nor are "Unlock
+  editing…" and "Pair another device…").
 - **Backend interface**: the UI talks to an abstract backend with two implementations:
   `ws` (the host) and `demo` (in-browser: runs `machine.ts` locally with simulated actions, config
   in localStorage, the host's rules: acks with `runId`, `expired`/`needs-confirm`, already-queued
-  `ignored`, the 800 ms requeue gap, `stops`/`none`, `@state`, the per-connection rate limit of
-  bursts of 10 then 5/s; its controls simulate an outage, a lost ack, a press held up on the way,
-  a host restart). `?demo` selects demo. Demo exists so the UI can be tried on a phone with no host,
+  `ignored`, the 800 ms requeue gap, `stops`/`none`, `@state`, per-button `maxLatenessMs`, the
+  per-connection rate limit of bursts of 10 then 5/s; its controls simulate an outage, a lost ack, a
+  press held up on the way, a host restart). `?demo` selects demo. Demo exists so the UI can be tried on a phone with no host,
   and so the UI can be built/tested independently.
 
 ### Run mode (the default, locked-down)
@@ -501,7 +544,8 @@ is logged once and the log starts empty.
   the default.
 - Thin top bar: pad tabs (hidden when only 1 pad or `?lock`), connection indicator (LIVE dot;
   OFFLINE / CONNECTING / HOST FULL in words; DEMO in the demo, never a green dot), menu
-  (fullscreen, keep-awake status, device settings, edit mode if admin). Tabs scroll sideways when
+  (fullscreen, keep-awake status, device settings, edit mode if admin; pairing entries). SYNCING
+  (hollow dot) while catching up after a stretch away. Tabs scroll sideways when
   they don't fit, the active one kept in view (also when a wider badge comes up); a tab shows a dot
   when something on its pad is running (white ring) or failed (red). Tabs and the menu button take
   a deliberate touch: ≥ 80 ms down without sliding (a 60 ms glove brush does nothing; mouse clicks
@@ -511,14 +555,16 @@ is logged once and the log starts empty.
   (not the one this device remembers); otherwise the last pad picked here. A pad that isn't there
   — asked for by the link, or deleted while on screen (renamed: followed by id, or by name if only
   its id changed) — gets a "Pad “X” no longer exists" screen (with the pads to pick from, unless
-  locked), never another pad's buttons. A locked screen in that state ignores keys too.
+  locked), never another pad's buttons. A locked screen in that state ignores keys too. Leaving the
+  editor returns to the pad that was on screen before it (a `?pad=` link's too), not the one edited
+  last; only when that pad is gone (deleted in the editor) does the editor's pad take its place.
 - `?lock` (kiosk, handlebar mount): no tabs, no edit entry, no "Pair again"; keys press only the
   locked pad's buttons; the menu opens only on a ~1 s press of its button (a ring fills
   meanwhile), never from the keyboard.
-- Device settings (menu, per device): sounds, haptics, keep awake, and **rough mode** for gloves
+- Device settings (menu, per device): sounds, haptics, keep awake, **rough mode** for gloves
   and vibrating mounts: one button at a time per pad (a second contact on another button while one
   is down is ignored, though it still counts toward a palm), finger taps need 80 ms of contact, a
-  cooldown of at least 800 ms, 1.5× `driftPx`.
+  cooldown of at least 800 ms, 1.5× `driftPx`; and **show mode** for a dark house (below).
 
 ### Button states (the important part)
 
@@ -527,20 +573,36 @@ peripheral vision, or with color blindness. Big and bold beats subtle.
 
 | State | Where | Look |
 |---|---|---|
-| READY | host | solid button color, huge label, still; a corner mark says how the last run ended (`last`: "✓ 12 s ago", "✗ 3 m ago", ■ stopped, ! interrupted) |
+| READY | host | solid button color, huge label, still; a corner mark says how the last run ended (`last`: "✓ 12 s ago", "✗ 3 m ago", ■ stopped, ! interrupted), with its result text when that is short (≤ 40 characters) and fits whole beside the latched chip ("✓ printing 37% · 3 s ago"; measured, never cut: where it doesn't fit, only "3 s ago") |
 | ARMING | client | bright fill rising bottom→top over `holdMs`; label stays; at 100%: pop |
 | CONFIRM | client | (confirm buttons) after the first fire: flashing amber border + "HOLD / TAP / DOUBLE-TAP / PRESS AGAIN TO CONFIRM" (said the way the first press was made: PRESS for a key), times out after `confirmWindowMs`. A press begun inside the window confirms, even if it completes after it |
-| SENDING | client | from fire until the host acks (normally ms); no ack in 2 s → NO RESPONSE. Pressing again meanwhile → BUSY (nothing is dropped silently) |
+| SENDING | client | from fire until the host acks (normally ms); no ack within the ack wait (2 s; up to 6 s on a slow link) → NO RESPONSE. Pressing again meanwhile → BUSY (nothing is dropped silently) |
 | RUNNING | host | diagonal stripes scrolling across the whole button; the label stays the big text (never below ~9% of the button's height), the elapsed clock second (at most 90% of the label's size); `@status` text; `@progress` → a determinate fill, with the stripes still moving, slower, underneath (2% must not look READY); `cancel` buttons show "tap/hold to cancel" once a cancel would count (700 ms after the start); "+1 QUEUED" |
 | SUCCESS | host | full-bleed green flood, giant ✓, result text, small elapsed; a thin bar drains over `resultHoldMs`; "NEXT RUN QUEUED" when a queued re-run starts in 800 ms |
-| FAILURE | host | full-bleed red, ✗, slow pulse; the reason is the headline (the result text, ≤ 2 lines, else TIMEOUT / CAN'T START / EXIT 3 / KILLED), the exit code small print. This device's own failure stays until its next run (see Sticky results); NOT SENT and DIDN'T RUN look the same |
+| FAILURE | host | full-bleed red with thin dark **cross-hatching** (still; it fades in after the flood), ✗, slow pulse: not "just red" next to a red E-STOP, in grayscale too (RUNNING's stripes are wide and move, INTERRUPTED's are wide hazard bands); the reason is the headline (the result text, ≤ 2 lines, else TIMEOUT / CAN'T START / EXIT 3 / KILLED), the exit code small print. This device's own failure stays until its next run (see Sticky results); NOT SENT and DIDN'T RUN look the same. Under OFFLINE ("LAST RUN: EXIT 3") the hatching stays, faint |
 | STOPPED | host | slate, ■, still: cancelled on purpose (a cancel press, another button's `stops`, removed by a config change): no red, no failure buzz |
 | UNKNOWN | client | amber, "?", dashed frame: NO RESPONSE (sent, no answer: it may or may not have run); IT RAN (it ran, the outcome is lost) |
 | INTERRUPTED | host | amber with dark hazard stripes, lightning glyph, pulse: the host stopped (or crashed) while it ran |
 | OFFLINE | client | grey, dashed border, ⚠; the last-known state stays visible underneath (stripes or progress dimmed and still, a tint for a result, "LAST SEEN RUNNING · 12s" frozen at the last word from the host, "LAST RUN: EXIT 3"); presses do nothing except shake, and try to reconnect |
+| SYNCING | client | back from a long stretch away (see Connection: Syncing): the button's color dimmed, desaturated, still, its label and "SYNCING…"; no stripes, flood, pulse or clock; presses shake with WAIT · SYNCING. Usually one round trip |
 
 Latched device state (`@state`, e.g. "REC ●", "ON 80%") is a solid chip in the top corner in every
-state, offline too. A run another device started gets an OTHER DEVICE mark.
+state, offline too. One the host can't vouch for — it starts with `? `: a crash cut off the run that
+set it, so the device may be in any state ("? REC ●") — is hollow with a dashed outline instead.
+A run another device started gets an OTHER DEVICE mark.
+
+**Show mode** (device setting, a dark house; the stage manager's results flooded the tile ~4×
+brighter just as the house went dark): every face is its hue dimmed to the same low lightness
+(OKLCH L 0.25, chroma ≤ 0.07: a yellow button no brighter than a navy one; `lib/color.ts`
+`showPalette`), a thin edge in the hue, and a light ink with the hue's tint (≥ 7:1 on the face). A
+result is a colored edge (4 px or more; dashed for UNKNOWN), the glyph and the text in the result's
+color on a near-black face, never a full-tile flood; FAILURE keeps its hatching (in red) and pulses
+its edge instead of the brightness. No bright flashes: the fire flash peaks at 14 % ink (65 % white
+otherwise), badges and pills are dim (pills outlined), the arming fill is fainter. Measured on a
+phone (mean relative luminance of a tile): READY 0.25 / 0.53 (blue / yellow) → 0.06 / 0.07, a
+SUCCESS flood 0.44 → 0.07, a FAILURE 0.24 → 0.08: a result about as bright as READY was, where
+normal mode's green flood is 1.8× a blue button's READY, and many times a dark one's (BLACKOUT).
+The whole states gallery: 0.20 → 0.06 (e2e/run-r4.spec.ts measures it on screen). Motion and shape still tell every state apart (`?gallery&show`).
 
 Sticky results: a FAILURE (and INTERRUPTED, NO RESPONSE, NOT SENT, DIDN'T RUN) of this device's own
 press stays on screen until the next run on the button supersedes it, or its ✕ chip (top corner)
@@ -563,7 +625,9 @@ Short buttons (≤ 84 px) put their items in one row with fixed shares of the wi
 glyph and then the number/headline when the button isn't wide enough. Chips: the trigger
 ("HOLD 1.5s" for holds of a second or more; "TAP AGAIN" while a double waits for its second tap)
 and the key, by name (VOL+, SPACE, ↑, PG↓, ⏯…); on narrow buttons they shrink (the key loses its
-keyboard glyph, the trigger its word) rather than spill out.
+keyboard glyph, the trigger its word) rather than spill out. Under 110 px wide (a 4-column pad on a
+phone: ~90 px) what matters for safety stays, as glyphs, centered: the trigger (hold / tap / double;
+a hold's duration "1.5s") and the confirm lock; the key chip goes.
 
 Forced colors (Windows high contrast): every face gets an edge, its border style differs by state
 (dotted running, double success, thick failure, dashed stopped/unknown/offline), the hold fill,

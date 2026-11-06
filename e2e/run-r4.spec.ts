@@ -349,3 +349,35 @@ test('?gallery shows SYNCING and a red READY next to FAILURE; ?gallery&show rend
   await expect(btn(page, 'success').locator('.bp-flood')).toBeHidden();
   expect((await vib()).filter((v) => v !== VIB.touch)).toEqual([]);
 });
+
+// ---- a latched state the host can't vouch for ---------------------------------------------------------
+
+test('a latched state marked uncertain by the host ("? REC ●", after a crash) is a hollow, dashed chip; a sure one is solid', async ({ page }) => {
+  await open(page, {
+    version: 1,
+    pads: [
+      {
+        id: 'p',
+        name: 'P',
+        cols: 2,
+        rows: 1,
+        buttons: [
+          { id: 'rec', label: 'REC', x: 0, y: 0, trigger: 'tap', action: sh('echo') },
+          { id: 'bgm', label: 'BGM', x: 1, y: 0, trigger: 'tap', action: sh('echo') },
+        ],
+      },
+    ],
+  });
+  // As a host's hello would bring them after a restart (src/server/persist.ts UNCERTAIN_PREFIX).
+  await page.evaluate(() => window.__buttpad!.backend.snapshot.set((s) => ({ ...s, latched: { 'p/rec': '? REC ●', 'p/bgm': 'BGM ON' } })));
+  const unsure = page.getByTestId('latched-rec');
+  await expect(unsure).toHaveText('? REC ●');
+  await expect(unsure).toHaveAttribute('data-uncertain', '');
+  const look = (id: string) =>
+    page.getByTestId(`latched-${id}`).evaluate((el) => ({ bg: getComputedStyle(el).backgroundColor, outline: getComputedStyle(el).outlineStyle }));
+  expect(await look('rec')).toEqual({ bg: 'rgba(0, 0, 0, 0)', outline: 'dashed' });
+  const sure = await look('bgm');
+  expect(sure.bg).not.toBe('rgba(0, 0, 0, 0)');
+  expect(sure.outline).not.toBe('dashed');
+  await expect(page.getByTestId('latched-bgm')).not.toHaveAttribute('data-uncertain', '');
+});
