@@ -75,6 +75,41 @@ export function saveFallbackToken(t: string | null): void {
   lsSet(KEYS.tokenFallback, t);
 }
 
+// ---- clipboard --------------------------------------------------------------------------------
+
+/**
+ * Puts `text` on the clipboard; call it right in a tap's handler (browsers want the gesture).
+ * Resolves false when it couldn't. A plain-HTTP page has no Clipboard API (it needs a secure
+ * context): there, the old way, from a selected text area.
+ */
+export function copyText(text: string): Promise<boolean> {
+  const api = window.isSecureContext ? navigator.clipboard : undefined;
+  if (api?.writeText) return api.writeText(text).then(() => true, () => copyBySelection(text));
+  return Promise.resolve(copyBySelection(text));
+}
+
+function copyBySelection(text: string): boolean {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  // Off screen, no keyboard, no zoom (iOS zooms into a field under 16 px).
+  ta.inputMode = 'none';
+  ta.style.cssText = 'position:fixed;top:0;left:-9999px;font-size:16px;opacity:0;';
+  const was = document.activeElement as HTMLElement | null;
+  document.body.appendChild(ta);
+  let ok = false;
+  try {
+    ta.focus({ preventScroll: true });
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  was?.focus?.({ preventScroll: true });
+  return ok;
+}
+
 // ---- fullscreen -------------------------------------------------------------------------------
 
 type FsDoc = Document & { webkitFullscreenElement?: Element; webkitFullscreenEnabled?: boolean; webkitExitFullscreen?: () => void };

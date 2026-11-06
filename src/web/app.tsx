@@ -10,7 +10,7 @@ import { draftScope, loadDraft, unsavedEdits } from './edit/draft-store.ts';
 import { EditMode } from './edit/EditMode.tsx';
 import { Dialog } from './edit/fields.tsx';
 import { stable } from './edit/ops.ts';
-import { loadFallbackToken, loadToken, readHashToken, saveFallbackToken, saveToken, takeIncomingToken, type AppOptions } from './lib/env.ts';
+import { loadFallbackToken, loadToken, mono, readHashToken, saveFallbackToken, saveToken, takeIncomingToken, type AppOptions } from './lib/env.ts';
 import { startKeepAwake } from './lib/keepawake.ts';
 import { clearPairHash, probeToken, readPairHash } from './lib/pairing.ts';
 import { KEYS, lsGet, lsSet, settings, storageBlocked } from './lib/settings.ts';
@@ -19,7 +19,7 @@ import { RunPad } from './run/RunPad.tsx';
 import { RunSession } from './run/session.ts';
 import { MenuSheet } from './ui/Menu.tsx';
 import { Close } from './ui/icons.tsx';
-import { CheckingScreen, ConnectingScreen, MissingPadScreen, originAdvice, PairCodeScreen, PairingScreen, RejectedScreen } from './ui/Screens.tsx';
+import { CheckingScreen, ConnectingScreen, MissingPadScreen, OriginAdvice, PairCodeScreen, PairingScreen, RejectedScreen } from './ui/Screens.tsx';
 import { TopBar } from './ui/TopBar.tsx';
 
 declare global {
@@ -33,6 +33,9 @@ declare global {
 export type PasteResult = Promise<string | null>;
 
 const REJECTED_PASTE = 'The host rejected that token: check the link for a typo, or get a new one from the host.';
+
+/** Leaving the editor on a pad the host has yet to send: how long to wait for it to come. */
+const LANDING_MS = 10_000;
 
 /**
  * The token to start with. A `#token=` link (stripped from the address bar already) that would
@@ -195,8 +198,10 @@ export function App({ opts }: { opts: AppOptions }) {
       }}
     />
   );
+  /** The code entry; with a code (typed into the pairing-link box), tried at once. */
+  const openCode = (c = '') => setCodeEntry({ code: c });
   if (checking) return <CheckingScreen />;
-  if (!backend) return code || <PairingScreen onToken={paste} onCode={() => setCodeEntry({ code: '' })} />;
+  if (!backend) return code || <PairingScreen onToken={paste} onCode={openCode} />;
   return (
     <>
       <Connected
@@ -204,7 +209,7 @@ export function App({ opts }: { opts: AppOptions }) {
         backend={backend}
         opts={opts}
         onPair={paste}
-        onCode={() => setCodeEntry({ code: '' })}
+        onCode={openCode}
         onForget={forget}
         onRetry={() => setGen((g) => g + 1)}
         recovering={recovering || !!loadFallbackToken()}
@@ -269,8 +274,8 @@ function Connected(p: {
   backend: Backend;
   opts: AppOptions;
   onPair(t: string): PasteResult;
-  /** Open the pairing-code entry. */
-  onCode(): void;
+  /** Open the pairing-code entry (with a code: tried at once). */
+  onCode(code?: string): void;
   onForget(): void;
   onRetry(): void;
   /** The token in use was rejected and the one this device had before is being tried: not "rejected" yet. */
@@ -289,6 +294,7 @@ function Connected(p: {
   const configErrors = useStore(backend.snapshot, (s) => s.configErrors);
   const hostFull = useStore(backend.snapshot, (s) => s.hostFull);
   const originRefused = useStore(backend.snapshot, (s) => s.originRefused);
+  const allowOrigin = useStore(backend.snapshot, (s) => s.allowOrigin);
   const syncing = useStore(backend.snapshot, (s) => s.syncing);
   const show = useStore(settings, (s) => s.show);
   const [choice, setChoice] = useState<PadChoice>(() =>
@@ -317,24 +323,41 @@ function Connected(p: {
     const d = loadDraft(draftScope(backend.kind));
     return d && stable(d.draft) !== stable(d.base) ? d : null;
   }, [role, mode]);
+  /**
+   * Leaving the editor on a pad the host's config doesn't have yet: one saved just now comes with
+   * the socket's next `config` (it can be a moment behind the save's answer); one never saved
+   * doesn't come, and the pad on screen before stays.
+   */
+  const landing = useRef<{ id: string; until: number } | null>(null);
+  /** Show pad `id` from now on (a tab, the missing-pad list, leaving the editor). */
+  const choose = (id: string) => {
+    landing.current = null;
+    shown.current = config?.pads.find((x) => x.id === id) ?? shown.current;
+    setChoice({ kind: 'id', id });
+    lsSet(KEYS.pad, id);
+  };
+  useEffect(() => {
+    const l = landing.current;
+    if (!l || !config) return;
+    if (mono() > l.until) landing.current = null;
+    else if (config.pads.some((x) => x.id === l.id)) choose(l.id);
+  }, [config]);
 
   if (status === 'unauthorized') return p.recovering ? <ConnectingScreen status="connecting" onRepair={p.onForget} /> : <RejectedScreen onToken={p.onPair} onRetry={p.onRetry} onCode={p.onCode} />;
-  if (!config) return <ConnectingScreen status={status} hostFull={hostFull} originRefused={originRefused} onRepair={p.onForget} />;
+  if (!config) return <ConnectingScreen status={status} hostFull={hostFull} originRefused={originRefused} allowOrigin={allowOrigin} onRepair={p.onForget} />;
   const found = resolvePad(config.pads, choice, shown.current);
   const pad = typeof found === 'string' ? null : found;
   keysOff.current = !pad && opts.lock;
   if (pad) shown.current = { id: pad.id, name: pad.name };
-  const choose = (id: string) => {
-    shown.current = config.pads.find((x) => x.id === id) ?? shown.current;
-    setChoice({ kind: 'id', id });
-    lsSet(KEYS.pad, id);
-  };
-  // Admin only: a press-role client never renders edit mode, whatever `mode` says. Leaving it goes
-  // back to the pad that was on screen before (a `?pad=` link's too), not the one edited last; only
-  // when that pad is gone (deleted in the editor) does the editor's pad take its place.
+  // Admin only: a press-role client never renders edit mode, whatever `mode` says. Leaving it lands
+  // on the pad the editor had open (QA: the owner built "Stage", saved, closed the editor, and was
+  // back on "Test"), a `?pad=` link's page too; on the one on screen before only when the editor's
+  // pad isn't on the host (never saved).
   const exitEdit = (id?: string) => {
-    if (typeof resolvePad(config.pads, choice, shown.current) === 'string' && id && config.pads.some((x) => x.id === id)) choose(id);
     setMode('run');
+    if (!id) return;
+    if (config.pads.some((x) => x.id === id)) choose(id);
+    else landing.current = { id, until: mono() + LANDING_MS };
   };
   return (
     <div class="app" data-mode={mode} data-lock={opts.lock ? '' : undefined} data-show={show && !editing ? '' : undefined}>
@@ -378,8 +401,9 @@ function Connected(p: {
         </div>
       )}
       {originRefused && status !== 'online' && !editing && (
-        <div class="bp-banner" role="alert" data-testid="origin-refused">
-          <b>The host turns this address away.</b> {originAdvice()}
+        <div class="bp-banner is-origin" role="alert" data-testid="origin-refused">
+          <b>The host turns this address away.</b>
+          <OriginAdvice allowOrigin={allowOrigin} />
         </div>
       )}
       {hostFull && status !== 'online' && !editing && (

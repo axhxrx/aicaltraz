@@ -261,3 +261,60 @@ describe('action type none', () => {
     expect(ed.button()!.action).toEqual({ type: 'shell', script: '' });
   });
 });
+
+describe('what a save changes (which host warnings are news)', () => {
+  test('changed and new buttons, by identity (a renamed one is the same button, its old key gone); the groups a button joins', () => {
+    const ed = new Editor(host(), 'r1');
+    const before = ed.state.base;
+    ed.select(0);
+    ed.patchButton({ id: 'lamp-2' }, 'id');
+    ed.showPad(1);
+    ed.select(0);
+    ed.patchButton({ group: 'fx' }, 'group');
+    const ix = ed.addButton(1, 0)!;
+    ed.tidy();
+    const sent = ed.state.draft;
+    const ch = ed.changes(before, sent);
+    const [main, other] = sent.pads;
+    expect([...ch.buttons]).toEqual([main!.buttons[0]!, other!.buttons[0]!, other!.buttons[ix]!]);
+    // Wipe card is untouched: what the host says about it is old news.
+    expect(ch.buttons.has(main!.buttons[1]!)).toBe(false);
+    expect([...ch.groups]).toEqual(['fx']);
+    expect([...ch.gone]).toEqual(['main/lamp']);
+  });
+
+  test('a group a button leaves, or loses to a delete', () => {
+    const cfg = host();
+    cfg.pads[0]!.buttons[0]!.group = 'g';
+    cfg.pads[0]!.buttons[1]!.group = 'g';
+    cfg.pads[1]!.buttons[0]!.group = 'h';
+    const ed = new Editor(cfg, 'r1');
+    ed.select(0);
+    ed.patchButton({ group: undefined }, 'group');
+    ed.showPad(1);
+    ed.select(0);
+    ed.removeButton();
+    const ch = ed.changes(cfg, ed.state.draft);
+    expect([...ch.groups].sort()).toEqual(['g', 'h']);
+    expect([...ch.gone]).toEqual(['other/solo']);
+    // Wipe card, still in "g", is not changed itself.
+    expect(ch.buttons.has(ed.state.draft.pads[0]!.buttons[1]!)).toBe(false);
+  });
+});
+
+describe('the pad open in the editor, by its id on the host (where leaving the editor goes)', () => {
+  test("its id changed in the draft: the host's; a new pad: none; once saved: its new id", () => {
+    const ed = new Editor(host(), 'r1', 1);
+    expect(ed.hostPadId()).toBe('other');
+    ed.patchPad({ id: 'others' }, 'id');
+    expect(ed.pad.id).toBe('others');
+    expect(ed.hostPadId()).toBe('other');
+    ed.addPad();
+    expect(ed.hostPadId()).toBeUndefined();
+    const id = ed.pad.id;
+    ed.saved(ed.state.draft, 'r2');
+    expect(ed.hostPadId()).toBe(id);
+    ed.showPad(1);
+    expect(ed.hostPadId()).toBe('others');
+  });
+});

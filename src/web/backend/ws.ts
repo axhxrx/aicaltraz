@@ -1,5 +1,12 @@
 /**
- * The real host: WebSocket `/ws?token=` for state, HTTP with a Bearer token for the rest.
+ * The real host: a WebSocket for state, HTTP with a Bearer token for the rest.
+ *
+ * The token never goes in a URL: reverse proxies and preview panes log URLs (QA found the admin
+ * token in one, a line a second while a probe ran). Each connection attempt first trades it for a
+ * one-time ticket (`POST /api/ws-ticket`, Bearer header) and opens `/ws?ticket=…` with that; a
+ * reconnect gets a fresh one. Browsers don't show why an upgrade was refused, so a socket that
+ * never got its hello is followed by `POST /api/ws-check` (Bearer header again): 503 host full, 403
+ * this page's origin refused (a proxy the host wasn't told about), 401 token rejected.
  *
  * Liveness: a link can die without a TCP close (Wi-Fi gone, host asleep or hung) and the host
  * sends no heartbeats, so this side asks. A socket that has been quiet for IDLE_PROBE while the
@@ -35,9 +42,10 @@
  * turned out dead) ends `syncing`.
  */
 import type { Config } from '../../core/config.ts';
-import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig } from '../../core/protocol.ts';
+import type { ClientMsg, PressResult, RunRecord, SaveConfigBody, ServerMsg, StateMap, WireConfig, WsTicket } from '../../core/protocol.ts';
 import { wall } from '../lib/clock.ts';
 import { afterQueuedInput, mono } from '../lib/env.ts';
+import { allowOriginOf } from '../lib/pairing.ts';
 import { KEYS, lsJSON, lsSet } from '../lib/settings.ts';
 import { createStore } from '../lib/store.ts';
 import {
@@ -110,11 +118,16 @@ interface Pending {
   reject: (e: Error) => void;
 }
 
-/** One socket and everything that belongs to it. */
+/** One connection attempt (its ticket, then its socket) and everything that belongs to it. */
 interface Conn {
-  ws: WebSocket;
+  /** null while its ticket is on the way. */
+  ws: WebSocket | null;
+  /** Gives up on the ticket request (the attempt was dropped). */
+  ticket: AbortController;
   greeted: boolean;
-  /** mono() when it was created, when it opened (the upgrade's answer), and of the hello. */
+  /** mono() when the attempt began (ticket included). */
+  startedAt: number;
+  /** mono() when the socket was created, when it opened (the upgrade's answer), and of the hello. */
   openedAt: number;
   upAt: number;
   greetedAt: number;
@@ -285,23 +298,21 @@ export class WsBackend implements Backend {
     this.snapshot.set((s) => ({ ...s, ...p }));
   }
 
+  /**
+   * A connection attempt: a fresh one-time ticket, then the socket. The hello wait covers both (a
+   * ticket request on a dead link hangs like a socket does).
+   */
   private connect() {
     if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
     clearTimeout(this.retryTimer);
     // Never two sockets: one already on its way (or up) wins.
     if (this.conn) return;
-    const proto = this.origin.startsWith('https:') ? 'wss:' : 'ws:';
-    const url = `${proto}//${this.origin.replace(/^https?:\/\//, '')}/ws?token=${encodeURIComponent(this.token)}`;
-    let ws: WebSocket;
-    try {
-      ws = new WebSocket(url);
-    } catch {
-      return this.scheduleRetry(null);
-    }
     const c: Conn = {
-      ws,
+      ws: null,
+      ticket: new AbortController(),
       greeted: false,
-      openedAt: mono(),
+      startedAt: mono(),
+      openedAt: 0,
       upAt: 0,
       greetedAt: 0,
       lastFrame: mono(),
@@ -322,11 +333,48 @@ export class WsBackend implements Backend {
       },
       Math.min(HELLO_TIMEOUT_MAX, HELLO_TIMEOUT * 2 ** this.helloMisses),
     );
+    void this.openWithTicket(c);
+  }
+
+  /** POST /api/ws-ticket (the token in its header), then `/ws?ticket=…`: the token itself never goes in a URL. */
+  private async openWithTicket(c: Conn) {
+    const live = () => this.conn === c && !this.disposed;
+    let ticket: string | undefined;
+    try {
+      const r = await this.http('POST', '/api/ws-ticket', undefined, c.ticket.signal);
+      if (!live()) return;
+      if (r.status === 401) return this.rejected();
+      if (r.status === 403) {
+        // This page's origin is turned away (a proxy the host wasn't told about): say so, keep trying.
+        const allowOrigin = (await allowOriginOf(r)) ?? null;
+        if (live() && this.snapshot.get().status !== 'online') this.patch({ originRefused: true, allowOrigin, hostFull: false });
+      } else if (r.ok) ticket = ((await r.json()) as Partial<WsTicket> | null)?.ticket;
+    } catch {
+      /* unreachable, or given up on: below */
+    }
+    if (!live()) return;
+    if (typeof ticket !== 'string' || !ticket) return this.lost(c);
+    const proto = this.origin.startsWith('https:') ? 'wss:' : 'ws:';
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(`${proto}//${this.origin.replace(/^https?:\/\//, '')}/ws?ticket=${encodeURIComponent(ticket)}`);
+    } catch {
+      return this.lost(c);
+    }
+    c.ws = ws;
+    c.openedAt = mono();
     ws.onmessage = (ev) => {
       if (this.conn === c) this.onFrame(c, ev.data);
     };
     ws.onopen = () => void (c.upAt = mono());
     ws.onclose = () => this.lost(c);
+  }
+
+  /** The host turned the token down (401): stop, and say so. */
+  private rejected() {
+    clearTimeout(this.retryTimer);
+    if (this.conn) this.drop(this.conn);
+    this.patch({ status: 'unauthorized', retryAt: null });
   }
 
   /**
@@ -374,6 +422,7 @@ export class WsBackend implements Backend {
   /** `sample`: its answer's round trip says how the link is (not one sent behind a backlog). */
   private sendPing(c: Conn, sample = true): boolean {
     try {
+      if (!c.ws) throw new Error('no socket yet');
       c.ws.send(PING);
     } catch {
       this.lost(c);
@@ -392,7 +441,7 @@ export class WsBackend implements Backend {
    */
   private probe(c: Conn, timeout: number, sync = false) {
     if (this.conn !== c || !c.greeted) return;
-    if (c.ws.readyState !== WebSocket.OPEN) return this.lost(c);
+    if (c.ws?.readyState !== WebSocket.OPEN) return this.lost(c);
     const deadline = mono() + timeout;
     const inFlight = c.probeTimer !== undefined;
     if (sync) {
@@ -416,17 +465,20 @@ export class WsBackend implements Backend {
   /** Done with a socket: detach it (its late events go nowhere), fail its unacked presses. */
   private drop(c: Conn) {
     if (this.conn === c) this.conn = null;
-    const { ws } = c;
-    ws.onmessage = null;
-    ws.onclose = null;
-    ws.onopen = null;
+    c.ticket.abort();
     clearTimeout(c.helloTimer);
     clearTimeout(c.idleTimer);
     clearTimeout(c.probeTimer);
-    try {
-      if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close();
-    } catch {
-      /* already going */
+    const { ws } = c;
+    if (ws) {
+      ws.onmessage = null;
+      ws.onclose = null;
+      ws.onopen = null;
+      try {
+        if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) ws.close();
+      } catch {
+        /* already going */
+      }
     }
     const err = new PressError(true, 'the link to the host dropped before it answered');
     for (const p of c.pending.values()) p.reject(err);
@@ -466,7 +518,7 @@ export class WsBackend implements Backend {
   /**
    * The HTTP side: a rejected token (401/403) means stop and say so. Otherwise, while the socket
    * isn't up, the host's states (and the layout, if none is cached) come from here. After a socket
-   * that never got its hello (`failed`): was it turned away because the host is full (503)?
+   * that never got its hello (`failed`): why was it turned away?
    */
   private async probeHttp(failed = false) {
     const live = () => this.disposed || this.snapshot.get().status === 'online';
@@ -475,22 +527,20 @@ export class WsBackend implements Backend {
       const r = await this.http('GET', '/api/state');
       // serverNow was taken about half the round trip ago.
       const half = Math.min(1000, (mono() - t0) / 2);
-      if (r.status === 401 || r.status === 403) {
-        clearTimeout(this.retryTimer);
-        if (this.conn) this.drop(this.conn);
-        this.patch({ status: 'unauthorized', retryAt: null });
-        return;
-      }
+      if (r.status === 401 || r.status === 403) return this.rejected();
       if (!r.ok || live()) return;
-      // A plain request to /ws gets the answer the upgrade got: 426 "expected a WebSocket upgrade"
-      // when there's room, 503 when the host is full. A POST carries this page's Origin (a GET from
-      // the same origin doesn't), so a 403 says the host turns this address away: a proxy, tunnel or
-      // preview in front of it that the host wasn't told about (--allow-origin).
+      // What an upgrade from this page gets now, asked over HTTP (the token in the header, nothing in
+      // the URL): 204 there's room; 503 the host is full; 403 it turns this page's address away (a
+      // proxy, tunnel or preview in front of it that it wasn't told about: --allow-origin). A POST,
+      // because a browser sends a same-origin GET without its Origin.
       if (failed) {
-        const status = (await this.http('POST', `/ws?token=${encodeURIComponent(this.token)}`).catch(() => null))?.status;
-        const full = status === 503;
-        const refused = status === 403;
-        if (!live() && (full !== this.snapshot.get().hostFull || refused !== this.snapshot.get().originRefused)) this.patch({ hostFull: full, originRefused: refused });
+        const rc = await this.http('POST', '/api/ws-check').catch(() => null);
+        const full = rc?.status === 503;
+        const refused = rc?.status === 403;
+        const allowOrigin = rc && refused ? ((await allowOriginOf(rc)) ?? null) : null;
+        if (rc?.status === 401) return this.rejected();
+        const s = this.snapshot.get();
+        if (!live() && (full !== s.hostFull || refused !== s.originRefused || allowOrigin !== s.allowOrigin)) this.patch({ hostFull: full, originRefused: refused, allowOrigin });
       }
       const j = (await r.json()) as { states?: StateMap; serverNow?: number };
       // The socket got there first: its picture is the fresher one.
@@ -525,6 +575,7 @@ export class WsBackend implements Backend {
           latched: m.latched ?? {},
           hostFull: false,
           originRefused: false,
+          allowOrigin: null,
           lastSeen: null,
           // The host's word as it is now: whatever this device was catching up on, it has.
           syncing: false,
@@ -580,8 +631,9 @@ export class WsBackend implements Backend {
   press(pad: string, button: string, opts: PressOpts = {}): Promise<PressResult> {
     const c = this.conn;
     // Closed under us, its close event not in yet: that's offline now.
-    if (c?.greeted && c.ws.readyState !== WebSocket.OPEN) this.lost(c);
-    if (this.snapshot.get().status !== 'online' || this.conn !== c || !c?.greeted) return Promise.reject(new PressError(false, 'not connected to the host'));
+    if (c?.greeted && c.ws?.readyState !== WebSocket.OPEN) this.lost(c);
+    const ws = c?.ws;
+    if (this.snapshot.get().status !== 'online' || this.conn !== c || !c?.greeted || !ws) return Promise.reject(new PressError(false, 'not connected to the host'));
     const id = `${Date.now().toString(36)}${(++this.seq).toString(36)}`;
     // When it was made (the gesture's time: a stalled page gets here late), in the host's clock:
     // the host drops it if it got there too late (the button's maxLatenessMs).
@@ -591,7 +643,7 @@ export class WsBackend implements Backend {
     const msg: ClientMsg = { t: 'press', id, pad, button, at, ...(opts.confirm ? { confirm: true } : {}) };
     return new Promise((resolve, reject) => {
       try {
-        c.ws.send(JSON.stringify(msg));
+        ws.send(JSON.stringify(msg));
       } catch (e) {
         return reject(new PressError(false, e instanceof Error ? e.message : String(e)));
       }
@@ -623,9 +675,9 @@ export class WsBackend implements Backend {
     // Never drops a socket that still answers (one that just said hello, say): it only checks.
     const c = this.conn;
     if (c?.greeted) this.probe(c, QUICK_PROBE_TIMEOUT);
-    // Offline, waiting for the next retry, or stuck opening a socket that should be open by now (one
-    // that is open and waiting for a slow hello is left to it): go now.
-    else if (!c || (c.ws.readyState === WebSocket.CONNECTING && mono() - c.openedAt > KICK_STALE_CONNECT)) this.connectNow();
+    // Offline, waiting for the next retry, or stuck getting a ticket or opening a socket that should
+    // be open by now (one that is open and waiting for a slow hello is left to it): go now.
+    else if (!c || ((!c.ws || c.ws.readyState === WebSocket.CONNECTING) && mono() - c.startedAt > KICK_STALE_CONNECT)) this.connectNow();
   }
 
   private async http(method: string, path: string, body?: string, signal?: AbortSignal): Promise<Response> {

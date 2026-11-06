@@ -78,8 +78,27 @@ holds under contention; 59/59 hobbyist runs exactly once at 6× throttle; touch-
 | Run attribution: stale queue claims, 30 s claim window, restarted run ids | correctness | fixed (d0df424) |
 | "All off" refusable by run/rate limits | correctness | fixed (d0df424) |
 | Rough mode disabled palm rejection; ?lock didn't confine keys; ghost runs after edits | correctness, regression | fixed (d0df424) |
-| Raising a running cue's time limit mid-show didn't apply | stage | round 4 |
-| No phone-only way to become admin | hobbyist | round 4 (pairing codes) |
-| Results flood the screen bright in a dark house | stage | round 4 (show mode) |
-| Two one-sided fades fight; no exclusive groups | stage | round 4 (`group`) |
-| Trailing space in a program path broke a button invisibly | hobbyist | round 4 (trimmed paths) |
+| Raising a running cue's time limit mid-show didn't apply | stage | fixed (85659ec) |
+| No phone-only way to become admin | hobbyist | fixed: pairing codes (85659ec) |
+| Results flood the screen bright in a dark house | stage | fixed: show mode (85659ec) |
+| Two one-sided fades fight; no exclusive groups | stage | fixed: `group` (85659ec) |
+| Trailing space in a program path broke a button invisibly | hobbyist | fixed: trimmed paths + editor flags (85659ec) |
+
+## Final pass (frozen build 85659ec)
+
+Round 4 (pairing codes, show mode, exclusive groups, per-button lateness, live time-limit edits,
+compact config writes, compressed assets) passed 425 bun + 401 Playwright tests. Then three agents:
+
+- **Regression verifier**: every round-2/3 item still fixed with the original repro scripts; every
+  round-4 feature verified end to end (incl. pairing + `--allow-origin` behind a Host-rewriting
+  proxy over ws and wss, SYNCING after a 29 s freeze, run history across a crash). 3 LOW bugs.
+- **Security review** of the round-4 surface: no critical/high. Double-redeem races, role
+  escalation, IPv6/address rotation, cache poisoning, BREACH and forged run-log XSS all held. Two
+  LOWs: run-log ids could seed the run counter; no Host-header allowlist (DNS rebinding can redeem
+  a code the page already knows — deferred, documented).
+- **The owner on an iPhone through a preview proxy** (simulated): paired by code, built a pad on
+  the phone, show mode. Found: the code box accepted and hid extra digits; the admin token
+  travelled in the WebSocket URL through the proxy (now one-time tickets); a bright @state chip in
+  show mode; STOP ALL saying "Done" when nothing ran; save warnings about untouched pads.
+
+Those fixes are in the final commit after 85659ec.

@@ -140,6 +140,12 @@ export interface ShowPalette {
   ink: string;
   /** The hue at medium lightness, for the face's edge: which button it is, at a glance. */
   edge: string;
+  /**
+   * The latched-state chip (`@state`): the face a step lighter, so it still reads as a solid chip,
+   * with the ink on it (≥ 4.5:1). A chip in the ink itself was the brightest thing on a dark pad
+   * (QA: 0.35 relative luminance on a 0.025 face).
+   */
+  chip: string;
 }
 
 const showCache = new Map<string, ShowPalette>();
@@ -152,7 +158,12 @@ export function showPalette(color: string): ShowPalette {
   const hit = showCache.get(color);
   if (hit) return hit;
   const [, C, h] = oklch(toRGB(paintColor(color)));
-  const out: ShowPalette = { bg: fromOklch(0.25, Math.min(C, 0.07), h), ink: fromOklch(0.78, Math.min(C, 0.03), h), edge: fromOklch(0.5, Math.min(C, 0.12), h) };
+  const out: ShowPalette = {
+    bg: fromOklch(0.25, Math.min(C, 0.07), h),
+    ink: fromOklch(0.78, Math.min(C, 0.03), h),
+    edge: fromOklch(0.5, Math.min(C, 0.12), h),
+    chip: fromOklch(0.36, Math.min(C, 0.06), h),
+  };
   if (showCache.size > 200) showCache.clear();
   showCache.set(color, out);
   return out;

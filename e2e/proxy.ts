@@ -42,6 +42,11 @@ export interface Proxy {
   rewriteHost: string | null;
   /** Close every new connection this long after it opened (0 = off). */
   cutNewAfterMs: number;
+  /**
+   * Every request line the browser sent through it (`GET /ws?ticket=…`), as a reverse proxy's
+   * access log keeps them: what must never carry a token.
+   */
+  readonly lines: string[];
   /** The next chunk from the browser is forwarded, then the link dies before anything comes back. */
   cutAfterNextUp(): void;
   /** Existing links stop moving bytes (their TCP connections stay open). */
@@ -64,11 +69,17 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
   };
   /** rewriteHost: request headers carry the proxy's own idea of the Host. */
   const rewrite = (d: Buffer) => (p.rewriteHost ? Buffer.from(d.toString('latin1').replace(/\r\nhost: [^\r]*\r\n/i, `\r\nHost: ${p.rewriteHost}\r\n`), 'latin1') : d);
+  const lines: string[] = [];
   const server = net.createServer((client) => {
     accepted++;
     const l: Link = { client, upstream: null, frozen: mode === 'blackhole', openedAt: Date.now(), ws: false };
     links.add(l);
     client.on('error', () => {});
+    // A request's head comes first in its chunk (browsers don't pipeline): its first line is the log line.
+    client.on('data', (d: Buffer) => {
+      const m = /^([A-Z]+) (\S+) HTTP\/1\.[01]\r\n/.exec(d.toString('latin1', 0, Math.min(d.length, 8192)));
+      if (m) lines.push(`${m[1]} ${m[2]}`);
+    });
     client.on('close', () => {
       links.delete(l);
       l.upstream?.destroy();
@@ -150,6 +161,7 @@ export async function startProxy(targetPort: number): Promise<Proxy> {
     blackholeWs: false,
     rewriteHost: null,
     cutNewAfterMs: 0,
+    lines,
     setMode: (m) => void (mode = m),
     cutAfterNextUp: () => void (cutNext = true),
     freezeAll: () => {

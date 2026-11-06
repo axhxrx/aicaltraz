@@ -155,11 +155,11 @@ describe('stops + action none', () => {
     expect(store.runs({ pad: 'lights', button: 'key' })[0]).toMatchObject({ reason: 'cancelled', error: 'stopped by All off' });
     await Bun.sleep(1000); // no re-run of fill comes
     expect(runs.length).toBe(3);
-    // Nothing left to stop: "Done".
+    // Nothing left to stop: it says so (QA: "Done" read as if it had switched something off).
     await waitFor(() => store.get('lights/off')?.phase === 'ready', 5000, 'off ready');
     press('lights', 'off');
     await waitFor(() => store.get('lights/off')?.phase === 'success', 1000, 'none again');
-    expect(store.get('lights/off')).toMatchObject({ text: 'Done', runId: 2 });
+    expect(store.get('lights/off')).toMatchObject({ text: 'Nothing was running', runId: 2 });
   });
 
   test('`*` stops every other running button; a stop button with an action runs it after stopping', async () => {
@@ -194,7 +194,39 @@ describe('stops + action none', () => {
     await Bun.sleep(1200);
     expect(runs.length).toBe(1);
     await waitFor(() => store.get('lights/off')?.phase === 'success', 1000, 'off done');
-    expect(store.get('lights/off')).toMatchObject({ text: 'Done' });
+    // Nothing was running, but a run was coming: that one it stopped.
+    expect(store.get('lights/off')).toMatchObject({ text: 'Stopped 1' });
+  });
+
+  test('what a `none` says it did: "Stopped N" (also a run already going down), "Nothing was running", "Done" without stops or group', async () => {
+    const cfg = twoPads();
+    cfg.pads[0]!.buttons!.push(
+      { id: 'noop', label: 'No-op', x: 1, y: 1, action: { type: 'none' } },
+      { id: 'solo', label: 'Solo', x: 2, y: 1, group: 'wash', action: { type: 'none' } },
+    );
+    const { store, runOf, press } = fakeStore(cfg);
+    /** The text of the `none` run this press started. */
+    const said = async (pad: string, b: string) => {
+      const r = press(pad, b);
+      expect(r.result).toBe('started');
+      await waitFor(() => store.get(r.key)?.phase === 'success' && store.get(r.key)!.runId === r.runId, 1000, `${r.key} #${r.runId}`);
+      return (store.get(r.key) as { text?: string }).text;
+    };
+    expect(await said('lights', 'noop')).toBe('Done'); // names nothing to stop
+    expect(await said('lights', 'off')).toBe('Nothing was running'); // its patterns find nothing running
+    expect(await said('lights', 'solo')).toBe('Nothing was running'); // its group has nothing running
+    press('lights', 'key');
+    expect(await said('cam', 'panic')).toBe('Stopped 1');
+    // Still on its way down (it hasn't exited): a second stop counts it, it doesn't say "Nothing".
+    expect(store.get('lights/key')).toMatchObject({ phase: 'running', cancelling: true });
+    expect(await said('lights', 'off')).toBe('Stopped 1');
+    expect(runOf('lights/key')!.kills).toBe(1); // …without a second kill
+    runOf('lights/key')!.exit({ exitCode: null });
+    // A run that already exited, its output still draining, is past stopping: not counted.
+    press('lights', 'idle');
+    runOf('lights/idle')!.draining = true;
+    expect(await said('lights', 'off')).toBe('Nothing was running');
+    runOf('lights/idle')!.exit();
   });
 });
 
@@ -409,6 +441,77 @@ describe('@state: latched device state', () => {
     store.setConfig(Config.parse({ version: 1, pads: [twoPads().pads[0]!] }));
     expect(latched.at(-1)).toEqual(['cam/rec', null]);
     expect(store.latched()).toEqual({});
+  });
+
+  test('`@state:<pad>/<button> text` names another button: parsed strictly', () => {
+    expect(parseDirective('@state:lights/key-80 ON 80%')).toEqual({ kind: 'state', key: 'lights/key-80', text: 'ON 80%' });
+    expect(parseDirective('@state:lights/key-80')).toEqual({ kind: 'state', key: 'lights/key-80', text: '' });
+    expect(parseDirective('@state:lights/key-80 \t ')).toEqual({ kind: 'state', key: 'lights/key-80', text: '' });
+    expect(parseDirective('@state:my_pad/b-2\tOFF')).toEqual({ kind: 'state', key: 'my_pad/b-2', text: 'OFF' });
+    for (const bad of ['@state:lights', '@state:lights/', '@state:/key', '@state: lights/key ON', '@state:lights /key ON', '@state:a/b/c ON', '@state:lights/key:x ON', '@state:pad/ké ON', `@state:p/${'b'.repeat(201)} ON`])
+      expect(parseDirective(bad)).toBeUndefined();
+  });
+
+  test('the runner reports them per key, in the order each was last set, sanitized; its own key is its plain @state', async () => {
+    const latchedFor = new Map<string, string | null>();
+    const own: (string | null)[] = [];
+    const h = startRun(
+      {
+        action: sh(`printf '@state:p/b ON\\n@state:p/c \\033[31mRED\\033[0m\\n@state:p/b\\n@state:p/a mine\\n@state:p/d %s\\n' "$(printf 'y%.0s' $(seq 1 80))"`),
+        baseDir: tmpDir(),
+        timeoutMs: 5000,
+        key: 'p/a',
+      },
+      {
+        onUpdate: (u) => {
+          if (u.latched !== undefined) own.push(u.latched);
+          for (const [k, t] of u.latchedFor ?? []) {
+            latchedFor.delete(k);
+            latchedFor.set(k, t);
+          }
+        },
+      },
+    );
+    const o = await h.done;
+    expect(own).toEqual(['mine']);
+    expect([...latchedFor.keys()]).toEqual(['p/c', 'p/b', 'p/d']);
+    expect(latchedFor.get('p/b')).toBeNull(); // cleared by its last line
+    expect(latchedFor.get('p/c')).toBe('RED');
+    expect(latchedFor.get('p/d')).toHaveLength(LATCHED_MAX);
+    expect(o.text).toBeUndefined(); // directives are no result text
+  });
+
+  test("a run sets other buttons' chips (any pad), clears them, and can't name a button that isn't there", async () => {
+    const { store, runOf, press, latched, logs } = fakeStore(twoPads());
+    press('cam', 'rec');
+    runOf('cam/rec')!.update({ latched: 'REC ●' });
+    press('lights', 'idle');
+    const all = runOf('lights/idle')!;
+    all.update({
+      latchedFor: new Map<string, string | null>([
+        ['lights/key', 'OFF'],
+        ['cam/rec', null],
+        ['lights/nope', 'x'],
+        ['nope/key', 'y'],
+      ]),
+    });
+    expect(store.latched()).toEqual({ 'lights/key': 'OFF' });
+    expect(latched.slice(-2)).toEqual([
+      ['lights/key', 'OFF'],
+      ['cam/rec', null],
+    ]);
+    // The ones that name nothing: said once (per 10 s), with a count after.
+    expect(logs.filter((l) => l.includes('names no button'))).toEqual(['lights/idle #1: "@state:lights/nope" names no button in the config; ignored']);
+    // The same text again changes nothing (no broadcast); the button's own run replaces it.
+    all.update({ latchedFor: new Map([['lights/key', 'OFF']]) });
+    expect(latched.length).toBe(3);
+    press('lights', 'key');
+    runOf('lights/key')!.update({ latched: 'ON 80%' });
+    expect(store.latched()).toEqual({ 'lights/key': 'ON 80%' });
+    // A run whose own button was removed meanwhile speaks for no one any more.
+    store.setConfig(Config.parse({ version: 1, pads: [{ ...twoPads().pads[0]!, buttons: twoPads().pads[0]!.buttons!.filter((b) => b.id !== 'idle') }, twoPads().pads[1]!] }));
+    all.update({ latchedFor: new Map([['cam/rec', 'HIJACK']]) });
+    expect(store.latched()).toEqual({ 'lights/key': 'ON 80%' });
   });
 });
 

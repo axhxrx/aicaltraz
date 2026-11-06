@@ -255,3 +255,26 @@ test("recent runs show a failed run's exit code and stderr", async ({ page, hasT
   await expect(page.getByTestId('run-test')).toHaveCount(0);
   await expect(page.getByTestId('run-save')).toBeEnabled();
 });
+
+test('leaving the editor lands on the pad open in it, by its id on the host: one saved on the way out; one whose new id was thrown away', async ({ page }) => {
+  await edit(page);
+  // A new pad, saved on the way out (QA: the owner built "Stage", closed the editor, and was back on another pad).
+  await page.getByTestId('edit-add-pad').click();
+  await page.getByTestId('pad-name').fill('Stage');
+  await page.getByTestId('edit-close').click();
+  await page.getByTestId('leave-save').click();
+  await expect(page.getByTestId('edit-mode')).toHaveCount(0);
+  await expect(page.getByTestId('tab-stage')).toHaveAttribute('aria-selected', 'true');
+  expect(disk().pads.map((p) => p.id)).toEqual(['main', 'stage']);
+  // Main with a new id in the draft, thrown away on the way out: Main, by the id the host knows.
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-edit').click();
+  await page.getByTestId('edit-tab-main').click();
+  await page.getByTestId('edit-pad-settings').click();
+  await page.getByTestId('pad-id').fill('mainline');
+  await page.getByTestId('edit-close').click();
+  await page.getByTestId('leave-discard').click();
+  await expect(page.getByTestId('edit-mode')).toHaveCount(0);
+  await expect(page.getByTestId('tab-main')).toHaveAttribute('aria-selected', 'true');
+  await expect(btn(page, 'lamp')).toBeVisible();
+});

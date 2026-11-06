@@ -48,6 +48,16 @@ export interface DraftSnapshot {
   pad: number;
 }
 
+/** What a save changes (Editor.changes): the host's warnings about anything else are old news. */
+export interface SaveChanges {
+  /** Buttons of the saved config that are new or changed. */
+  buttons: Set<Button>;
+  /** Groups a button joins or leaves. */
+  groups: Set<string>;
+  /** `pad/button` keys the saved config no longer has (deleted or renamed). */
+  gone: Set<string>;
+}
+
 const HISTORY = 200;
 /** Edits to the same field closer together than this are one undo step (typing). */
 const MERGE_MS = 1500;
@@ -117,6 +127,36 @@ export class Editor {
     const u = this.uid(o);
     if (!pad) return this.state.base.pads.find((p) => this.uid(p) === u);
     return this.baseOf(pad)?.buttons.find((b) => this.uid(b) === u);
+  }
+
+  /** The pad open in the editor, by its id on the host (the base's): undefined for one the host doesn't have. */
+  hostPadId(): string | undefined {
+    return this.baseOf(this.pad)?.id;
+  }
+
+  /**
+   * What saving `next` over `prev` changes, by identity (a renamed button is the same button): the
+   * buttons of `next` that are new or differ from their version in `prev`, the groups a button
+   * joins or leaves (by going too), the `pad/button` keys of `prev` that `next` lacks.
+   */
+  changes(prev: Config, next: Config): SaveChanges {
+    const key = (p: Pad, b: Button) => `${p.id}/${b.id}`;
+    const keys = new Set(next.pads.flatMap((p) => p.buttons.map((b) => key(p, b))));
+    const gone = new Set(prev.pads.flatMap((p) => p.buttons.map((b) => key(p, b))).filter((k) => !keys.has(k)));
+    const was = new Map(prev.pads.flatMap((p) => p.buttons.map((b) => [this.uid(b), b] as const)));
+    const out: SaveChanges = { buttons: new Set(), groups: new Set(), gone };
+    const group = (g: string | undefined) => void (g !== undefined && out.groups.add(g));
+    for (const p of next.pads)
+      for (const b of p.buttons) {
+        const old = was.get(this.uid(b));
+        was.delete(this.uid(b));
+        if (old && stable(old) === stable(b)) continue;
+        out.buttons.add(b);
+        if (old?.group !== b.group) (group(old?.group), group(b.group));
+      }
+    // Left over: deleted.
+    for (const b of was.values()) group(b.group);
+    return out;
   }
 
   /** Ids a new button on `pad` must stay clear of: the host's buttons on the pad with that id (or that the pad comes from). */

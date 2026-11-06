@@ -1248,6 +1248,12 @@
   color: #c9ced6;
   box-shadow: 0 0 0 0.07em #c9ced666;
 }
+/* Latched state (`@state`): still a solid chip, but the face's hue a step lighter with the ink on
+   it, not a chip in the ink (QA: "ON 80%" was the brightest thing on the pad, 0.35 on a 0.025 face). */
+.bp-btn[data-show] .bp-latched:not(.is-uncertain) {
+  background: var(--chip, var(--sh-face));
+  color: var(--ink);
+}
 .bp-btn[data-show][data-visual='offline'] .bp-face {
   --ink: #a3abb6;
 }

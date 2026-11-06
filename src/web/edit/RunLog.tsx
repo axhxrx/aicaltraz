@@ -8,6 +8,7 @@
  */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { buttonKey, type Button } from '../../core/config.ts';
+import type { RunState } from '../../core/machine.ts';
 import type { PressResult, RunRecord } from '../../core/protocol.ts';
 import type { Backend } from '../backend/types.ts';
 import { wall } from '../lib/clock.ts';
@@ -27,8 +28,19 @@ function outcome(r: RunRecord): { tone: 'ok' | 'bad' | 'run'; title: string } {
   if (r.reason === 'cancelled') return { tone: 'bad', title: r.error ? 'Stopped' : 'Cancelled' };
   if (r.reason === 'spawn') return { tone: 'bad', title: "Couldn't start" };
   if (r.reason === 'interrupted') return { tone: 'bad', title: 'Interrupted (the host stopped)' };
+  // Nothing ran (action `none`: it stops others, if anything is running): no program, no exit code.
+  if (r.exitCode === 0 && r.command === undefined) return { tone: 'ok', title: 'Done' };
   if (r.exitCode === 0) return { tone: 'ok', title: 'OK · exit 0' };
   return { tone: 'bad', title: r.exitCode == null ? 'Killed' : `Exit ${r.exitCode}` };
+}
+
+/**
+ * The result text the button showed for run `runId`, while its state still has it: the host's own
+ * words where the run printed none (a `none` button's "Stopped 2", "Nothing was running").
+ */
+function shownText(st: RunState | undefined, runId: number): string | undefined {
+  if (st?.phase === 'success' || st?.phase === 'failure') return st.runId === runId ? st.text : undefined;
+  return st?.phase === 'ready' && st.last?.runId === runId ? st.last.text : undefined;
 }
 
 function ago(ms: number): string {
@@ -78,7 +90,8 @@ function resultText(r: RunRecord, failed: boolean): string | undefined {
   if (res !== undefined) return res;
   const last = out.findLast((l) => l.trim() && !l.startsWith('@'));
   if (last !== undefined) return last;
-  return failed ? (r.stderr.split('\n').findLast((l) => l.trim()) ?? r.error) : undefined;
+  // Ended fine: an `error` there is the host's word for what it did, not why it stopped.
+  return failed ? (r.stderr.split('\n').findLast((l) => l.trim()) ?? r.error) : r.error;
 }
 
 const PRESS_NOTE: Partial<Record<PressResult, string>> = {
@@ -90,11 +103,12 @@ const PRESS_NOTE: Partial<Record<PressResult, string>> = {
   'needs-confirm': "The host wants this press confirmed, and it wasn't: nothing ran.",
 };
 
-function Run({ r, skew, open, onToggle }: { r: RunRecord; skew: number; open: boolean; onToggle(): void }) {
+function Run({ r, skew, shown, open, onToggle }: { r: RunRecord; skew: number; shown: string | undefined; open: boolean; onToggle(): void }) {
   const o = outcome(r);
   const start = r.startedAt + skew;
   const dur = r.endedAt !== undefined ? fmtElapsed(r.endedAt - r.startedAt) : null;
-  const text = resultText(r, o.tone === 'bad');
+  const said = resultText(r, o.tone === 'bad') ?? (r.endedAt !== undefined ? shown : undefined);
+  const text = said === o.title ? undefined : said;
   return (
     <li class={`ed-run is-${o.tone}${open ? ' is-open' : ''}`} data-testid="run-item">
       <button type="button" class="ed-run-head" aria-expanded={open} onClick={onToggle}>
@@ -115,7 +129,7 @@ function Run({ r, skew, open, onToggle }: { r: RunRecord; skew: number; open: bo
             Run #{r.runId} · started {clock(start)}
             {r.endedAt !== undefined && ` · ended ${clock(r.endedAt + skew)}`}
           </div>
-          {r.error && (
+          {r.error && o.tone !== 'ok' && (
             <div class="ed-out">
               <div class="ed-out-name">{r.reason === 'spawn' ? "Why it couldn't start" : 'Why it stopped'}</div>
               <pre class="ed-pre is-err" data-testid="run-error" data-selectable>
@@ -324,7 +338,7 @@ export function RunLog(p: {
       {onHost && runs && runs.length > 0 && (
         <ol class="ed-run-list">
           {runs.map((r) => (
-            <Run key={r.runId} r={r} skew={skew} open={shown === r.runId} onToggle={() => setOpen(shown === r.runId ? -1 : r.runId)} />
+            <Run key={r.runId} r={r} skew={skew} shown={shownText(st, r.runId)} open={shown === r.runId} onToggle={() => setOpen(shown === r.runId ? -1 : r.runId)} />
           ))}
         </ol>
       )}

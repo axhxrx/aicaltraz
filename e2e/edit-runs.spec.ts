@@ -27,6 +27,7 @@ const CONFIG: ConfigInput = {
         { id: 'render', label: 'Render', color: '#0891b2', x: 1, y: 0, trigger: 'tap', whileRunning: 'cancel', action: { type: 'shell', script: 'echo one; sleep 1.5; echo two; sleep 1.5; echo three; sleep 30' } },
         { id: 'slow', label: 'Slow', color: '#0d9488', x: 2, y: 0, trigger: 'tap', timeoutMs: 5000, action: { type: 'shell', script: "echo '@status busy'; sleep 30" } },
         { id: 'ghost', label: 'Ghost', color: '#7c3aed', x: 0, y: 1, trigger: 'tap', action: { type: 'exec', command: './no-such-program.sh', args: ['--now'] } },
+        { id: 'stop', label: 'Stop all', color: '#212529', x: 1, y: 1, trigger: 'tap', stops: ['*'], action: { type: 'none' } },
       ],
     },
   ],
@@ -152,37 +153,98 @@ test("a program that can't start: the run says why, what ran and in which folder
   await expect(page.getByTestId('run-cwd')).toHaveText(dirname(host.configPath));
 });
 
-test("a save's warnings (non-blocking) show after it, on the button they're about, until it changes", async ({ page, hasTouch }) => {
+test('a Nothing button’s runs read like any other: “Done”, with what the host says it did (“Nothing was running”, “Stopped 1”), never as a failure', async ({ page, hasTouch }) => {
   await edit(page);
+  await runs(page, hasTouch, 'stop');
+  await page.getByTestId('run-test').click();
+  const run = page.getByTestId('run-item').first();
+  await expect(run.locator('.ed-run-text')).toHaveText('Nothing was running', { timeout: 8000 });
+  await expect(run.locator('.ed-run-title')).toHaveText('Done');
+  await expect(run).toHaveClass(/\bis-ok\b/);
+  await expect(page.getByTestId('run-error')).toHaveCount(0);
+  // With something to stop: what it stopped.
+  await runs(page, hasTouch, 'render');
+  await page.getByTestId('run-test').click();
+  await expect(item(page, 'render').getByTestId('running-badge')).toBeVisible();
+  await runs(page, hasTouch, 'stop');
+  await page.getByTestId('run-test').click();
+  await expect(item(page, 'render').getByTestId('running-badge')).toHaveCount(0, { timeout: 8000 });
+  await expect(run.locator('.ed-run-text')).toHaveText('Stopped 1');
+  await expect(run.locator('.ed-run-title')).toHaveText('Done');
+  await expect(page.getByTestId('run-item')).toHaveCount(2);
+});
+
+test("a save's warnings (non-blocking): what it changed in a notice, the rest one quiet line; on the button they're about, until it changes", async ({ page, hasTouch }) => {
+  await edit(page);
+  const missing = `Main › “Ghost” · Command: not found: ${join(dirname(host.configPath), 'no-such-program.sh')}`;
+  // The host checks what a press would run into: Ghost's program isn't there. But this save doesn't
+  // touch Ghost (QA: every save warned about the example's broken button): old news, one quiet line,
+  // and the toast says it saved.
   await tap(page, hasTouch, 'edit-btn-format');
   await page.getByTestId('field-label').fill('Format SD card');
   await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  await expect(page.getByTestId('toast')).toContainText('Saved: live on every device now');
   const notice = page.getByTestId('notice-warnings');
-  // The notice says it was saved: no toast on top of it (it used to hide the notice's header and ✕).
-  await expect(notice).toContainText('Saved, but the host warns about this');
-  await expect(page.getByTestId('toast')).toHaveCount(0);
-  // The host checks what a press would run into: Ghost's program isn't there.
-  await expect(notice.getByTestId('warning-item')).toHaveText(`Main › “Ghost” · Command: not found: ${join(dirname(host.configPath), 'no-such-program.sh')}`);
+  const quiet = page.getByTestId('notice-warnings-elsewhere');
+  await expect(notice).toHaveCount(0);
+  await expect(quiet.getByTestId('warnings-elsewhere')).toHaveText('1 other warning elsewhere');
+  await expect(quiet.getByTestId('warning-elsewhere-item')).toHaveCount(0);
+  await quiet.getByTestId('warnings-elsewhere').click();
+  await expect(quiet.getByTestId('warning-elsewhere-item')).toHaveText(missing);
+  // On the button it's about all the same.
   await expect(item(page, 'ghost').getByTestId('warned-badge')).toBeVisible();
   await expect(item(page, 'format').getByTestId('warned-badge')).toHaveCount(0);
   // It points at the button and the field.
-  await notice.getByTestId('warning-item').click();
+  await quiet.getByTestId('warning-elsewhere-item').click();
   await expect(page.getByTestId('field-command')).toHaveValue('./no-such-program.sh');
   await expect(page.getByTestId('warning-button')).toContainText('Command: not found');
   await page.getByTestId('editor-tab-button').click();
   await expect(page.getByTestId('warning-button')).toBeVisible();
+
+  // A save that changes Ghost: news. The notice says it was saved: no toast on top of it (it used to
+  // hide the notice's header and ✕), not even the last save's.
+  await page.getByTestId('field-label').fill('Ghost v2');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  await expect(notice).toContainText('Saved, but the host warns about this');
+  await expect(notice.getByTestId('warning-item')).toHaveText(missing.replace('Ghost', 'Ghost v2'));
+  await expect(page.getByTestId('toast')).toHaveCount(0);
+  await expect(page.getByTestId('warnings-elsewhere')).toHaveCount(0);
+  await expect(quiet).toHaveCount(0);
   // Fixed (changed): the warning is history.
-  await page.getByTestId('editor-tab-action').click();
+  await notice.getByTestId('warning-item').click();
   await page.getByTestId('field-command').fill('/bin/echo');
   await expect(page.getByTestId('warning-button')).toHaveCount(0);
   await expect(item(page, 'ghost').getByTestId('warned-badge')).toHaveCount(0);
   await page.getByTestId('warnings-dismiss').click();
   await expect(notice).toHaveCount(0);
-  // Saved again with nothing to warn about: no notice, no toast about warnings.
+  // Saved again with nothing to warn about: no notice, no quiet line, the toast.
   await page.getByTestId('edit-save').click();
   await expect(page.getByTestId('toast')).toContainText('Saved: live on every device now');
   await expect(notice).toHaveCount(0);
+  await expect(quiet).toHaveCount(0);
+});
+
+test('a warning a save brings on a button it didn’t touch is news too: the group it left one button in', async ({ page, hasTouch, request }) => {
+  // Format and Render share a group on the host.
+  const cfg = structuredClone(CONFIG);
+  Object.assign(cfg.pads[0]!.buttons[0]!, { group: 'card' });
+  Object.assign(cfg.pads[0]!.buttons[1]!, { group: 'card' });
+  const { rev } = (await (await request.get(`${host.url}/api/config`, { headers: headers() })).json()) as { rev: string };
+  expect((await request.put(`${host.url}/api/config`, { headers: headers(), data: { config: cfg, baseRev: rev } })).status()).toBe(200);
+  await edit(page);
+  await tap(page, hasTouch, 'edit-btn-render');
+  await page.getByTestId('editor-tab-action').click();
+  await page.getByTestId('field-group').fill('');
+  await page.getByTestId('edit-save').click();
+  await expect(status(page)).toHaveAttribute('data-state', 'clean');
+  const notice = page.getByTestId('notice-warnings');
+  await expect(notice.getByTestId('warning-item')).toHaveText('Main › “Format card” · Group: “card” has no other button: it stops nothing');
+  await expect(notice.getByTestId('warnings-elsewhere')).toHaveText('1 other warning elsewhere');
+  await notice.getByTestId('warnings-elsewhere').click();
+  await expect(notice.getByTestId('warning-elsewhere-item')).toContainText('Main › “Ghost” · Command: not found');
+  await expect(page.getByTestId('toast')).toHaveCount(0);
 });
 
 type Json = { pads: { buttons: Record<string, unknown>[] }[] };
@@ -262,15 +324,18 @@ test('the host’s warnings land on their fields (a group of one, bash syntax un
   await page.getByTestId('edit-save').click();
   await expect(status(page)).toHaveAttribute('data-state', 'clean');
   const notice = page.getByTestId('notice-warnings');
-  await expect(notice).toContainText('Saved, but the host warns about 3 things');
+  await expect(notice).toContainText('Saved, but the host warns about 2 things');
   if (hasTouch) {
     await expect(notice.getByTestId('warning-item')).toHaveCount(1);
     await notice.getByTestId('warnings-more').click();
   }
-  await expect(notice.getByTestId('warning-item')).toHaveCount(3);
+  await expect(notice.getByTestId('warning-item')).toHaveCount(2);
   await expect(notice).toContainText('Main › “Format card” · Group: “solo” has no other button');
   await expect(notice).toContainText('Main › “Render” · Shell: the script uses bash syntax ([[ … ]])');
   await expect(notice).toContainText('set Shell to bash');
+  // Ghost's missing program was there before this save: one quiet line under them.
+  await expect(notice.getByTestId('warnings-elsewhere')).toHaveText('1 other warning elsewhere');
+  await expect(notice.getByTestId('warning-elsewhere-item')).toHaveCount(0);
   // On the button: in its editor, by the field's name.
   await expect(page.getByTestId('warning-button')).toContainText('Shell: the script uses bash syntax');
   await page.getByTestId('field-shell').fill('bash');

@@ -54,6 +54,8 @@ const REQUEUE_RETRY_MS = 100;
 const MAX_MEMOS = 1000;
 /** A run the host lost track of (it stopped or crashed while the run went on). */
 export const INTERRUPTED_TEXT = 'Interrupted: host restarted';
+/** Result of an action `none` whose `stops`/group found nothing running (nor a queued re-run) to stop. */
+export const NOTHING_RUNNING = 'Nothing was running';
 
 /** How the host stopped a run: RunRecord.error, and the host log. */
 export const STOP_REASONS = {
@@ -234,6 +236,8 @@ export class StateStore {
   private readonly refusals: ThrottledLog;
   private readonly expired: ThrottledLog;
   private readonly unconfirmed: ThrottledLog;
+  /** `@state:<pad>/<button>` naming no button. */
+  private readonly unknownLatched: ThrottledLog;
 
   constructor(
     config: Config,
@@ -250,6 +254,7 @@ export class StateStore {
     this.refusals = new ThrottledLog(log, this.clock);
     this.expired = new ThrottledLog(log, this.clock);
     this.unconfirmed = new ThrottledLog(log, this.clock);
+    this.unknownLatched = new ThrottledLog(log, this.clock);
     if (opts.statePath) this.load(opts.statePath);
     this.setConfig(config);
   }
@@ -287,9 +292,11 @@ export class StateStore {
         if (slot.run && slot.run.timeoutMs !== button.timeoutMs) this.retime(slot.run, button.timeoutMs);
         continue;
       }
-      // Keep runIds increasing for a key that comes back (or across a restart), so clients never see an old runId reused.
+      // Keep runIds increasing for a key that comes back (or across a restart), so clients never see
+      // an old runId reused. The counter is the memo's (buttpad.state.json's), never the run log's:
+      // that is display data (a crafted runId there froze the ids).
       const memo = this.memos.get(key);
-      const runId = Math.max(this.history.get(key)?.[0]?.runId ?? 0, memo?.lastRunId ?? 0);
+      const runId = memo?.lastRunId ?? 0;
       const state: RunState = memo?.last ? { phase: 'ready', runId, last: memo.last } : { phase: 'ready', runId };
       this.slots.set(key, { key, pad, button, state });
       added.push(key);
@@ -467,7 +474,7 @@ export class StateStore {
       clearTimeout(slot.resetTimer);
       clearTimeout(slot.requeueTimer);
     }
-    for (const l of [this.refusals, this.expired, this.unconfirmed]) l.close();
+    for (const l of [this.refusals, this.expired, this.unconfirmed, this.unknownLatched]) l.close();
     // Runs killed earlier that are still in their grace period get the rest of it, like the running ones.
     const runs: Straggler[] = [...this.live, ...this.stragglers()];
     const ending = [...this.live];
@@ -658,7 +665,10 @@ export class StateStore {
 
   /**
    * `stops` and `group`: cancel the running buttons its patterns name and the running buttons of
-   * its group (any pad; never itself), dropping their queued re-runs. How many it stopped.
+   * its group (any pad; never itself), dropping their queued re-runs. How many buttons it stopped
+   * (an action `none` says so: "Stopped 2"): each one running (killed now, or already on its way
+   * down from an earlier stop) or with a re-run it dropped. A run that had already exited, only its
+   * output still draining, doesn't count (unless a re-run was queued behind it).
    */
   private stopOthers(self: Slot): number {
     // A label is anyone's text (the config): none of its escape sequences or controls in the result text, RunRecord.error or the log.
@@ -676,10 +686,12 @@ export class StateStore {
           if (s.queued) {
             const { queued: _queued, ...rest } = s;
             this.apply(slot, rest, []);
+            n++;
           }
           continue;
         }
-        if (kill) n++;
+        // Killed now, or no kill needed: already being cancelled.
+        n++;
         this.apply(slot, next, effects.filter((e) => e !== kill));
       } else if (s.phase !== 'ready' && s.queued) {
         // Its result is showing and a re-run is about to start: drop the re-run.
@@ -688,6 +700,7 @@ export class StateStore {
         const next = { ...s };
         delete next.queued;
         this.apply(slot, next, [{ type: 'scheduleReset', runId: s.runId, afterMs: slot.button.resultHoldMs }]);
+        n++;
       }
     }
     return n;
@@ -774,15 +787,17 @@ export class StateStore {
       onUpdate: (u) => run && this.update(slot, run, u),
       onExit: (o) => run && this.finishRun(slot, run, o),
     };
+    // Action `none`: what it did was stop the others ("Done" for one that names nothing to stop).
     const handle =
       b.action.type === 'none'
-        ? finishedRun({ text: stopped ? `Stopped ${stopped}` : 'Done' }, hooks)
+        ? finishedRun({ text: stopped ? `Stopped ${stopped}` : stopsAny(b) ? NOTHING_RUNNING : 'Done' }, hooks)
         : this.spawn(
             {
               action: b.action,
               baseDir: this.opts.baseDir,
               timeoutMs: b.timeoutMs,
               env: { BUTTPAD_PAD: slot.pad, BUTTPAD_BUTTON: b.id, BUTTPAD_RUN_ID: String(runId), BUTTPAD_LABEL: b.label },
+              key: slot.key,
             },
             hooks,
           );
@@ -816,6 +831,11 @@ export class StateStore {
   private update(slot: Slot, run: LiveRun, u: RunUpdate) {
     if (this.slots.get(slot.key) !== slot) return; // button was removed
     if (u.latched !== undefined) this.setLatched(slot.key, u.latched);
+    // `@state:<pad>/<button>`: another button's chip ("All off" clearing each light's "ON 80%").
+    for (const [key, text] of u.latchedFor ?? []) {
+      if (this.slots.has(key)) this.setLatched(key, text);
+      else this.unknownLatched.note(`${slot.key} #${run.runId}: "@state:${key}" names no button in the config; ignored`);
+    }
     if (u.progress !== undefined || u.status !== undefined) this.dispatch(slot, { type: 'progress', runId: run.runId, progress: u.progress, status: u.status });
   }
 

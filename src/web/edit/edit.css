@@ -1750,6 +1750,50 @@ p.ed-warn-note {
 .ed-notice.is-bad b {
   color: #ff8f92;
 }
+/* A save's warnings about what it didn't change: old news, one quiet line that opens up. */
+.ed-notice.is-quiet {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: 600;
+}
+.ed-notice.is-quiet > svg {
+  width: 18px;
+  height: 18px;
+  margin-top: 9px;
+}
+.ed-notice.is-quiet > .ed-icon {
+  margin: 0 -4px 0 0;
+}
+.ed-elsewhere-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+}
+.ed-notice.is-warn .ed-elsewhere-toggle {
+  opacity: 0.8;
+}
+.ed-elsewhere-toggle svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  transition: rotate 0.15s;
+}
+.ed-elsewhere-toggle[aria-expanded='true'] svg {
+  rotate: 180deg;
+}
+.ed-elsewhere .ed-link {
+  font-weight: 600;
+}
 .ed-notice-actions {
   flex-basis: 100%;
   display: flex;

@@ -1,8 +1,10 @@
 #!/bin/sh
 # Fake smart light.  Usage: light.sh <key|fill|back|all> <on|off|toggle|0-100>
 # Takes 0.2-1.5 s to "reach" the light, remembers its level, reports e.g. "@result Key light ON 80%",
-# and latches the light's state on the button ("@state ON 80%" / "@state OFF"; not for "all": one
-# button's chip can't speak for three lights).
+# and latches each light's state ("ON 80%" / "OFF") on the buttons that show it: on the pressed
+# button with "@state ON 80%", on the light's other buttons with "@state:<pad>/<button> ON 80%" —
+# so "All off" clears the "ON 80%" chip on Key 80%. ("all" keeps no chip of its own: one button's
+# chip can't speak for three lights.)
 . "$(dirname "$0")/_lib.sh"
 
 usage() {
@@ -38,11 +40,29 @@ set_one() {
   fi
 }
 
+# buttons_of NAME: the buttons that show light NAME's state — their ids in
+# examples/buttpad.example.json, on the pressed button's pad ($BUTTPAD_PAD; "lights" by hand)
+buttons_of() {
+  case $1 in
+    key) echo key-80 key-off ;;
+    fill) echo fill ;;
+    back) echo back-30 ;;
+  esac
+}
+
+# latch NAME STATE: show STATE ("ON 80%", "OFF") on light NAME's buttons, except the pressed one
+latch() {
+  for b in $(buttons_of "$1"); do
+    [ "$b" = "${BUTTPAD_BUTTON:-}" ] || echo "@state:${BUTTPAD_PAD:-lights}/$b $2"
+  done
+}
+
 if [ "$name" = all ]; then
   for n in key fill back; do
     echo "@status $(cap "$n") light…"
     latency 100 500
     state=$(set_one "$n" "$cmd")
+    latch "$n" "${state#* light }"
   done
   case $state in *OFF) echo "@result All lights OFF" ;; *) echo "@result All lights ON" ;; esac
 else
@@ -50,5 +70,6 @@ else
   latency 200 1500
   state=$(set_one "$name" "$cmd")
   echo "@state ${state#* light }"
+  latch "$name" "${state#* light }"
   echo "@result $state"
 fi

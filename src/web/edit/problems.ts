@@ -6,6 +6,7 @@
  * the config they're about.
  */
 import { ENV_NAME_MESSAGE, type Button, type Config } from '../../core/config.ts';
+import type { SaveChanges } from './editor.ts';
 import { bound, TIME_FIELDS } from './time.ts';
 
 export interface Problem {
@@ -128,6 +129,21 @@ export function toProblems(errors: string[], cfg?: Pick<Config, 'pads'>): Proble
     }
     return { pad, button: null, field: seg.slice(2).join('.') || null, message };
   });
+}
+
+/**
+ * Is a host warning about `sent` (the config just saved) about what that save changed (`ch`): a
+ * button it changed or added, a group it gave or took a button (a group of one), a `pad/*` pattern
+ * whose buttons it removed? The rest was there before it (an example's broken button on a pad
+ * nobody touched): old news, said quietly.
+ */
+export function aboutChanges(w: Problem, sent: Pick<Config, 'pads'>, ch: SaveChanges): boolean {
+  const b = w.pad !== null && w.button !== null ? sent.pads[w.pad]?.buttons[w.button] : undefined;
+  if (!b) return false;
+  if (ch.buttons.has(b)) return true;
+  if (w.field === 'group') return b.group !== undefined && ch.groups.has(b.group);
+  const p = w.field === 'stops' ? /^“(.*)” matches no other button$/.exec(w.message)?.[1] : undefined;
+  return p !== undefined && [...ch.gone].some((k) => k === p || (p.endsWith('/*') && k.startsWith(p.slice(0, -1))));
 }
 
 /** One line for a list: "Lights › “Fill light” · Command: Can't be empty". */

@@ -758,6 +758,66 @@ button.bp-row:active {
 .bp-cta:disabled {
   opacity: 0.6;
 }
+/* The host turns this address away: the option to start it with, kept whole on its line (an origin
+   never breaks at its hyphen: "https://mason-" / "preview.test"), and a copy button for the operator. */
+.bp-origin {
+  margin-top: 4px;
+}
+.bp-screen .bp-origin p,
+.bp-origin p {
+  margin: 0 0 10px;
+  font: inherit;
+  color: inherit;
+}
+.bp-unit {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  vertical-align: bottom;
+}
+.bp-screen code.bp-cmd,
+.bp-cmd {
+  display: block;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #ffffff14;
+  color: var(--text);
+  font: 700 15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: left;
+}
+.bp-copy {
+  display: block;
+  height: auto;
+  min-height: 48px;
+  padding: 8px 18px;
+  color: var(--text);
+}
+.bp-copy.is-copied {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.bp-copy.is-failed {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+.bp-origin .bp-origin-new {
+  margin: 12px 0 0;
+  font-weight: 900;
+  color: var(--text);
+}
+.bp-banner.is-origin .bp-origin {
+  margin-top: 6px;
+}
+.bp-banner.is-origin .bp-cmd {
+  font-size: 14px;
+  padding: 8px 10px;
+}
+.bp-banner.is-origin .bp-copy {
+  min-height: 44px;
+  color: inherit;
+  border-color: #ffffff33;
+}
 /* Admin: the code another device types (menu → Pair another device). */
 .bp-paircode {
   margin: 4px 6px 10px;

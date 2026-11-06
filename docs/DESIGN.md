@@ -73,29 +73,62 @@ bun src/server/main.ts [--config PATH] [--secrets PATH] [--host H] [--port N]
 
 - Two random tokens (32 bytes, base64url) in the secrets file: `pressToken`, `adminToken`.
   `--rotate-tokens` regenerates both.
-- HTTP: `Authorization: Bearer <token>`. WebSocket: `/ws?token=<token>` (browsers can't set
-  WS headers). Constant-time compare. Role = whichever token matched. Anything else → 401
-  (WS: reject the upgrade with 401).
+- HTTP: `Authorization: Bearer <token>`. Constant-time compare. Role = whichever token matched.
+  Anything else → 401 (WS: reject the upgrade with 401).
+- WebSocket: a browser can't set headers on one, and a URL ends up in logs (a reverse proxy's, a
+  preview pane's: QA found the admin token in one, ~1 line a second while a probe ran), so **a
+  browser never puts a token in a URL**. It trades its token for a one-time **ticket** —
+  `POST /api/ws-ticket` with the Bearer header → 200 `{ticket, expiresInMs}` (`WsTicket`) — and
+  opens `/ws?ticket=<ticket>` at once. A ticket is 32 random bytes (base64url), valid 30 s (the
+  host's monotonic clock), and carries the role of the token that made it. It is good for one
+  request: the first `/ws` request that shows it uses it up, whatever becomes of that request (a
+  403, a 503, a plain request with no upgrade), so a ticket a proxy logged is worthless. An unknown,
+  used or expired one → 401, like a wrong token. At most 64 are out per token: making one more
+  drops that token's oldest (a press-token holder can't crowd out admin tickets). Kept as sha256
+  digests. With `ticket` in the URL, `token` is ignored. `/ws?token=<token>` still works for
+  scripts and other non-browser clients (their URL stays on their machine); browsers use tickets.
 - A WS upgrade whose `Origin` host differs from its `Host` header → 403 (cross-site WebSocket
   hijacking), unless that Origin is one `--allow-origin` names exactly. No `Origin` (curl,
   scripts) is fine. A refusal is logged (at most once per 10 s, with a count) with the Origin and
   Host it saw and the flag that would allow it: `refused a WebSocket from a page at
   https://x.example (the request's Host is 127.0.0.1:8787): not this host's own address. If that is
   ButtPad through your reverse proxy (or a preview pane), start ButtPad with --allow-origin
-  https://x.example`. `POST /api/pair` (no token) takes the same check.
+  https://x.example`. `POST /api/pair` (no token), `POST /api/ws-ticket` and `POST /api/ws-check`
+  take the same check. The 403 says it to the page too (`OriginRefusal`): `{"error": "cross-origin
+  WebSocket refused" (pairing: "cross-origin request refused"), "origin": "https://x.example",
+  "allowOrigin": "https://x.example"}` — `allowOrigin` is the exact `--allow-origin` value that
+  would allow it, absent for an origin that never can be (`null`, malformed).
+- `POST /api/ws-check` (Bearer header, any role, no body) is the client's probe, with nothing in the
+  URL: what a WebSocket upgrade from this page would get now. 204: it would be taken; 401: the
+  token is rejected; 403 (the body above): this page's origin is refused; 503 `{"error": "host
+  full", "reason": "too many connections"}`: no room now for this role or address. It is a POST
+  because a browser sends `Origin` on a same-origin POST but not on a same-origin GET (which would
+  always look allowed); GET → 405.
 - Pairing codes (see Pairing) trade for these tokens; they are not tokens themselves.
 - The browser **never sends commands**: a press names `pad`+`button`; the host looks up the action.
 - Press role never receives `action` fields (see `WireConfig`). Only admin can PUT config or read
   run logs. But every client sees each run's result text (≤200 chars, see Runner): a script must not
   print a secret as its last line.
 - The admin token is a remote-shell credential. Treat it as such in docs and UI.
+- **Known limitation (host security): no Host-header allowlist yet, so DNS rebinding gets past the
+  origin checks.** They compare a page's Origin with the request's own Host header; a page whose
+  DNS name was re-pointed at the host (`http://evil.example:8787` now resolving to 192.168.1.20)
+  sends Origin and Host `evil.example:8787` alike, and to the browser it is same-origin. Such a
+  page gets nothing that needs a token, can't read the tokens paired devices stored (they belong to
+  the host's real origin), and its code guesses are rate limited like anyone's (Pairing). But one
+  that already **knows a valid pairing code** (shown on a screen, read out, printed at startup)
+  could trade it for that code's token over `POST /api/pair`. Planned fix: answer only requests
+  whose Host is one of the host's own addresses or names (its interfaces' IPs, `localhost`, its
+  host name and `<name>.local`) or an `--allow-origin` host, and refuse the rest (421).
 
 ### HTTP API
 
 | Method | Path | Role | Notes |
 |---|---|---|---|
 | GET | `/` | none | the web app (Bun HTML import of `src/web/index.html`), and its hashed chunks at `/chunk-….js`/`.css`: compressed, see Web app |
-| POST | `/api/pair` | none (the code is the credential) | body `{code}` (`"123456"`; spaces, `-` and `.` are ignored) → 200 `{token, role}` (`PairResponse`); 401 `{error: "wrong or expired code"}` for a wrong, used or expired one alike; 429 `{error}` + `Retry-After: N` (seconds) when attempts are coming too fast (Pairing); 400 for a body without `code`; 403 for a page of another origin |
+| POST | `/api/pair` | none (the code is the credential) | body `{code}` (`"123456"`; spaces, `-` and `.` are ignored) → 200 `{token, role}` (`PairResponse`); 401 `{error: "wrong or expired code"}` for a wrong, used or expired one alike; 429 `{error}` + `Retry-After: N` (seconds) when attempts are coming too fast (Pairing); 400 for a body without `code`; 403 `OriginRefusal` for a page of another origin |
+| POST | `/api/ws-ticket` | any | no body → 200 `{ticket, expiresInMs}` (`WsTicket`): a one-time ticket for `/ws?ticket=…` (see Auth); 403 `OriginRefusal` for a page of a refused origin |
+| POST | `/api/ws-check` | any | no body → what `/ws` would answer this page now, without upgrading: 204 it would be taken; 403 `OriginRefusal`; 503 host full (`{error, reason}`); 401. POST, not GET: see Auth |
 | POST | `/api/pair-code` | admin | body `{}` (or none) for an admin code, `{"role": "press"}` for a press one → 200 `{code: "123456", expiresAt (host clock, epoch ms), role}`; 400 for another role |
 | GET | `/api/health` | none | `{ok:true, version, protocol}`; no host name (anyone can ask, even a DNS-rebinding page; `hello` has it) |
 | GET | `/api/config` | any | `{config: WireConfig, rev}` (redacted for press) |
@@ -147,6 +180,11 @@ uncompressed before; 188 KB with gzip, 169 KB with brotli (−66 %); the first `
 
 See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
 
+- Connect to `/ws?ticket=<ticket>` (browsers: a one-time ticket from `POST /api/ws-ticket`, made
+  right before each attempt) or `/ws?token=<token>` (scripts); see Auth. The upgrade answers 403
+  (`OriginRefusal`), 401, 503 (`{"error":"host full","reason":"too many connections"}`) or 426 (a
+  plain request: "expected a WebSocket upgrade"); a browser can't read those, so its client asks
+  `POST /api/ws-check` afterwards.
 - On connect: `hello` (role, redacted-or-full config, rev, all states, serverNow, host info, and
   `latched`: the latched device state per button key, see `@state`).
 - Every state change → `state` to **all** clients; a latched device state change → `latched`
@@ -256,7 +294,13 @@ See `ServerMsg`/`ClientMsg` in `src/core/protocol.ts`.
   progress bar's last line is what was left on screen):
   - `@progress N` (0–100) → `progress`; `@status text` → `status`; `@result text` → result text;
     `@state text` → the button's latched device state ("REC ●", "ON 80%"; ≤ 40 chars), `@state`
-    alone clears it (see State store).
+    alone clears it (see State store). `@state:<pad>/<button> text` does the same for **another**
+    button, any pad (an "All off" clearing the "ON 80%" on each light's own buttons:
+    examples/scripts/light.sh), `@state:<pad>/<button>` alone clears it; no space around the `:`
+    or `/`, ids as in the config (naming the run's own button = plain `@state`). A key that names
+    no button in the config is ignored (logged, at most once per 10 s, with a count). Same
+    sanitizing, cap, persistence and `latched` broadcast as `@state`; at most 256 buttons per
+    update (one per 50 ms).
   - Without `@result`, result text = last non-empty, non-`@` stdout line; on failure with no
     stdout, last non-empty stderr line; spawn error → the error message. Truncate to 200 chars.
   - Result, status and latched text are sanitized: ANSI CSI/OSC/DCS sequences, C0/C1 control
@@ -341,7 +385,9 @@ button its patterns name (`pad/button`, `pad/*`, `*`; never itself), whatever th
 run whose process already exited: too late to cancel, it ends as what it was, but without the
 re-run). Those runs end FAILURE `cancelled` with the text `Stopped by <label>` (sanitized; the id
 when nothing is left of it). Action `none` runs nothing: success at once, text `Stopped N` when it
-stopped N > 0 runs, else `Done`.
+stopped N > 0 buttons (each running one it names, also one an earlier stop is already taking down,
+and each whose queued re-run it dropped; not a run that already exited, its output draining),
+`Nothing was running` when its `stops`/group found nothing to stop, `Done` for one with neither.
 
 `group` (exclusive buttons): a press that will start a run first stops the RUNNING buttons of the
 same group, on any pad, never itself — exactly as if `stops` named them (same kill reason, same
@@ -356,10 +402,12 @@ Kill reasons, distinct in RunRecord.error and the host log (`■ pad/button #7 1
 
 `@state` (latched device state): per button, kept across runs (failed ones too) and restarts; sent
 in `hello.latched` and as `latched` broadcasts; `@state` alone clears it; removing the button
-drops it. A run cut off by a crash (shown INTERRUPTED by the next host, see Run state file) may have
-changed the device after its last word: its button's latched state gets a `? ` prefix (`? BGM ●`,
-at most 42 characters) until the next `@state` of that button replaces it. A run a graceful
-shutdown stopped ended under the host's eyes, as a cancel does: its state stands.
+drops it. Any run may set any button's (`@state:<pad>/<button>`, see Runner), and that button's
+own runs replace it as usual: the last word wins. A run cut off by a crash (shown INTERRUPTED by
+the next host, see Run state file) may have changed the device after its last word: its button's
+latched state gets a `? ` prefix (`? BGM ●`, at most 42 characters) until the next `@state` of that
+button replaces it (only its own button: which others it would have set is not known). A run a
+graceful shutdown stopped ended under the host's eyes, as a cancel does: its state stands.
 
 ### Run state file
 
@@ -373,7 +421,11 @@ again); the host keeps going.
 At startup, once the port is bound (a second host that can't bind never touches the first one's
 runs):
 
-- Run ids continue where they left off, also past runs that were in flight.
+- Run ids continue where they left off (each button's `lastRunId`, and past runs that were in
+  flight), from this file only: the run log's ids are display data (a crafted `runId` there of
+  2^53 − 1 froze them: + 1 changed nothing). A run id above 2^40 (millennia of presses) is
+  malformed and dropped like any other bad value, in either file: a clamp would bring it back down
+  after every restart, and the ids after it would repeat.
 - Each run that was in flight: if its process is still alive and its start-time fingerprint matches
   (Linux: `/proc/PID/stat` starttime plus the boot id; elsewhere `ps -o lstart=`) — the PID may
   have been reused — the host SIGTERMs its process group and SIGKILLs it after 2 s; presses of that
@@ -404,8 +456,8 @@ a state file of another name): the last 20 finished runs per button, each output
 last 2 KB (marked with a leading `…`), `command`/`cwd` to 4 KB; at most 2 MB in all — past that, the
 oldest runs over all buttons are left out of the file. Saved at most once a second (a run ending, a
 config change dropping a button's runs), at shutdown and in the process `exit` handler; written 0600
-by the same safe write. At startup the runs of the buttons still in the config come back, and run
-ids continue past them; a run a graceful shutdown stopped is already there with its output (the
+by the same safe write. At startup the runs of the buttons still in the config come back (their ids
+don't move the counter: that is the state file's); a run a graceful shutdown stopped is already there with its output (the
 next host doesn't add it twice), one cut off by a crash is added as interrupted. Same trust posture
 as the state file — it is display data: read without blocking (a FIFO is refused), at most 4 MB,
 every record checked (its key, ids, times, reason) and capped, errors sanitized, malformed ones

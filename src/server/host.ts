@@ -6,7 +6,17 @@ import type { Server, ServerWebSocket } from 'bun';
 import { hostname as osHostname } from 'node:os';
 import { join } from 'node:path';
 import type { RunState } from '../core/machine.ts';
-import { PROTOCOL_VERSION, type ClientMsg, type ConfigConflict, type HostInfo, type PairResponse, type Role, type ServerMsg } from '../core/protocol.ts';
+import {
+  PROTOCOL_VERSION,
+  type ClientMsg,
+  type ConfigConflict,
+  type HostInfo,
+  type OriginRefusal,
+  type PairResponse,
+  type Role,
+  type ServerMsg,
+  type WsTicket,
+} from '../core/protocol.ts';
 import webApp from '../web/index.html';
 import pkg from '../../package.json';
 import { ConfigStore } from './config-store.ts';
@@ -17,7 +27,7 @@ import { ThrottledLog } from './limits.ts';
 import { Pairing, type PairCode, type PairLimits } from './pairing.ts';
 import { STATE_FILE } from './persist.ts';
 import { sanitizeLog } from './runner.ts';
-import { bearerToken, loadSecrets, makeAuth, type Secrets } from './secrets.ts';
+import { bearerToken, loadSecrets, makeAuth, WsTickets, type Secrets } from './secrets.ts';
 import { starterConfigText } from './starter.ts';
 import { runEndLine, StateStore, type PressReply, type StartLimits } from './state-store.ts';
 import { WebAssets } from './web-assets.ts';
@@ -60,8 +70,15 @@ export interface HostOptions {
   preloadWebApp?: boolean;
   /** Run state that survives restarts. Default: buttpad.state.json next to the config. */
   statePath?: string;
-  /** Override connection, press and pairing-attempt limits (tests). */
-  limits?: { maxClients?: number; adminReserved?: number; clientsPerAddress?: number; presses?: Partial<StartLimits>; pairing?: Partial<PairLimits> };
+  /** Override connection, press, pairing-attempt and WebSocket-ticket limits (tests). */
+  limits?: {
+    maxClients?: number;
+    adminReserved?: number;
+    clientsPerAddress?: number;
+    presses?: Partial<StartLimits>;
+    pairing?: Partial<PairLimits>;
+    tickets?: { ttlMs?: number; perToken?: number };
+  };
   /**
    * Origins (exact `scheme://host:port`, see parseOrigin) whose pages may open a WebSocket and
    * pair, besides the host's own: a reverse proxy in front of it (an HTTPS preview, a tunnel).
@@ -93,6 +110,8 @@ export interface Host {
   readonly info: HostInfo;
   /** One-time pairing codes (POST /api/pair-code makes them, POST /api/pair takes them). */
   readonly pairing: Pairing;
+  /** One-time WebSocket tickets (POST /api/ws-ticket makes them, `/ws?ticket=` takes them). */
+  readonly tickets: WsTickets;
   /** What `allowOrigins` admits, normalized. */
   readonly allowOrigins: readonly string[];
   stop(): Promise<void>;
@@ -254,8 +273,14 @@ const KNOWN_PATHS: [RegExp, string][] = [
   [/^\/api\/config$/, 'GET, PUT'],
   [/^\/api\/press\/[^/]+\/[^/]+$/, 'POST'],
   [/^\/api\/pair(-code)?$/, 'POST'],
+  // POST, not GET: a browser sends Origin on a same-origin POST, never on a same-origin GET.
+  [/^\/api\/ws-(ticket|check)$/, 'POST'],
   [/^\/ws$/, 'GET'],
 ];
+
+/** 403 `error`s of an origin refusal: the WebSocket (and its ticket and probe), pairing. */
+const WS_REFUSED = 'cross-origin WebSocket refused';
+const REQUEST_REFUSED = 'cross-origin request refused';
 
 export async function startHost(opts: HostOptions): Promise<Host> {
   const sink = opts.log ?? ((m: string) => console.log(m));
@@ -278,17 +303,23 @@ export async function startHost(opts: HostOptions): Promise<Host> {
   ];
   const allowed = new Set(allowOrigins);
   const pairing = new Pairing({ log, limits: opts.limits?.pairing });
-  /** Refused for its Origin: what the operator would change to allow it, at most once per 10 s. */
+  const tickets = new WsTickets(opts.limits?.tickets);
+  /**
+   * A request refused for its Origin: logged with what the operator would change to allow it (at
+   * most once per 10 s), and answered 403 with the same to the page (OriginRefusal).
+   */
   const originRefusals = new ThrottledLog(log, () => performance.now());
-  const refuseOrigin = (req: Request, what: string) => {
-    const origin = (req.headers.get('origin') ?? '').slice(0, 200);
-    const exact = parseOrigin(origin);
+  const refuseOrigin = (req: Request, what: string, error: string) => {
+    const raw = req.headers.get('origin') ?? '';
+    const origin = raw.slice(0, 200);
+    const exact = raw.length <= 2048 ? parseOrigin(raw) : undefined;
     originRefusals.note(
       `refused ${what} from a page at ${origin} (the request's Host is ${(req.headers.get('host') ?? 'missing').slice(0, 200)}): not this host's own address. ` +
         (exact
           ? `If that is ButtPad through your reverse proxy (or a preview pane), start ButtPad with --allow-origin ${exact}`
           : 'An origin like that (opaque or malformed) can never be allowed'),
     );
+    return json({ error, origin, ...(exact ? { allowOrigin: exact } : {}) } satisfies OriginRefusal, 403);
   };
 
   const clients = new Set<ServerWebSocket<WsData>>();
@@ -343,6 +374,19 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     };
 
   const refusingClients = new ThrottledLog(log, () => performance.now());
+  /**
+   * Why a WebSocket of `role` from `address` would be refused now (the host is full); undefined
+   * when there's room. Press tokens get handed out freely (QR codes), so they can't take the slots
+   * admins need; and one device (address) can't take them all.
+   */
+  const noRoom = (role: Role, address: string): string | undefined => {
+    const fromAddress = perAddress.get(address) ?? 0;
+    if (clients.size >= maxClients) return `${clients.size} open (max ${maxClients})`;
+    if (role === 'press' && [...clients].filter((c) => c.data.role === 'press').length >= maxClients - adminReserved)
+      return `${maxClients - adminReserved} open with the press token (the last ${adminReserved} are kept for admins)`;
+    if (fromAddress >= clientsPerAddress) return `${fromAddress} open from ${address} (max ${clientsPerAddress} per address)`;
+    return undefined;
+  };
 
   // The web app, compressed (web-assets.ts); built on first use, and again after a failure.
   let assets: Promise<WebAssets> | undefined;
@@ -385,22 +429,18 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     routes: {
       // Dev mode: Bun's own serving (HMR, on-the-fly rebuilds). Otherwise compressed, from the cache.
       '/': opts.development ? webApp : async (req) => (await serveAsset(req, '/')) ?? json({ error: 'not found' }, 404),
+      // Browsers: `?ticket=` (POST /api/ws-ticket), so no token is in a URL a proxy logs; scripts: `?token=`.
       '/ws': (req, srv) => {
-        if (!originAllowed(req, allowed)) {
-          refuseOrigin(req, 'a WebSocket');
-          return json({ error: 'cross-origin WebSocket refused' }, 403);
-        }
-        const role = auth(new URL(req.url).searchParams.get('token'));
+        const q = new URL(req.url).searchParams;
+        const ticket = q.get('ticket');
+        // Used up by the first request that shows it, whatever becomes of that request: a ticket a
+        // proxy logged (or a refused page sent) is worthless.
+        const ticketRole = ticket === null ? undefined : tickets.redeem(ticket);
+        if (!originAllowed(req, allowed)) return refuseOrigin(req, 'a WebSocket', WS_REFUSED);
+        const role = ticket === null ? auth(q.get('token')) : ticketRole;
         if (!role) return unauthorized();
         const address = addressOf(srv, req);
-        const fromAddress = perAddress.get(address) ?? 0;
-        // Press tokens get handed out freely (QR codes), so they can't take the slots admins need;
-        // and one device (address) can't take them all.
-        let full: string | undefined;
-        if (clients.size >= maxClients) full = `${clients.size} open (max ${maxClients})`;
-        else if (role === 'press' && [...clients].filter((c) => c.data.role === 'press').length >= maxClients - adminReserved)
-          full = `${maxClients - adminReserved} open with the press token (the last ${adminReserved} are kept for admins)`;
-        else if (fromAddress >= clientsPerAddress) full = `${fromAddress} open from ${address} (max ${clientsPerAddress} per address)`;
+        const full = noRoom(role, address);
         if (full) {
           refusingClients.note(`refusing WebSocket connections: ${full}`);
           return json(HOST_FULL.connections, 503);
@@ -453,10 +493,7 @@ export async function startHost(opts: HostOptions): Promise<Host> {
       // No token: the code is the credential. See pairing.ts (and DESIGN.md, Pairing) for the limits.
       '/api/pair': {
         POST: async (req) => {
-          if (!originAllowed(req, allowed)) {
-            refuseOrigin(req, 'a pairing request');
-            return json({ error: 'cross-origin request refused' }, 403);
-          }
+          if (!originAllowed(req, allowed)) return refuseOrigin(req, 'a pairing request', REQUEST_REFUSED);
           // No token here: anyone can send this, so it is kept small.
           const body = await readJson(req, { max: 4096 });
           if (!body.ok) return json({ error: body.error }, body.status);
@@ -466,6 +503,26 @@ export async function startHost(opts: HostOptions): Promise<Host> {
           if (r.ok) return json({ token: r.role === 'admin' ? sec.secrets.adminToken : sec.secrets.pressToken, role: r.role } satisfies PairResponse);
           if (r.why === 'limited') return json({ error: 'too many attempts: wait a minute, then try again' }, 429, { 'retry-after': String(r.retryAfterSec) });
           return json({ error: 'wrong or expired code' }, 401);
+        },
+      },
+      // How a browser gets onto /ws without its token in the URL (DESIGN.md, Auth). Origin first,
+      // as /ws checks it: a page the socket would turn away gets no ticket either.
+      '/api/ws-ticket': {
+        POST: (req) => {
+          if (!originAllowed(req, allowed)) return refuseOrigin(req, 'a WebSocket ticket request', WS_REFUSED);
+          const role = auth(bearerToken(req));
+          if (!role) return unauthorized();
+          return json(tickets.mint(role) satisfies WsTicket);
+        },
+      },
+      // The client's probe: what /ws would answer this page now, with the token in a header.
+      '/api/ws-check': {
+        POST: (req) => {
+          if (!originAllowed(req, allowed)) return refuseOrigin(req, 'a WebSocket check', WS_REFUSED);
+          const role = auth(bearerToken(req));
+          if (!role) return unauthorized();
+          if (noRoom(role, addressOf(server, req))) return json(HOST_FULL.connections, 503);
+          return new Response(null, { status: 204, headers: { 'cache-control': 'no-store' } });
         },
       },
       '/api/pair-code': {
@@ -551,6 +608,7 @@ export async function startHost(opts: HostOptions): Promise<Host> {
     created: { config: createdConfig, secrets: sec.created, rotatedTokens: sec.rotated, fixedSecretsMode: sec.fixedMode },
     info,
     pairing,
+    tickets,
     allowOrigins,
     stop: () =>
       (stopping ??= (async () => {

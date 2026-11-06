@@ -1,7 +1,8 @@
 /** Edit mode's error/warning mapping (src/web/edit/problems.ts): index paths and the host's by-id form. */
 import { describe, expect, test } from 'bun:test';
 import { Config, parseConfig } from '../src/core/config.ts';
-import { describe as line, toProblems } from '../src/web/edit/problems.ts';
+import type { SaveChanges } from '../src/web/edit/editor.ts';
+import { aboutChanges, describe as line, toProblems } from '../src/web/edit/problems.ts';
 
 const cfg = Config.parse({
   version: 1,
@@ -66,5 +67,39 @@ describe("the host's by-id form (PUT warnings)", () => {
     ]);
     expect(line(list[0]!, cfg)).toBe('Main › “Lamp” · Command: not found: /srv/bp/lamp.sh');
     expect(line(list[4]!, cfg)).toBe('FX › off · Stops: “fx/nope” matches no other button');
+  });
+});
+
+describe('host warnings about what a save changed, and old news', () => {
+  test('a changed button; a group a button left (or went from); a pattern naming buttons it removed. The rest: old news', () => {
+    const sent = Config.parse({
+      version: 1,
+      pads: [
+        { id: 'main', name: 'Main', cols: 3, rows: 1, buttons: [{ id: 'lamp', x: 0, y: 0, action: { type: 'exec', command: './lamp.sh' } }, { id: 'fan', x: 1, y: 0, action: { type: 'exec', command: './fan.sh' } }] },
+        { id: 'fx', name: 'FX', cols: 3, rows: 1, buttons: [{ id: 'fog', x: 0, y: 0, group: 'smoke', action: { type: 'shell', script: 'fog' } }, { id: 'off', x: 1, y: 0, stops: ['gone/*', 'main/old'], action: { type: 'none' } }] },
+      ],
+    });
+    const [lamp] = sent.pads[0]!.buttons;
+    const [, off] = sent.pads[1]!.buttons;
+    const w = toProblems(
+      [
+        'pad "main" › button "lamp": command not found: /srv/bp/lamp.sh',
+        'pad "main" › button "fan": command not found: /srv/bp/fan.sh',
+        'pad "fx" › button "fog": group "smoke" has no other button: it stops nothing',
+        'pad "fx" › button "off": stops "gone/*" matches no other button',
+        'pad "fx" › button "off": stops "main/old" matches no other button',
+        '…and 3 more',
+      ],
+      sent,
+    );
+    const about = (ch: Partial<SaveChanges>) => w.map((x) => aboutChanges(x, sent, { buttons: new Set(), groups: new Set(), gone: new Set(), ...ch }));
+    expect(about({})).toEqual([false, false, false, false, false, false]);
+    // Lamp changed: news. Fan's program is just as missing, but Fan wasn't touched.
+    expect(about({ buttons: new Set([lamp!]) })).toEqual([true, false, false, false, false, false]);
+    // A button left "smoke" (Fog, untouched, is alone in it now); pad "gone" lost its last button; main/old was renamed.
+    expect(about({ groups: new Set(['smoke']), gone: new Set(['gone/last', 'main/old']) })).toEqual([false, false, true, true, true, false]);
+    expect(about({ gone: new Set(['gone2/x', 'main/older']) })).toEqual([false, false, false, false, false, false]);
+    // A changed button: all that's said about it.
+    expect(about({ buttons: new Set([off!]) })).toEqual([false, false, false, true, true, false]);
   });
 });

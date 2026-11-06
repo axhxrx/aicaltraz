@@ -19,7 +19,8 @@
  * The run log (GET /api/runs) survives too, in a sibling file (buttpad.runs.json, see RunsFile
  * below): the last HISTORY_SIZE finished runs per button, their output tails cut to
  * SAVED_TAIL_BYTES. Same posture: written 0600, read without blocking, everything in it checked
- * and capped (it is display data: nothing in it is ever run or signalled).
+ * and capped (it is display data: nothing in it is ever run or signalled, and its run ids don't
+ * seed the run id counter: the state file's `lastRunId` does).
  */
 import { statSync, type Stats } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -79,13 +80,21 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 /** A button key as the host writes them: `pad/button`, both ids as the config allows them (src/core/config.ts). */
 const isKey = (v: unknown): v is string => typeof v === 'string' && v.length <= 500 && /^[\w-]+\/[\w-]+$/.test(v);
 const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+/**
+ * Run ids go up by one per run of a button: 2^40 is millennia of presses. One above it is malformed
+ * (dropped like any other bad value, not clamped: a clamp would bring it back down after every
+ * restart, and the ids after it would repeat). Near MAX_SAFE_INTEGER, +1 stops changing anything
+ * (2^53 + 1 = 2^53): a crafted file froze the ids there.
+ */
+export const MAX_RUN_ID = 2 ** 40;
+const isRunId = (v: unknown): v is number => isCount(v) && v <= MAX_RUN_ID;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 const isPid = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 1;
 const str = (v: unknown, max: number) => (typeof v === 'string' && v.length <= max ? v : undefined);
 const REASONS: readonly FailureReason[] = ['exit', 'timeout', 'spawn', 'cancelled', 'interrupted'];
 
 function parseLast(v: unknown, clean: (s: string, max: number) => string): LastResult | undefined {
-  if (!isRecord(v) || !isCount(v.runId) || typeof v.ok !== 'boolean' || !isTime(v.endedAt)) return undefined;
+  if (!isRecord(v) || !isRunId(v.runId) || typeof v.ok !== 'boolean' || !isTime(v.endedAt)) return undefined;
   const last: LastResult = { runId: v.runId, ok: v.ok, endedAt: v.endedAt };
   if (REASONS.includes(v.reason as FailureReason)) last.reason = v.reason as FailureReason;
   const text = typeof v.text === 'string' ? clean(v.text, 200) : '';
@@ -95,7 +104,7 @@ function parseLast(v: unknown, clean: (s: string, max: number) => string): LastR
 
 function parseLive(v: unknown): LiveEntry | undefined {
   if (!isRecord(v) || !isKey(v.key)) return undefined;
-  if (!isCount(v.runId) || !isPid(v.pid) || !isPid(v.pgid) || !isTime(v.startedAt)) return undefined;
+  if (!isRunId(v.runId) || !isPid(v.pid) || !isPid(v.pgid) || !isTime(v.startedAt)) return undefined;
   // The host only ever writes its runs' own process groups (detached: pgid = pid), and never itself:
   // anything else would let a hand-edited file aim a kill at some other group.
   if (v.pgid !== v.pid || v.pid === process.pid) return undefined;
@@ -122,10 +131,12 @@ export function parseState(raw: unknown, clean: (s: string, max: number) => stri
   const buttons: Record<string, ButtonMemo> = {};
   if (isRecord(raw.buttons))
     for (const [key, v] of Object.entries(raw.buttons)) {
-      if (!isRecord(v) || !isKey(key) || !isCount(v.lastRunId)) continue;
+      if (!isRecord(v) || !isKey(key) || !isRunId(v.lastRunId)) continue;
       const memo: ButtonMemo = { lastRunId: v.lastRunId };
       const last = parseLast(v.last, clean);
       if (last) memo.last = last;
+      // The run READY's `last` names is one the ids have passed.
+      if (last && last.runId > memo.lastRunId) memo.lastRunId = last.runId;
       const latched = typeof v.latched === 'string' ? clean(v.latched, LATCHED_KEPT_MAX) : '';
       if (latched) memo.latched = latched;
       buttons[key] = memo;
@@ -252,7 +263,7 @@ export function savedRecord(r: RunRecord): RunRecord {
 }
 
 function parseRecord(v: unknown, key: string, clean: (s: string, max: number) => string): RunRecord | undefined {
-  if (!isRecord(v) || !isCount(v.runId) || !isTime(v.startedAt) || !isTime(v.endedAt)) return undefined;
+  if (!isRecord(v) || !isRunId(v.runId) || !isTime(v.startedAt) || !isTime(v.endedAt)) return undefined;
   const [pad = '', button = ''] = key.split('/');
   // Only finished runs are saved; a record names its own button.
   if (v.pad !== pad || v.button !== button) return undefined;

@@ -25,19 +25,23 @@ import { BrokenFileDialog, ConflictDialog, MergeDialog, ran, RestoreDialog, Stop
 import { clearDraft, DraftKeeper, draftScope, loadDraft, unsavedEdits, type StoredDraft } from './draft-store.ts';
 import { Editor, stable } from './editor.ts';
 import { Dialog, typingIn } from './fields.tsx';
-import { Plus, Redo, Sliders, Timer, Undo } from './icons.tsx';
+import { ChevronDown, Plus, Redo, Sliders, Timer, Undo } from './icons.tsx';
 import { merge3, type Conflict, type MergeResult, type Side } from './merge.ts';
 import { PadPanel } from './PadPanel.tsx';
 import type { RunAsk } from './RunLog.tsx';
 import { nameOf, rectOf, refusal, same } from './ops.ts';
-import { buttonFieldErrors, describe, padFieldErrors, toProblems, type Problem } from './problems.ts';
+import { aboutChanges, buttonFieldErrors, describe, padFieldErrors, toProblems, type Problem } from './problems.ts';
 import { secs } from './time.ts';
 
 export interface EditModeProps {
   backend: Backend;
   /** Pad shown when edit mode was entered. */
   padId: string;
-  /** Back to run mode, on the pad that was being edited. */
+  /**
+   * Back to run mode. `padId`: the pad open in the editor as it closed, by its id on the host (just
+   * saved, it may be a moment ahead of the socket's config); none when the host doesn't have it (a
+   * new pad thrown away).
+   */
   onExit(padId?: string): void;
 }
 
@@ -200,14 +204,22 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   const [saving, setSaving] = useState(false);
   const [showProblems, setShowProblems] = useState(false);
   const [hostErrors, setHostErrors] = useState<{ list: Problem[]; draft: Config } | null>(null);
-  /** The host's warnings about the last save (`sent`: what was saved; problems index into it). */
-  const [warnings, setWarnings] = useState<{ list: Problem[]; sent: Config; shown: boolean } | null>(null);
+  /**
+   * The host's warnings about the last save (`sent`: what was saved; problems index into it): `mine`
+   * are about what it changed (the notice), `others` were there before it (one quiet line).
+   */
+  const [warnings, setWarnings] = useState<{ list: Problem[]; mine: Problem[]; others: Problem[]; sent: Config; shown: boolean } | null>(null);
   /** "+N more" opened up: the file's errors, the problems list. */
   const [moreFile, setMoreFile] = useState(false);
   const [moreProblems, setMoreProblems] = useState(false);
   /** Phones: the save's warnings past the first opened up. */
   const [moreWarnings, setMoreWarnings] = useState(false);
-  useEffect(() => setMoreWarnings(false), [warnings?.sent]);
+  /** The warnings about what the save didn't change, opened up. */
+  const [elsewhere, setElsewhere] = useState(false);
+  useEffect(() => {
+    setMoreWarnings(false);
+    setElsewhere(false);
+  }, [warnings?.sent]);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<{ rev: string; again?: boolean; opts: SaveOpts } | null>(null);
   const [merging, setMerging] = useState<Merging | null>(null);
@@ -517,6 +529,8 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     // Exactly what the host will keep (trimmed labels and names): or the host's copy would differ from ours.
     ed.tidy();
     const sent = ed.state.draft;
+    /** The host's config as the draft knows it: what the save changes is told against it. */
+    const before = ed.state.base;
     const r = parseConfig(sent);
     if (!r.ok) {
       setShowProblems(true);
@@ -535,14 +549,18 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setHostErrors(null);
     let ok = false;
     let again = false;
-    let warned = 0;
+    let warned = false;
     try {
       const res = await backend.saveConfig(r.config, ed.state.baseRev, { force: o.force });
       if (res.ok) {
         landed(sent, res.rev);
         ok = true;
-        warned = res.warnings?.length ?? 0;
-        setWarnings(warned ? { list: toProblems(res.warnings!, sent), sent, shown: true } : null);
+        // The host checks the whole config each time: what this save didn't change is old news.
+        const list = toProblems(res.warnings ?? [], sent);
+        const ch = ed.changes(before, sent);
+        const mine = list.filter((w) => aboutChanges(w, sent, ch));
+        warned = mine.length > 0;
+        setWarnings(list.length ? { list, mine, others: list.filter((w) => !mine.includes(w)), sent, shown: true } : null);
       } else if (res.kind === 'invalid') {
         const list = toProblems(res.errors, sent);
         setHostErrors({ list, draft: sent });
@@ -568,8 +586,10 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     }
     if (again) return save({ ...o, retried: true });
     if (ok) {
-      // With warnings, their notice says "Saved, but…": a toast on top of it would only hide it.
+      // With warnings about what it changed, their notice says "Saved, but…": a toast would only hide it
+      // (one still up from an earlier save too).
       if (!warned) say('Saved: live on every device now');
+      else (clearTimeout(toastTimer.current), setToast(null));
       o.then?.();
     }
     return ok;
@@ -639,13 +659,21 @@ function Session({ backend, padId, onExit }: EditModeProps) {
     setPadOpen(true);
     setSheetOpen(true);
   };
-  const exit = () => (dirty ? setModal('leave') : onExit(pad.id));
+  /** The newest onExit: a save's `then` runs after renders that brought another (knowing the saved config). */
+  const exitRef = useRef(onExit);
+  exitRef.current = onExit;
+  /**
+   * Back to run mode, on the pad open in the editor: reported by its id on the host (the draft's may
+   * be mid-edit; after a save, the saved one), none for a pad the host doesn't have (a new one thrown away).
+   */
+  const leave = () => exitRef.current(ed.hostPadId());
+  const exit = () => (dirty ? setModal('leave') : leave());
   const saveAndClose = async () => {
     setModal(null);
     // A save still on its way first.
     while (inFlight.current) await new Promise((r) => setTimeout(r, 100));
-    if (!ed.dirty) return onExit(ed.pad.id);
-    void save({ then: () => onExit(ed.pad.id) });
+    if (!ed.dirty) return leave();
+    void save({ then: leave });
   };
 
   const del = () => {
@@ -840,6 +868,33 @@ function Session({ backend, padId, onExit }: EditModeProps) {
   }[state];
   const overlap = preview?.conflicts.length ?? 0;
 
+  /** A host warning about the last save, as a line: a link to its button (wherever it is in the draft now). */
+  const warningLine = (w: Problem, testid: string) =>
+    w.button !== null ? (
+      <button type="button" class="ed-link" data-testid={testid} onClick={() => goToSent(w)}>
+        {describe(w, warnings!.sent)}
+      </button>
+    ) : (
+      <span data-testid={testid}>{describe(w, warnings!.sent)}</span>
+    );
+  /** The save's warnings about what it didn't change (an example's broken button nobody touched): one quiet line that opens up. */
+  const others = warnings?.others ?? [];
+  const elsewhereLine = others.length > 0 && (
+    <div class="ed-elsewhere">
+      <button type="button" class="ed-elsewhere-toggle" data-testid="warnings-elsewhere" aria-expanded={elsewhere} onClick={() => setElsewhere((x) => !x)}>
+        {others.length} other warning{others.length === 1 ? '' : 's'} elsewhere
+        <ChevronDown />
+      </button>
+      {elsewhere && (
+        <ul data-testid="warnings-elsewhere-list">
+          {others.map((w, i) => (
+            <li key={i}>{warningLine(w, 'warning-elsewhere-item')}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+
   const notices = (
     <>
       {/* Most urgent first: answers to what was just done, then what needs a decision, then the state of things. */}
@@ -921,32 +976,25 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           </span>
         </div>
       )}
-      {warnings?.shown && (
+      {warnings?.shown && warnings.mine.length > 0 && (
         <div class="ed-notice is-warn" role="status" data-testid="notice-warnings">
           <Warn />
           <div class="ed-problems is-all">
             <b>
-              Saved, but the host warns about {warnings.list.length === 1 ? 'this' : `${warnings.list.length} things`}:
+              Saved, but the host warns about {warnings.mine.length === 1 ? 'this' : `${warnings.mine.length} things`}:
             </b>
             <ul>
-              {(wide || moreWarnings ? warnings.list : warnings.list.slice(0, 1)).map((w, i) => (
-                <li key={i}>
-                  {w.button !== null ? (
-                    <button type="button" class="ed-link" data-testid="warning-item" onClick={() => goToSent(w)}>
-                      {describe(w, warnings.sent)}
-                    </button>
-                  ) : (
-                    <span data-testid="warning-item">{describe(w, warnings.sent)}</span>
-                  )}
-                </li>
+              {(wide || moreWarnings ? warnings.mine : warnings.mine.slice(0, 1)).map((w, i) => (
+                <li key={i}>{warningLine(w, 'warning-item')}</li>
               ))}
             </ul>
             {/* Phones: one line, the rest on request (the canvas keeps its room). */}
-            {!wide && !moreWarnings && warnings.list.length > 1 && (
+            {!wide && !moreWarnings && warnings.mine.length > 1 && (
               <button type="button" class="ed-link ed-more" data-testid="warnings-more" onClick={() => setMoreWarnings(true)}>
-                +{warnings.list.length - 1} more
+                +{warnings.mine.length - 1} more
               </button>
             )}
+            {elsewhereLine}
           </div>
           <button type="button" class="ed-icon" aria-label="Dismiss" data-testid="warnings-dismiss" onClick={() => setWarnings({ ...warnings, shown: false })}>
             <Close />
@@ -984,6 +1032,16 @@ function Session({ backend, padId, onExit }: EditModeProps) {
           <span>
             <b>Not connected to the host.</b> Keep editing; save once it's back.
           </span>
+        </div>
+      )}
+      {/* Only old news from the save (its "Saved" toast said the rest): one quiet line, last. */}
+      {warnings?.shown && !warnings.mine.length && warnings.others.length > 0 && (
+        <div class="ed-notice is-quiet" role="status" data-testid="notice-warnings-elsewhere">
+          <Warn />
+          <div class="ed-problems is-all">{elsewhereLine}</div>
+          <button type="button" class="ed-icon" aria-label="Dismiss" data-testid="warnings-dismiss" onClick={() => setWarnings({ ...warnings, shown: false })}>
+            <Close />
+          </button>
         </div>
       )}
     </>
@@ -1187,7 +1245,7 @@ function Session({ backend, padId, onExit }: EditModeProps) {
               <button type="button" class="ed-btn is-primary" data-testid="leave-save" onClick={() => void saveAndClose()}>
                 Save and close
               </button>
-              <button type="button" class="ed-btn is-danger" data-testid="leave-discard" onClick={() => (keeper.forget(), onExit(pad.id))}>
+              <button type="button" class="ed-btn is-danger" data-testid="leave-discard" onClick={() => (keeper.forget(), leave())}>
                 Discard changes
               </button>
               <button type="button" class="ed-btn is-quiet" data-testid="leave-cancel" data-autofocus onClick={() => setModal(null)}>

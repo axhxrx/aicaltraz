@@ -1,6 +1,7 @@
 /**
- * Wire protocol between a ButtPad host and its clients. WebSocket at /ws?token=…, JSON text frames.
- * HTTP endpoints are documented in docs/DESIGN.md.
+ * Wire protocol between a ButtPad host and its clients. WebSocket at /ws?ticket=… (browsers: a
+ * one-time ticket, see WsTicket) or /ws?token=… (scripts), JSON text frames. HTTP endpoints are
+ * documented in docs/DESIGN.md.
  */
 import type { Action, Button, Config, Pad } from './config.ts';
 import type { FailureReason, RunState } from './machine.ts';
@@ -85,6 +86,29 @@ export interface PairRequest {
 export interface PairResponse {
   token: string;
   role: Role;
+}
+
+/**
+ * POST /api/ws-ticket (any role, Bearer header, no body) → 200: a one-time ticket for
+ * `/ws?ticket=…`, so a browser never puts its long-lived token in a URL (reverse proxies and preview
+ * panes log URLs). Used up by the first /ws request that shows it; valid `expiresInMs` (30 s); it
+ * carries the role of the token that made it.
+ */
+export interface WsTicket {
+  ticket: string;
+  expiresInMs: number;
+}
+
+/**
+ * 403 body when the host turns a page's origin away: the WebSocket upgrade, POST /api/pair,
+ * POST /api/ws-ticket and POST /api/ws-check (the client's probe: 204 when an upgrade would be taken).
+ */
+export interface OriginRefusal {
+  error: string;
+  /** The Origin header the host saw (at most 200 characters). */
+  origin: string;
+  /** The exact `--allow-origin` value that would let it in; absent when none can (an opaque or malformed origin). */
+  allowOrigin?: string;
 }
 
 /** PUT /api/config (admin). */

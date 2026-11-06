@@ -405,7 +405,7 @@ export function ButtonFace({ vm, now, class: cls, style, onDismiss, show, ...res
 
   // Show mode: the hue dimmed (a dark house), with an ink that keeps its contrast on it.
   const pal = show ? showPalette(vm.color) : null;
-  const colors: Record<string, string> = pal ? { '--bg': pal.bg, '--ink': pal.ink, '--edge': pal.edge } : { '--bg': vm.color, '--ink': inkFor(vm.color) };
+  const colors: Record<string, string> = pal ? { '--bg': pal.bg, '--ink': pal.ink, '--edge': pal.edge, '--chip': pal.chip } : { '--bg': vm.color, '--ink': inkFor(vm.color) };
   // Offline: the last-known state's layers stay, under the OFFLINE look.
   const u = v === 'offline' ? vm.under : v;
   const badge = vm.flash ? badgeOf(vm.flash.kind, vm) : undefined;

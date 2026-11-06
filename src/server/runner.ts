@@ -7,6 +7,8 @@
  *   @status text  status line shown while running
  *   @result text  result text shown after the run
  *   @state text   the device's latched state ("REC ●", "ON 80%"), kept across runs; `@state` alone clears it
+ *   @state:<pad>/<button> text   the same for another button (an "All off" clearing each light's
+ *                 "ON 80%"); `@state:<pad>/<button>` alone clears it
  *
  * Text that reaches clients (status, result, latched state) is sanitized: ANSI escape sequences,
  * control characters and bidi overrides/isolates are removed. So is the host log (sanitizeLog).
@@ -29,6 +31,8 @@ export const DRAIN_MS = 250;
 /** Min interval between progress/status updates (they become WebSocket broadcasts). */
 const UPDATE_INTERVAL_MS = 50;
 const MAX_LINE = 16 * 1024;
+/** `@state:<pad>/<button>` lines: at most this many buttons per update (one per UPDATE_INTERVAL_MS); a flood of others is dropped. */
+const MAX_LATCHED_KEYS = 256;
 /** Longer timer delays overflow and fire immediately. */
 export const MAX_DELAY_MS = 2 ** 31 - 1;
 
@@ -43,6 +47,8 @@ export interface RunSpec {
   /** Extra env vars (BUTTPAD_*), applied over host env + action env. */
   env?: Record<string, string>;
   killGraceMs?: number;
+  /** The button's own key (`pad/button`): `@state:<its own key>` is its plain `@state`. */
+  key?: string;
 }
 
 export interface RunUpdate {
@@ -50,6 +56,11 @@ export interface RunUpdate {
   status?: string;
   /** `@state text`: the device's latched state; null when `@state` cleared it. */
   latched?: string | null;
+  /**
+   * `@state:<pad>/<button> text`: other buttons' latched states, by key, in the order each was last
+   * set; null = cleared. Unchecked: the key may name no button (the state store decides).
+   */
+  latchedFor?: Map<string, string | null>;
 }
 
 export interface RunOutcome {
@@ -210,11 +221,17 @@ export function clip(s: string, max = RESULT_MAX): string {
   return out.trimEnd() + '…';
 }
 
-export type Directive = { kind: 'progress'; value: number } | { kind: 'status' | 'result' | 'state'; text: string };
+/** `key`: `@state:<pad>/<button>`, another button's latched state. */
+export type Directive = { kind: 'progress'; value: number } | { kind: 'status' | 'result'; text: string } | { kind: 'state'; text: string; key?: string };
+
+/** `@state:<pad>/<button> text`: ids as the config allows them (src/core/config.ts), ≤ 200 characters each as a press names them. */
+const STATE_OF = /^@state:([\w-]{1,200}\/[\w-]{1,200})(?:[ \t]+(.*))?$/;
 
 /** Parse one stdout line; `null` for a plain line, `undefined` for an unknown/invalid `@` line. */
 export function parseDirective(line: string): Directive | null | undefined {
   if (!line.startsWith('@')) return null;
+  const of = STATE_OF.exec(line);
+  if (of) return { kind: 'state', key: of[1]!, text: (of[2] ?? '').trim() };
   const m = /^@(progress|status|result|state)(?:[ \t]+(.*))?$/.exec(line);
   if (!m) return undefined;
   const arg = (m[2] ?? '').trim();
@@ -383,8 +400,15 @@ export function startRun(spec: RunSpec, hooks: RunHooks = {}): RunHandle {
       if (line.trim()) lastOut = line;
     } else if (d?.kind === 'progress') pending = { ...pending, progress: d.value };
     else if (d?.kind === 'status') pending = { ...pending, status: clip(d.text) };
-    else if (d?.kind === 'state') pending = { ...pending, latched: clip(d.text, LATCHED_MAX) || null };
-    else if (d?.kind === 'result') result = d.text;
+    else if (d?.kind === 'state') {
+      const text = clip(d.text, LATCHED_MAX) || null;
+      if (d.key === undefined || d.key === spec.key) pending = { ...pending, latched: text };
+      else {
+        // In the order each was last set (re-inserted); a flood of keys can't grow it without bound.
+        const others = ((pending ??= {}).latchedFor ??= new Map());
+        if (others.delete(d.key) || others.size < MAX_LATCHED_KEYS) others.set(d.key, text);
+      }
+    } else if (d?.kind === 'result') result = d.text;
   });
   const errLines = new LineReader((raw) => {
     if (finished) return;

@@ -55,6 +55,8 @@ export interface Snapshot {
    * told about with --allow-origin): a reverse proxy, tunnel or preview pane in front of it.
    */
   originRefused: boolean;
+  /** With `originRefused`: the exact `--allow-origin` value the host's 403 names (`OriginRefusal`); null: it didn't say. */
+  allowOrigin: string | null;
   /** While not online: local (wall()) time of the last word from the host, if it ever spoke. */
   lastSeen: number | null;
   /**
@@ -179,6 +181,7 @@ export const emptySnapshot = (over: Partial<Snapshot> = {}): Snapshot => ({
   latched: {},
   hostFull: false,
   originRefused: false,
+  allowOrigin: null,
   lastSeen: null,
   syncing: false,
   ...over,

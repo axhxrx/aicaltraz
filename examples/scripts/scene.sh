@@ -17,7 +17,9 @@ i=0
 while [ $# -ge 2 ]; do
   i=$((i + 1))
   echo "@status $(cap "$1") light → $2 ($i/$total)"
-  "$(dirname "$0")/light.sh" "$1" "$2" > /dev/null || exit 1
+  out=$("$(dirname "$0")/light.sh" "$1" "$2") || exit 1
+  # The light's own buttons show its new state (light.sh's "@state:" lines); the scene keeps no chip.
+  printf '%s\n' "$out" | grep '^@state:' || true
   echo "@progress $((i * 100 / total))"
   shift 2
 done
