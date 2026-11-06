@@ -24,9 +24,13 @@ bun src/server/main.ts --help    # --config, --port, --host, --rotate-tokens, --
 
 It prints a **press URL** (and a QR code) and an **admin URL**. Open one on your phone (same
 network; the host's firewall must allow the port, 8787 by default). The token in the URL pairs the
-device and is then stripped from the address bar. **The QR code pairs a press-only device**: to edit
-pads from a phone, open the admin URL on it instead (it's printed below the press URL — send it to
-yourself, it's a password).
+device and is then stripped from the address bar. **The QR code pairs a press-only device.**
+
+To make a phone an admin without typing a token, use a **pairing code**: the host prints one at
+startup ("Pair a phone as admin: … enter 724 490, valid 10 min"), and an admin device can mint more
+(menu → *Pair another device…*). On the phone, open the page and tap **Pair with a code**. Codes are
+6 digits, single use, expire after 10 minutes and are rate limited; `--no-pair-code` turns the
+startup code off.
 
 - `bun start` uses `./buttpad.config.json`, writing a harmless starter config if it's missing.
 - No host handy? Open any host's page with `?demo` — an in-browser simulation of the whole thing.
@@ -114,6 +118,8 @@ Other integrations: `curl -X POST -H "Authorization: Bearer $TOKEN" http://host:
   cooldown, more drift tolerance. Recommended whenever you wear gloves.
 - `?lock&pad=lights` for a mounted tablet: no tabs, menu only on long-press; if that pad is renamed
   or deleted it says so instead of becoming another pad's remote.
+- Menu → **Show mode** for dark rooms: dim faces, results as a colored edge + glyph instead of a
+  full-screen flood, no bright flashes.
 
 ## Recipes
 
@@ -146,6 +152,18 @@ WantedBy=multi-user.target
 
 `sudo systemctl enable --now buttpad`; `journalctl -u buttpad` shows the pairing URLs and the run
 log. Or `bun run compile` and run the single `dist/buttpad` binary anywhere.
+
+## Behind a proxy, tunnel or preview pane
+
+ButtPad refuses WebSocket connections from pages of another origin. When the page is served
+through a reverse proxy (a tunnel, a TLS terminator, the Claude app's preview pane), start the host
+with that origin allowed — the page and the host log both print the exact flag when they refuse:
+
+```sh
+bun src/server/main.ts --allow-origin https://your-proxy.example   # repeatable; or BUTTPAD_ALLOW_ORIGINS
+```
+
+Then pair with a code (restarting the host prints a new one).
 
 ## Keep-awake
 
