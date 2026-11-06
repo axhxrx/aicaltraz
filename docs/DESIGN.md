@@ -496,15 +496,15 @@ is logged once and the log starts empty.
   digits." Pair stays disabled until all 6 are there (Enter before that says "A code has 6 digits
   (4 so far).") (QA: after an error a tap put the caret mid-code, and a new code typed there showed
   as "640 1696" of "640169616"; Pair took it and a try was burned). `POST /api/pair {code}` →
-  `{token, role}`, the token then used as above. A code that fails is **selected** (focused once
-  the field, read-only while the host answers, takes focus again), and the next edit starts a new
+  `{token, role}`, the token then used as above. A code that fails is **selected** (as soon as the
+  field, read-only while the host answers, can take focus again), and the next edit starts a new
   code wherever the caret is — a tap on the field moves it into the old digits (iOS), and the
   field selects it all again once the tap is done: what is typed or pasted replaces the code, a
   delete clears it. 401 → "That code didn't work: mistyped, used already, or expired"; 429 → "Too
   many tries", a countdown from `Retry-After`, Pair disabled meanwhile; 403 → the address advice
   below. An admin's menu has **Pair another device…**: `POST /api/pair-code`, the code shown big
   ("123 456") with the time it runs out (whole seconds left, host clock via the offset: a fresh
-  10-minute code says 9:59, not 10:01) and the `…/#pair` address to type it at.
+  10-minute code says 10:00 or 9:59, never 10:01) and the `…/#pair` address to type it at.
 - **The host turns this address away** (a 403 `OriginRefusal` from `POST /api/pair`,
   `POST /api/ws-ticket` or `POST /api/ws-check`: the page comes through a reverse proxy, tunnel or
   preview pane the host wasn't told about), said the same on the code entry, the connecting screen
@@ -520,17 +520,23 @@ is logged once and the log starts empty.
   is gone with the restart); a paired device instead says it stays paired and connects once the
   host lets it.
 - **The token never goes in a URL** (a reverse proxy's or preview pane's log kept the admin token,
-  a line a second): every connection attempt first trades it for a one-time ticket,
-  `POST /api/ws-ticket` with the Bearer header → `{ticket, expiresInMs}`, and opens
-  `/ws?ticket=<ticket>` (`wss:` under https) at once; each reconnect gets a fresh one, a ticket is
-  never reused. Its 401 → token rejected (stop, as below); 403 → the address advice above (and
-  keep trying); no answer, or anything else → a failed attempt like a socket that failed. HTTP
-  carries the token only in `Authorization` headers; the `#token=` of a pairing link is a fragment,
-  which never leaves the browser.
+  a line a second): every connection attempt opens `/ws?ticket=<ticket>` (`wss:` under https) with
+  a one-time ticket of its own, traded for the token by `POST /api/ws-ticket` (Bearer header) →
+  `{ticket, expiresInMs}`; a ticket is never reused, whatever became of its attempt. The next
+  attempt's ticket is fetched while the socket is up (a **spare**: after the hello, and again when it
+  is 10 s from expiring, on the next frame, page visible), so a reconnect opens its socket at once
+  on a new connection, as before tickets: a ticket fetched only then can go out on a pooled HTTP
+  connection that died with the socket (a NAT forgetting it while the phone slept) and hang. With
+  no spare (a stretch hidden, a second attempt in a row) the request gets the quick probe's wait
+  (1.5 s on a fast link), doubled after each one in a row that didn't answer in time; given up
+  on, its connection closes and the next attempt gets another. Its 401 → token rejected (stop, as
+  below); 403 → the address advice above (and keep trying); no answer, or anything else → a failed
+  attempt like a socket that failed. HTTP carries the token only in `Authorization` headers; the
+  `#token=` of a pairing link is a fragment, which never leaves the browser.
 - WS with auto-reconnect (backoff 0, 250 ms → 5 s). The backoff starts over only after a
   connection held 10 s: a host or proxy that drops every socket right after `hello` is not
-  hammered. A socket waits 5 s for its `hello` (from when it is made; its ticket request gets as
-  long), then 10, 20… (≤ 60 s) after each one that timed out: a big config over a slow link gets
+  hammered. A socket waits 5 s for its `hello` (from when it is made; a ticket request has its own
+  wait, above), then 10, 20… (≤ 60 s) after each one that timed out: a big config over a slow link gets
   through. Reconnect gets a fresh `hello`; state is authoritative from the host, so a reload or
   flaky Wi-Fi never loses track of a running action. Offline, a touch on a button tries to connect
   at once (not at the next retry, seconds away), giving up on a ticket request or socket that has
@@ -549,7 +555,8 @@ is logged once and the log starts empty.
   2–6 s, the probe 4p within 3–8 s, the doubtful probe 3p within 1.5–5 s, "no ack yet" 2p within
   0.6–3 s. Until there are 3, p is the last ticket request's round trip as the network stack timed
   it (Resource Timing, `responseStart − requestStart`: no connecting, unaffected by the page
-  stalling; none where the browser has no such entry). QA, a link 2 s each way: a fresh socket's
+  stalling; none where the browser has no such entry), before the first one the page's own
+  request's (navigation timing: it came over the same link). QA, a link 2 s each way: a fresh socket's
   first press got the fast-link 0.6 + 1.5 s for a frame and the link was dropped, press after press,
   so no round trip was ever measured. Slower to say NO RESPONSE on a slow link, never faster than
   before, never past 6 s; and never a success that didn't happen (only the host's answer or state

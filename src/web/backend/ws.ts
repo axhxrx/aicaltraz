@@ -104,6 +104,11 @@ const ONE_WAY_GUESS_MAX = 1000;
 const ONE_WAY_MAX = 4000;
 /** Resource Timing keeps a few hundred entries, then drops new ones: the ticket's must get in. */
 const RT_ENTRIES_MAX = 150;
+/** A spare ticket is used only until this long before it expires on the host (and renewed then); a failed try at one is retried after SPARE_RETRY. */
+const SPARE_MARGIN = 10_000;
+const SPARE_RETRY = 5000;
+/** A ticket the host gave no lifetime for lives this long (the host's WS_TICKET_TTL_MS). */
+const TICKET_TTL = 30_000;
 /** Back from at least this long in the background → probe. */
 const HIDDEN_DOUBT_AFTER = 1000;
 /** …this long → syncing (the screen may be minutes old). */
@@ -163,6 +168,14 @@ interface Conn {
 
 type Cached = { config: WireConfig; rev: string };
 
+/**
+ * A request's round trip as the network stack timed it (Resource Timing): from sending it to the
+ * first byte of the answer — no connecting, no page stalls in it. Undefined where there is none.
+ */
+function requestRtt(e: PerformanceResourceTiming | undefined): number | undefined {
+  return e && e.requestStart > 0 && e.responseStart >= e.requestStart ? e.responseStart - e.requestStart : undefined;
+}
+
 /** The cache is for showing the layout while offline; never keep actions (admin) on disk. */
 const redact = (c: WireConfig): WireConfig => ({ ...c, pads: c.pads.map((p) => ({ ...p, buttons: p.buttons.map(({ action: _, ...b }) => b) })) });
 
@@ -189,6 +202,18 @@ export class WsBackend implements Backend {
    */
   private linkHint: number | null = null;
   /**
+   * A one-time ticket fetched while a socket was up, for the next attempt: a reconnect then opens
+   * its socket at once, on a new connection, as before tickets. A ticket fetched only then can go
+   * out on a pooled HTTP connection that died with the socket (a NAT forgetting it while the phone
+   * slept), and hang. `until`: mono() it is used by.
+   */
+  private spare: { ticket: string; until: number } | null = null;
+  /** The spare's request on its way; mono() before which no other starts. */
+  private spareCtl: AbortController | null = null;
+  private spareNext = 0;
+  /** Ticket requests in a row that got no answer in time: the next one waits longer (a slow link, not a dead connection). */
+  private ticketMisses = 0;
+  /**
    * Bumped whenever the page may not have run for a while (hidden, frozen, asleep): a "round trip"
    * that spans one measures the page, not the link.
    */
@@ -203,6 +228,8 @@ export class WsBackend implements Backend {
   ) {
     const cached = lsJSON<Cached>(KEYS.configCache);
     if (cached?.config?.pads) this.patch({ config: cached.config, rev: cached.rev });
+    // Until a ticket request has timed the link: the page's own request did (it came over the same link).
+    this.linkHint = requestRtt(performance.getEntriesByType?.('navigation')?.[0] as PerformanceResourceTiming | undefined) ?? null;
     const on = (target: EventTarget, type: string, fn: (e: Event) => void) => {
       target.addEventListener(type, fn);
       this.offs.push(() => target.removeEventListener(type, fn));
@@ -315,7 +342,7 @@ export class WsBackend implements Backend {
     this.snapshot.set((s) => ({ ...s, ...p }));
   }
 
-  /** How long the ticket request, and then the socket for its hello, may take: 5 s, doubled after each that didn't make it (≤ 60 s). */
+  /** How long an attempt, and then its socket, may take to say hello: 5 s, doubled after each that didn't make it (≤ 60 s). */
   private helloWait(): number {
     return Math.min(HELLO_TIMEOUT_MAX, HELLO_TIMEOUT * 2 ** this.helloMisses);
   }
@@ -330,9 +357,9 @@ export class WsBackend implements Backend {
   }
 
   /**
-   * A connection attempt: a fresh one-time ticket, then the socket. The ticket request gets the
-   * hello's wait too (one on a dead link hangs like a socket does); the socket gets its own, from
-   * when it is made, as before tickets.
+   * A connection attempt: a one-time ticket of its own, then the socket. The hello's wait bounds
+   * the whole attempt (a ticket request has a shorter wait of its own: openWithTicket); the socket
+   * gets it afresh from when it is made, as before tickets.
    */
   private connect() {
     if (this.disposed || this.snapshot.get().status === 'unauthorized') return;
@@ -362,21 +389,35 @@ export class WsBackend implements Backend {
     void this.openWithTicket(c);
   }
 
-  /** POST /api/ws-ticket (the token in its header), then `/ws?ticket=…`: the token itself never goes in a URL. */
+  /**
+   * A ticket (the spare, or POST /api/ws-ticket with the token in its header), then
+   * `/ws?ticket=…`: the token itself never goes in a URL. A ticket request gets the quick probe's
+   * wait (1.5 s on a fast link), doubled after each one in a row that didn't answer in time: given
+   * up on, its connection is closed, and the next attempt gets another.
+   */
   private async openWithTicket(c: Conn) {
     const live = () => this.conn === c && !this.disposed;
-    let ticket: string | undefined;
-    try {
-      const r = await this.http('POST', '/api/ws-ticket', undefined, c.ticket.signal);
-      if (!live()) return;
-      if (r.status === 401) return this.rejected();
-      if (r.status === 403) {
-        // This page's origin is turned away (a proxy the host wasn't told about): say so, keep trying.
-        const allowOrigin = (await allowOriginOf(r)) ?? null;
-        if (live() && this.snapshot.get().status !== 'online') this.patch({ originRefused: true, allowOrigin, hostFull: false });
-      } else if (r.ok) ticket = ((await r.json()) as Partial<WsTicket> | null)?.ticket;
-    } catch {
-      /* unreachable, or given up on: below */
+    let ticket: string | undefined = this.takeSpare() ?? undefined;
+    if (!ticket) {
+      const timer = setTimeout(() => {
+        this.ticketMisses++;
+        c.ticket.abort();
+      }, Math.min(HELLO_TIMEOUT_MAX, this.probeTimeout(true) * 2 ** this.ticketMisses));
+      try {
+        const r = await this.http('POST', '/api/ws-ticket', undefined, c.ticket.signal);
+        if (!live()) return;
+        if (r.status === 401) return this.rejected();
+        if (r.status === 403) {
+          // This page's origin is turned away (a proxy the host wasn't told about): say so, keep trying.
+          const allowOrigin = (await allowOriginOf(r)) ?? null;
+          if (live() && this.snapshot.get().status !== 'online') this.patch({ originRefused: true, allowOrigin, hostFull: false });
+        } else if (r.ok) ticket = ((await r.json()) as Partial<WsTicket> | null)?.ticket;
+        if (ticket) this.ticketMisses = 0;
+      } catch {
+        /* unreachable, or given up on: below */
+      } finally {
+        clearTimeout(timer);
+      }
     }
     if (!live()) return;
     if (typeof ticket !== 'string' || !ticket) return this.lost(c);
@@ -395,6 +436,43 @@ export class WsBackend implements Backend {
     };
     ws.onopen = () => void (c.upAt = mono());
     ws.onclose = () => this.lost(c);
+  }
+
+  /** The spare ticket, if it is still good (it is used once either way). */
+  private takeSpare(): string | null {
+    const s = this.spare;
+    this.spare = null;
+    return s && mono() < s.until ? s.ticket : null;
+  }
+
+  /**
+   * While socket `c` is up (a frame just came) and the page visible: a spare ticket for the next
+   * attempt, renewed when it is about to expire (frames come every few seconds at least: the idle
+   * probe). Not while one is on its way, nor sooner than SPARE_RETRY after the last try.
+   */
+  private keepSpare(c: Conn) {
+    if (this.disposed || this.spareCtl || mono() < this.spareNext || (this.spare && mono() < this.spare.until)) return;
+    if (this.conn !== c || !c.greeted || document.visibilityState !== 'visible') return;
+    void this.fetchSpare();
+  }
+
+  private async fetchSpare() {
+    const ctl = new AbortController();
+    this.spareCtl = ctl;
+    this.spareNext = mono() + SPARE_RETRY;
+    const timer = setTimeout(() => ctl.abort(), GET_TIMEOUT);
+    try {
+      const r = await this.http('POST', '/api/ws-ticket', undefined, ctl.signal);
+      const j = r.ok ? ((await r.json()) as Partial<WsTicket> | null) : null;
+      if (typeof j?.ticket !== 'string' || !j.ticket || this.disposed) return;
+      const ttl = typeof j.expiresInMs === 'number' && j.expiresInMs > SPARE_MARGIN ? j.expiresInMs : TICKET_TTL;
+      this.spare = { ticket: j.ticket, until: mono() + ttl - SPARE_MARGIN };
+    } catch {
+      /* the socket's own checks say what the link is like */
+    } finally {
+      clearTimeout(timer);
+      if (this.spareCtl === ctl) this.spareCtl = null;
+    }
   }
 
   /** The host turned the token down (401): stop, and say so. */
@@ -419,17 +497,20 @@ export class WsBackend implements Backend {
     return Math.min(ONE_WAY_MAX, Math.max(quarter, Math.min(opening / 2, c.ticketRtt / 2)));
   }
 
-  /** Conn.ticketRtt from Resource Timing (in by the hello: the socket took a round trip at least); undefined where the browser has none. */
-  private ticketTiming(c: Conn): number | undefined {
+  /**
+   * Conn.ticketRtt from Resource Timing: the last ticket request of the past minute, this socket's
+   * or the spare it used (an entry is in by the hello: the socket took a round trip at least);
+   * undefined where the browser has none.
+   */
+  private ticketTiming(): number | undefined {
     try {
       const all = performance.getEntriesByName(`${this.origin}/api/ws-ticket`, 'resource') as PerformanceResourceTiming[];
-      const e = all.filter((x) => x.startTime >= c.startedAt - 1).at(-1);
+      const e = all.filter((x) => x.startTime >= mono() - 60_000 && x.responseStart > 0).at(-1);
       if (performance.getEntriesByType('resource').length > RT_ENTRIES_MAX) performance.clearResourceTimings();
-      if (e && e.requestStart > 0 && e.responseStart >= e.requestStart) return e.responseStart - e.requestStart;
+      return requestRtt(e);
     } catch {
-      /* no Resource Timing */
+      return undefined;
     }
-    return undefined;
   }
 
   private onFrame(c: Conn, data: unknown) {
@@ -452,10 +533,12 @@ export class WsBackend implements Backend {
       this.everGreeted = true;
       this.helloMisses = 0;
       clearTimeout(c.helloTimer);
-      c.ticketRtt = this.ticketTiming(c);
+      c.ticketRtt = this.ticketTiming();
       if (c.ticketRtt !== undefined) this.linkHint = c.ticketRtt;
     }
     this.onMessage(c, msg);
+    // The next attempt's ticket, while the link is up.
+    if (c.greeted) this.keepSpare(c);
   }
 
   /** Visible and quiet for IDLE_PROBE → probe. Hidden pages don't (coming back does). */
@@ -809,6 +892,8 @@ export class WsBackend implements Backend {
     this.disposed = true;
     clearTimeout(this.retryTimer);
     clearInterval(this.beatTimer);
+    this.spareCtl?.abort();
+    this.spare = null;
     for (const off of this.offs) off();
     if (this.conn) this.drop(this.conn);
   }

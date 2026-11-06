@@ -470,6 +470,18 @@ test('the demo as the host: a Nothing button says "Stopped N", "Nothing was runn
   await expect(page.getByTestId('latched-fill')).toHaveCount(0);
 });
 
+// ---- 10. a fresh code's countdown ------------------------------------------------------------------
+
+test('"Pair another device…": a fresh 10-minute code counts down from 10:00 / 9:59 in whole seconds left (QA: "Expires in 10:01")', async ({ page }) => {
+  await page.route('**/api/pair-code', (route) => route.fulfill({ json: { code: '640169', expiresAt: Date.now() + 10 * 60_000, role: 'admin' } }));
+  await page.goto(`${host.url}/?pad=main#token=${host.adminToken}`);
+  await expect(conn(page)).toHaveAttribute('data-status', 'online');
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-pair-device').click();
+  await expect(page.getByTestId('pair-device-code')).toHaveText('640 169');
+  await expect(page.getByTestId('pair-device-left')).toHaveText(/^Expires in (10:00|9:5\d)$/);
+});
+
 // ---- 6. leaving the editor -----------------------------------------------------------------------
 
 test('leaving the editor lands on the pad it had open: a pad built and saved there (QA: built "Stage", landed on "Test"), even when the socket brings it a moment after the save', async ({ page }) => {

@@ -352,7 +352,7 @@ export function PairCodeScreen(p: { initial?: string; paired: boolean; onPaired(
           readOnly={busy}
           aria-describedby="bp-code-hint"
         />
-        {short && !err && (
+        {short && (
           <div class="bp-paste-err" role="alert" id="bp-code-hint" data-testid="code-hint">
             A code has {CODE_LEN} digits{digits.length && digits.length < CODE_LEN ? ` (${digits.length} so far)` : ''}.
           </div>
