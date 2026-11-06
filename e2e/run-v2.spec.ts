@@ -180,7 +180,7 @@ test('READY shows how the last run ended; a run the host lost (restart) is amber
   await expectVisual(page, 'tap', 'success');
   await expectVisual(page, 'tap', 'ready', 3000);
   // (With its short result text where that fits: "✓ tapped · 3 s ago".)
-  await expect(page.getByTestId('last-tap')).toContainText(/✓(tapped · )?\s*\d+ s ago/);
+  await expect(page.getByTestId('last-tap')).toContainText(/✓\s*(tapped · )?\d+ s ago/);
 
   await f.tap('slow');
   await expectVisual(page, 'slow', 'running');

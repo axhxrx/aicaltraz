@@ -161,7 +161,7 @@ function TopBand({ vm, onDismiss }: { vm: ButtonVM; onDismiss?: () => void }) {
       data-testid={`last-${vm.id}`}
       style={lastText ? { '--need': String(lastNeedEm(lastText, vm.last.ago, vm.latched)) } : undefined}
     >
-      <i>{LAST_GLYPH[vm.last.tone]}</i>
+      <i>{LAST_GLYPH[vm.last.tone]}</i>{' '}
       <span class="bp-chip-text">
         {lastText && (
           <span class="bp-last-text" data-testid={`last-text-${vm.id}`}>

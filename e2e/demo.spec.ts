@@ -256,6 +256,15 @@ test('offline: grey + dashed, presses only shake; recovers on reconnect', async 
 });
 
 test('a run keeps going while offline: its last-known state stays visible, and shows again after reconnecting', async ({ page }) => {
+  // A run long enough to still be going after the checks below, however busy this machine is.
+  await page.evaluate(async () => {
+    const b = window.__buttpad!.backend;
+    const s = b.snapshot.get();
+    const cfg = structuredClone(s.config) as { pads: { buttons: { id: string; action?: { script?: string } }[] }[] };
+    cfg.pads[0]!.buttons.find((x) => x.id === 'slow')!.action!.script = "echo '@status busy'; sleep 10; echo 'slow done'";
+    const r = await b.saveConfig(cfg as never, s.rev!);
+    if (!r.ok) throw new Error(JSON.stringify(r));
+  });
   await f.tap('slow');
   await f.tap('fail');
   await f.tap('tap');

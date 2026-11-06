@@ -558,6 +558,10 @@ is logged once and the log starts empty.
   locked), never another pad's buttons. A locked screen in that state ignores keys too. Leaving the
   editor returns to the pad that was on screen before it (a `?pad=` link's too), not the one edited
   last; only when that pad is gone (deleted in the editor) does the editor's pad take its place.
+- Banners (unsaved edits kept on the device, storage blocked, host full, address refused, config
+  errors, pairing notes) take their own room below the pad, which shrinks for them: never over a
+  button (on a 360×640 phone one covered the bottom row). Toasts (a key pressed a button on another
+  pad) are brief and overlay, and take no touches.
 - `?lock` (kiosk, handlebar mount): no tabs, no edit entry, no "Pair again"; keys press only the
   locked pad's buttons; the menu opens only on a ~1 s press of its button (a ring fills
   meanwhile), never from the keyboard.

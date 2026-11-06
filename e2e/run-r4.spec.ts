@@ -381,3 +381,42 @@ test('a latched state marked uncertain by the host ("? REC ●", after a crash) 
   expect(sure.outline).not.toBe('dashed');
   await expect(page.getByTestId('latched-bgm')).not.toHaveAttribute('data-uncertain', '');
 });
+
+// ---- banners take their own room ----------------------------------------------------------------------
+
+test('a banner (unsaved edits kept on the device) sits below the pad, never over its bottom button (360×640)', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 640 });
+  await open(page, {
+    version: 1,
+    pads: [
+      {
+        id: 'p',
+        name: 'P',
+        cols: 1,
+        rows: 3,
+        buttons: [
+          { id: 'a', label: 'Garage door', x: 0, y: 0, action: sh('echo') },
+          { id: 'b', label: 'Porch light', x: 0, y: 1, trigger: 'tap', action: sh('echo') },
+          { id: 'c', label: 'Printer', x: 0, y: 2, trigger: 'tap', action: sh('echo') },
+        ],
+      },
+    ],
+  });
+  // An edit left unsaved (the page reloaded): the run mode offers it back in a banner.
+  await page.getByTestId('menu-btn').click();
+  await page.getByTestId('menu-edit').click();
+  await page.getByTestId('edit-btn-c').click();
+  await page.getByTestId('field-label').fill('Printer (unsaved)');
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('buttpad.draft:demo') ?? '')).toContain('Printer (unsaved)');
+  await page.reload();
+  const banner = page.getByTestId('draft-banner');
+  await expect(banner).toBeVisible();
+  const b = (await btn(page, 'c').boundingBox())!;
+  const r = (await banner.boundingBox())!;
+  expect(b.y + b.height).toBeLessThanOrEqual(r.y + 1);
+  expect(r.y + r.height).toBeLessThanOrEqual(640);
+  // Its buttons still work, and hiding it gives the room back.
+  await page.getByTestId('draft-banner-hide').click();
+  await expect(banner).toHaveCount(0);
+  await expect.poll(async () => (await btn(page, 'c').boundingBox())!.height).toBeGreaterThan(b.height);
+});

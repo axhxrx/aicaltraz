@@ -620,11 +620,12 @@ button.bp-row:active {
   animation-duration: 1.6s;
 }
 
+/* Banners take their own room below the pad (the grid shrinks): on a 360×640 phone one used to
+   sit over the bottom row of buttons. (.app's padding already keeps them off the safe areas.) */
 .bp-banner {
-  position: absolute;
-  left: calc(env(safe-area-inset-left) + var(--gap));
-  right: calc(env(safe-area-inset-right) + var(--gap));
-  bottom: calc(env(safe-area-inset-bottom) + var(--gap));
+  position: relative;
+  flex: none;
+  margin: 0 var(--gap) var(--gap);
   z-index: 10;
   padding: 12px 14px;
   border-radius: 14px;
